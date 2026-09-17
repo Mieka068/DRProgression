@@ -1,0 +1,261 @@
+Date ran: May 3 at 1:57 AM
+Note that longitudinal dataset still needs to be applied for training.
+
+robynnegonzales@Robynnes-MacBook-Air ~/Downloads/SY2025-2026/SEM 2/Thesis/M2-DRProgression/DRForestGAN-v2 ❯ python3 main.py \
+    --mode inference \
+    --image_path "../IDRiD_dataset/A. Segmentation/1. Original Images/a. Training Set/IDRiD_01.jpg" \
+    --mask_path "../IDRiD_dataset/A. Segmentation/2. All Segmentation Groundtruths/a. Training Set/3. Hard Exudates/IDRiD_01_EX.tif" \
+    --target_grade 2
+Namespace(c_dim=5, c2_dim=8, celeba_crop_size=178, rafd_crop_size=256, image_size=128, g_conv_dim=64, d_conv_dim=64, g_repeat_num=6, d_repeat_num=6, lambda_cls=1, lambda_rec=10, lambda_gp=10, dataset='CelebA', batch_size=16, num_iters=200000, num_iters_decay=100000, g_lr=0.0001, d_lr=0.0001, n_critic=5, beta1=0.5, beta2=0.999, resume_iters=None, selected_attrs=['Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Male', 'Young'], test_iters=200000, image_path='../IDRiD_dataset/A. Segmentation/1. Original Images/a. Training Set/IDRiD_01.jpg', mask_path='../IDRiD_dataset/A. Segmentation/2. All Segmentation Groundtruths/a. Training Set/3. Hard Exudates/IDRiD_01_EX.tif', target_grade=2, num_workers=1, mode='inference', use_tensorboard=True, celeba_image_dir='data/celeba/images', attr_path='data/celeba/list_attr_celeba.txt', rafd_image_dir='data/RaFD/train', log_dir='stargan/logs', model_save_dir='stargan/models', sample_dir='stargan/samples', result_dir='stargan/results', log_step=10, sample_step=1000, model_save_step=10000, lr_update_step=1000)
+
+============================================================
+DRForecastGAN - Inference Mode
+============================================================
+Device: cpu
+
+[1/4] Loading image and mask...
+  Image: ../IDRiD_dataset/A. Segmentation/1. Original Images/a. Training Set/IDRiD_01.jpg
+  Mask:  ../IDRiD_dataset/A. Segmentation/2. All Segmentation Groundtruths/a. Training Set/3. Hard Exudates/IDRiD_01_EX.tif
+  ✓ Image shape: torch.Size([1, 3, 128, 128])
+  ✓ Mask shape: torch.Size([1, 1, 128, 128])
+
+[2/4] Loading generator...
+  ⚠ Weights not found at stargan/models/200000-G.ckpt
+  ⚠ Using random initialization
+  💡 Tip: Train the model first or provide trained weights
+
+[3/4] Preparing inference inputs...
+  ✓ Input (image + mask): torch.Size([1, 4, 128, 128])
+  ✓ Current grade: 1
+  ✓ Target grade: 2
+  ✓ Target condition shape: torch.Size([1, 5])
+
+[4/4] Running inference...
+  ✓ Synthesis complete
+  ✓ Output shape: torch.Size([1, 3, 128, 128])
+
+[5/5] Saving results...
+  ✓ Result saved to: stargan/results/inference_result.jpg
+  ✓ Synthesized image saved to: stargan/results/synthesized_stage_2.jpg
+  ✓ Mask saved to: stargan/results/lesion_mask.jpg
+
+============================================================
+✓ Inference complete!
+============================================================
+
+
+
+Date ran: Mat 5, 2026
+Note that longitudinal dataset still needs to be applied for training.
+
+robynnegonzales@Robynnes-MacBook-Air ~/Downloads/SY2025-2026/SEM 2/Thesis/M2-DRProgression ❯ python3 batch_inference.py
+
+======================================================================
+BATCH INFERENCE - Module 2 (GAN Synthesis)
+======================================================================
+Device: cpu
+Processing 5 images...
+Target Grade: 2
+
+[Loading Generator]
+⚠ Weights not found. Using random initialization.
+
+======================================================================
+Found 5 images to process
+======================================================================
+
+
+[1/5] Processing: IDRiD_01.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/01_IDRiD_01_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/01_IDRiD_01_synthesized.jpg
+
+[2/5] Processing: IDRiD_02.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/02_IDRiD_02_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/02_IDRiD_02_synthesized.jpg
+
+[3/5] Processing: IDRiD_03.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/03_IDRiD_03_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/03_IDRiD_03_synthesized.jpg
+
+[4/5] Processing: IDRiD_04.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/04_IDRiD_04_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/04_IDRiD_04_synthesized.jpg
+
+[5/5] Processing: IDRiD_05.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/05_IDRiD_05_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/05_IDRiD_05_synthesized.jpg
+
+======================================================================
+BATCH INFERENCE COMPLETE
+======================================================================
+Total processed: 5
+Successful: 5
+Failed: 0
+
+Results saved to: ./DRForestGAN-v2/stargan/results/batch_inference/
+
+
+Detailed Results:
+----------------------------------------------------------------------
+  IDRiD_01.jpg                   SUCCESS   
+  IDRiD_02.jpg                   SUCCESS   
+  IDRiD_03.jpg                   SUCCESS   
+  IDRiD_04.jpg                   SUCCESS   
+  IDRiD_05.jpg                   SUCCESS  
+
+
+Date ran: May 5
+
+robynnegonzales@Robynnes-MacBook-Air ~/Downloads/SY2025-2026/SEM 2/Thesis/M2-DRProgression ❯ python3 train_fire.py
+
+======================================================================
+DRForecastGAN Training on FIRE Dataset
+======================================================================
+Device: cpu
+
+[1/4] Loading FIRE dataset...
+  Searching: ./FIRE_dataset/FIRE/Images
+✓ Found 14 pairs in FIRE Category A
+✓ Loaded 14 pairs
+✓ Batches per epoch: 7
+
+[2/4] Initializing models...
+✓ Generator parameters: 8,433,664
+✓ Discriminator parameters: 44,762,048
+
+[3/4] Starting training for 100 epochs...
+======================================================================
+Epoch [1/100] | D_loss: 8.8781 | G_loss: 0.7402 | Rec_loss: 0.3745 | Time: 6.2s
+Epoch [5/100] | D_loss: 1.1034 | G_loss: 0.3934 | Rec_loss: 0.1501 | Time: 29.4s
+Epoch [10/100] | D_loss: 9.9475 | G_loss: 1.2479 | Rec_loss: 0.1230 | Time: 58.5s
+Epoch [15/100] | D_loss: 7.3357 | G_loss: 1.4544 | Rec_loss: 0.1293 | Time: 87.5s
+Epoch [20/100] | D_loss: 8.5929 | G_loss: 1.1592 | Rec_loss: 0.1802 | Time: 116.4s
+Epoch [25/100] | D_loss: 9.9673 | G_loss: 0.8738 | Rec_loss: 0.0885 | Time: 145.6s
+  ✓ Saved samples to ./training_samples/epoch_25.jpg
+  ✓ Saved checkpoints: ./DRForestGAN-v2/stargan/models/25-G.ckpt
+Epoch [30/100] | D_loss: 9.8794 | G_loss: 0.8307 | Rec_loss: 0.0887 | Time: 175.0s
+Epoch [35/100] | D_loss: 8.8600 | G_loss: 0.0979 | Rec_loss: 0.0810 | Time: 204.1s
+Epoch [40/100] | D_loss: 6.4190 | G_loss: -5.7918 | Rec_loss: 0.2211 | Time: 235.6s
+Epoch [45/100] | D_loss: 7.2196 | G_loss: -6.4481 | Rec_loss: 0.1986 | Time: 269.9s
+Epoch [50/100] | D_loss: 4.2887 | G_loss: -5.3159 | Rec_loss: 0.1789 | Time: 304.0s
+  ✓ Saved samples to ./training_samples/epoch_50.jpg
+  ✓ Saved checkpoints: ./DRForestGAN-v2/stargan/models/50-G.ckpt
+Epoch [55/100] | D_loss: 5.0681 | G_loss: -2.8002 | Rec_loss: 0.1571 | Time: 338.1s
+Epoch [60/100] | D_loss: 3.6457 | G_loss: -2.0909 | Rec_loss: 0.1643 | Time: 372.4s
+Epoch [65/100] | D_loss: 6.9817 | G_loss: 3.4135 | Rec_loss: 0.1704 | Time: 407.2s
+Epoch [70/100] | D_loss: 1.5558 | G_loss: 4.9623 | Rec_loss: 0.1228 | Time: 442.3s
+Epoch [75/100] | D_loss: 4.8445 | G_loss: 2.6419 | Rec_loss: 0.1464 | Time: 477.8s
+  ✓ Saved samples to ./training_samples/epoch_75.jpg
+  ✓ Saved checkpoints: ./DRForestGAN-v2/stargan/models/75-G.ckpt
+Epoch [80/100] | D_loss: 5.5031 | G_loss: 2.3972 | Rec_loss: 0.1296 | Time: 514.1s
+Epoch [85/100] | D_loss: 5.0739 | G_loss: 1.2724 | Rec_loss: 0.1241 | Time: 550.5s
+Epoch [90/100] | D_loss: 8.3912 | G_loss: 1.1131 | Rec_loss: 0.1026 | Time: 587.4s
+Epoch [95/100] | D_loss: 2.4825 | G_loss: 3.0295 | Rec_loss: 0.1191 | Time: 624.2s
+Epoch [100/100] | D_loss: 0.8536 | G_loss: 1.5312 | Rec_loss: 0.1047 | Time: 661.0s
+  ✓ Saved samples to ./training_samples/epoch_100.jpg
+  ✓ Saved checkpoints: ./DRForestGAN-v2/stargan/models/100-G.ckpt
+
+[4/4] Training complete!
+======================================================================
+✓ Final Generator saved to: ./DRForestGAN-v2/stargan/models/final-G.ckpt
+✓ Final Discriminator saved to: ./DRForestGAN-v2/stargan/models/final-D.ckpt
+✓ Inference-compatible weights saved to: ./DRForestGAN-v2/stargan/models/200000-G.ckpt
+
+📊 Total training time: 11.0 minutes
+
+🎉 You can now run inference with these trained weights!
+robynnegonzales@Robynnes-MacBook-Air ~/Downloads/SY2025-2026/SEM 2/Thesis/M2-DRProgression ❯ python3 batch_i
+nference.py
+
+======================================================================
+BATCH INFERENCE - Module 2 (GAN Synthesis)
+======================================================================
+Device: cpu
+Processing 5 images...
+Target Grade: 2
+
+[Loading Generator]
+✓ Loading weights from: ./DRForestGAN-v2/stargan/models/200000-G.ckpt
+
+======================================================================
+Found 5 images to process
+======================================================================
+
+
+[1/5] Processing: IDRiD_01.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/01_IDRiD_01_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/01_IDRiD_01_synthesized.jpg
+
+[2/5] Processing: IDRiD_02.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/02_IDRiD_02_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/02_IDRiD_02_synthesized.jpg
+
+[3/5] Processing: IDRiD_03.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/03_IDRiD_03_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/03_IDRiD_03_synthesized.jpg
+
+[4/5] Processing: IDRiD_04.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/04_IDRiD_04_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/04_IDRiD_04_synthesized.jpg
+
+[5/5] Processing: IDRiD_05.jpg
+----------------------------------------------------------------------
+  ✓ Image loaded: torch.Size([1, 3, 128, 128])
+  ✓ Mask loaded: torch.Size([1, 1, 128, 128])
+  ✓ Synthesis complete: torch.Size([1, 3, 128, 128])
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/05_IDRiD_05_comparison.jpg
+  ✓ Saved: ./DRForestGAN-v2/stargan/results/batch_inference/05_IDRiD_05_synthesized.jpg
+
+======================================================================
+BATCH INFERENCE COMPLETE
+======================================================================
+Total processed: 5
+Successful: 5
+Failed: 0
+
+Results saved to: ./DRForestGAN-v2/stargan/results/batch_inference/
+
+
+Detailed Results:
+----------------------------------------------------------------------
+  IDRiD_01.jpg                   SUCCESS   
+  IDRiD_02.jpg                   SUCCESS   
+  IDRiD_03.jpg                   SUCCESS   
+  IDRiD_04.jpg                   SUCCESS   
+  IDRiD_05.jpg                   SUCCESS 
