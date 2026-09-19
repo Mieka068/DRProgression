@@ -1,0 +1,20 @@
+# Raw dataset archives/folders -- never git-tracked. Staged on Google Drive, unzipped fresh
+# onto the ephemeral Colab VM disk each session (see CLAUDE.md's Colab workflow section).
+FGADR-Seg-set_Release/
+IDRiD_dataset/
+IDRiD_dataset_root/
+FIRE_dataset/
+FIRE/
+LongDRScreening_20150209/
+retinal-dr-longitudinal/
+
+# Derived artifacts that live on Drive only (module1 pkls/caches, checkpoints, samples)
+*.pth.tar
+*.ckpt
+module1_outputs_*.pt
+training_samples_poc/
+outputs_poc/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

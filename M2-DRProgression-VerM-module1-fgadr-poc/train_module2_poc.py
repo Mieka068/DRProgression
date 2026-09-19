@@ -7,8 +7,11 @@ This is a thin variant of train_combined.py, not a rewrite -- same Generator/Dis
 (DRForestGAN-v2/base_model.py), same WGAN-GP-style training loop, same 4-channel
 (image + mask) conditioning input train_combined.py already implements. The only things that
 change:
-  1. fire_module1_cache_path / longdr_module1_cache_path are threaded through to
-     get_combined_loader() -> FIREDataset/LongDRScreeningDataset, so real grade/mask flow in.
+  1. fire_module1_cache_path / longdr_module1_cache_path / tianjin_dir /
+     tianjin_module1_cache_path are threaded through to get_combined_loader() ->
+     FIREDataset/LongDRScreeningDataset/TianjinLongitudinalDataset, so real grade/mask flow
+     in. tianjin_dir is optional (default None) -- omit it to train on FIRE+LongDR only,
+     exactly as before Tianjin was wired in.
   2. num_epochs is reduced for a same-day POC run (see Config.num_epochs below) -- explicitly
      NOT the manuscript's literature-matched 200 (train_fire.py/train_combined.py already
      diverged from that to 50; this POC run goes further, to make sure at least one full run
@@ -26,6 +29,15 @@ Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
         --fire-module1-cache /content/drive/MyDrive/.../module1_outputs_fire.pt \
         --longdr-module1-cache /content/drive/MyDrive/.../module1_outputs_longdr.pt \
+        --num-epochs 5
+
+With Tianjin included (see notebooks/05_tianjin_data_prep_colab.ipynb and
+notebooks/06_module2_poc_with_tianjin_colab.ipynb):
+    python train_module2_poc.py \
+        --fire-module1-cache /content/drive/MyDrive/.../module1_outputs_fire.pt \
+        --longdr-module1-cache /content/drive/MyDrive/.../module1_outputs_longdr.pt \
+        --tianjin-dir /content/data/retinal-dr-longitudinal \
+        --tianjin-module1-cache /content/drive/MyDrive/.../module1_outputs_tianjin.pt \
         --num-epochs 5
 """
 import argparse
@@ -48,11 +60,14 @@ class Config:
     # Data
     fire_dir = "./FIRE_dataset"
     longdr_dir = "./LongDRScreening_20150209"
+    tianjin_dir = None  # optional -- e.g. "./retinal-dr-longitudinal"; None skips Tianjin
     image_size = 128
     batch_size = 4
     augment = True
     fire_module1_cache_path = None
     longdr_module1_cache_path = None
+    tianjin_module1_cache_path = None
+    tianjin_min_pair_quality = None
 
     # Model (unchanged from train_combined.py)
     g_conv_dim = 64
@@ -159,6 +174,8 @@ def train(config: Config):
     print(f"Device: {device}")
     print(f"fire_module1_cache_path: {config.fire_module1_cache_path}")
     print(f"longdr_module1_cache_path: {config.longdr_module1_cache_path}")
+    print(f"tianjin_dir: {config.tianjin_dir}")
+    print(f"tianjin_module1_cache_path: {config.tianjin_module1_cache_path}")
 
     os.makedirs(config.save_dir, exist_ok=True)
     os.makedirs(config.sample_dir, exist_ok=True)
@@ -167,11 +184,14 @@ def train(config: Config):
     loader, num_pairs = get_combined_loader(
         fire_dir=config.fire_dir,
         longdr_dir=config.longdr_dir,
+        tianjin_dir=config.tianjin_dir,
         image_size=config.image_size,
         batch_size=config.batch_size,
         augment=config.augment,
         fire_module1_cache_path=config.fire_module1_cache_path,
         longdr_module1_cache_path=config.longdr_module1_cache_path,
+        tianjin_module1_cache_path=config.tianjin_module1_cache_path,
+        tianjin_min_pair_quality=config.tianjin_min_pair_quality,
     )
     print(f"✓ Real pairs: {num_pairs}, effective samples: {len(loader.dataset)}, batches/epoch: {len(loader)}")
 
@@ -270,6 +290,8 @@ def train(config: Config):
         "beta2": config.beta2,
         "fire_module1_cache_path": config.fire_module1_cache_path,
         "longdr_module1_cache_path": config.longdr_module1_cache_path,
+        "tianjin_dir": config.tianjin_dir,
+        "tianjin_module1_cache_path": config.tianjin_module1_cache_path,
         "metrics": metrics,
         "total_time_min": (time.time() - start_time) / 60,
     }
@@ -284,8 +306,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fire-dir", default=Config.fire_dir)
     parser.add_argument("--longdr-dir", default=Config.longdr_dir)
+    parser.add_argument("--tianjin-dir", default=Config.tianjin_dir,
+                         help="Optional path to the extracted Tianjin dataset; omit to skip it")
     parser.add_argument("--fire-module1-cache", default=None)
     parser.add_argument("--longdr-module1-cache", default=None)
+    parser.add_argument("--tianjin-module1-cache", default=None)
+    parser.add_argument("--tianjin-min-pair-quality", type=float, default=None)
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     args = parser.parse_args()
@@ -293,8 +319,11 @@ if __name__ == "__main__":
     cfg = Config()
     cfg.fire_dir = args.fire_dir
     cfg.longdr_dir = args.longdr_dir
+    cfg.tianjin_dir = args.tianjin_dir
     cfg.fire_module1_cache_path = args.fire_module1_cache
     cfg.longdr_module1_cache_path = args.longdr_module1_cache
+    cfg.tianjin_module1_cache_path = args.tianjin_module1_cache
+    cfg.tianjin_min_pair_quality = args.tianjin_min_pair_quality
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
 
