@@ -2,13 +2,13 @@
 One-time preprocessing: trains an AffineRegistrationNet (see registration_network.py) on
 FIRE/LongDR/Tianjin baseline<->follow-up pairs via self-supervised photometric loss, then runs
 it once more over every pair to produce a cache of pre-warped follow-up images, keyed by
-(source, baseline_path) -- content-addressed, not index-addressed, so it stays valid
-regardless of dataset construction order later.
+(source, baseline_path) -- content-addressed, so it stays valid regardless of dataset
+construction order later.
 
 This is a preprocessing step, not part of GAN training itself: Module 2's data loaders
-consume the resulting cache (see docs/IMPLEMENTATION_PLAN.md Task F) to substitute a warped,
-baseline-aligned follow-up image in place of the raw one wherever a cache entry exists,
-instead of registering on-the-fly inside the training loop every epoch.
+consume the resulting cache to substitute a warped, baseline-aligned follow-up image in place
+of the raw one wherever a cache entry exists, instead of registering on-the-fly inside the
+training loop every epoch.
 
 Registration-quality prefiltering: Tianjin already ships its own registration-quality score
 (corrected_manifest.csv's `quality` column, from the dataset providers' own SIFT/ECC pairing
@@ -109,7 +109,7 @@ def build_datasets(config):
 def train(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 70)
-    print("Training-only affine registration network (Task E)")
+    print("Training-only affine registration network")
     print("=" * 70)
     print(f"Device: {device}")
 
@@ -147,10 +147,7 @@ def train(config):
     torch.save(net.state_dict(), config.checkpoint_out)
     print(f"✓ Saved registration network to {config.checkpoint_out}")
 
-    print(
-        "\n[3/3] Pre-warping every pair once and writing the cache "
-        "(keyed by (source, baseline_path), content-addressed -- see module docstring)..."
-    )
+    print("\n[3/3] Pre-warping every pair once and writing the cache (keyed by (source, baseline_path))...")
     net.eval()
     cache = {}
     with torch.no_grad():

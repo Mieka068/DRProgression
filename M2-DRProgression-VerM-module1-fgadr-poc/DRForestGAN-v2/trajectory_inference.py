@@ -1,26 +1,17 @@
 """
-Autoregressive multi-stage trajectory synthesis -- the manuscript's "full multi-stage
-trajectory from a single baseline image" claim, which the base DRForecastGAN/StarGAN
-architecture does not do on its own (it only ever does one G(x, c) call; see
-docs/IMPLEMENTATION_PLAN.md Task D and CLAUDE.md's "What this project is"). This is this
-thesis's actual novelty contribution on top of the verified DRForecastGAN base in
-base_model.py, not something recovered from upstream code.
+Autoregressive multi-stage trajectory synthesis: feeds each generated stage back in as the
+input for generating the next stage from a single baseline image, since the base
+DRForecastGAN/StarGAN architecture only ever performs one G(x, c) call.
 
-Per the manuscript's Section 3.3.7 (docs/IMPLEMENTATION_PLAN.md's revised Task D), each
-cascade step is a 4-part loop, NOT a bare repeated generator call:
+Each cascade step is a 4-part loop, not a bare repeated generator call:
   1. Generate the next-stage image from the current image + current mask.
-  2. Re-segment the synthesized image with Module 1 to get the NEXT step's mask -- lesion
-     distribution changes across stages, so carrying the baseline mask forward (an earlier,
-     simpler version of this function did that) would misalign the conditioning signal with
-     the synthesized image it's supposedly describing.
+  2. Re-segment the synthesized image with Module 1 to get the next step's mask -- lesion
+     distribution changes across stages, so carrying the baseline mask forward would misalign
+     the conditioning signal with the synthesized image it describes.
   3. Re-grade the synthesized image with Module 1's classifier as an internal consistency
-     check: does the synthesized image actually look like the target stage to Module 1's own
-     grader? Logged, not used to alter generation -- a real "does the model's own severity
-     grader agree with what we told the generator to produce" measurement.
+     check: does the synthesized image read as the target stage to Module 1's own grader?
+     Logged, not used to alter generation.
   4. Feed the new image + new mask into the next iteration.
-
-This is confirmed absent from the official DRForecastGAN release and this project's prior
-code -- new engineering, not something recovered from upstream.
 """
 import os
 import sys
@@ -37,10 +28,9 @@ from apply_to_progression_data import process_image  # noqa: E402
 def _tensor_to_pil(image_tensor):
     """
     Converts a single-image [1,3,H,W] or [3,H,W] tensor in the GAN's [-1,1] Tanh-output range
-    to a PIL RGB image. This is a deliberate temp-file round trip (see _module1_predict)
-    rather than a second, tensor-native reimplementation of Module 1's preprocessing --
-    guarantees IDENTICAL preprocessing to Module 1's real-image predictions instead of risking
-    the two pipelines silently drifting apart.
+    to a PIL RGB image, for a temp-file round trip through Module 1's own file-based
+    prediction pipeline (see _module1_predict) instead of a separate tensor-native
+    reimplementation of its preprocessing.
     """
     if image_tensor.dim() == 4:
         image_tensor = image_tensor[0]
@@ -52,8 +42,8 @@ def _tensor_to_pil(image_tensor):
 def _module1_predict(image_tensor, classifier, seg_models, device, mask_size):
     """
     Runs Module 1's classifier + segmentation heads on a synthesized image tensor, via a
-    temp-file round trip through module1/apply_to_progression_data.py's own process_image()
-    -- see _tensor_to_pil's docstring for why. Returns (predicted_grade, mask_tensor[1,1,H,W]).
+    temp-file round trip through module1/apply_to_progression_data.py's own process_image().
+    Returns (predicted_grade, mask_tensor[1,1,H,W]).
     """
     pil_image = _tensor_to_pil(image_tensor)
     tmp_path = None
@@ -77,10 +67,8 @@ def _module1_predict(image_tensor, classifier, seg_models, device, mask_size):
 def synthesize_trajectory(generator, classifier, seg_models, baseline_image, baseline_mask,
                            start_stage, end_stage, c_dim, device):
     """
-    Generates a full stage-by-stage trajectory from start_stage to end_stage, per the
-    manuscript's Sec 3.3.7 4-step loop (see module docstring) -- NOT a bare repeated generator
-    call, and NOT a baseline-mask-reuse simplification (an earlier version of this function
-    did that; this version replaces it).
+    Generates a full stage-by-stage trajectory from start_stage to end_stage (see module
+    docstring for the per-step loop).
 
     Args:
         generator: a base_model.Generator instance (AdaIN-conditioned or not -- this function
@@ -92,8 +80,7 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
         baseline_image: [1, 3, H, W] real baseline fundus image tensor, in the generator's
             expected input range ([-1, 1], matching the existing tanh-output convention).
         baseline_mask: [1, 1, H, W] real Module 1 lesion mask for the baseline image. Used
-            as-is for the baseline entry -- Module 1 is only re-run on SYNTHESIZED images,
-            since the baseline already has a real mask.
+            as-is for the baseline entry -- Module 1 is only re-run on synthesized images.
         start_stage: int, the baseline image's own severity stage (0-indexed, ICDR 0-4).
         end_stage: int, the final stage to synthesize up to (inclusive). Must be > start_stage.
         c_dim: number of stages (5 for ICDR 0-4), matching the Generator's own c_dim.
@@ -104,8 +91,7 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
         each {'stage', 'image', 'mask', 'consistency'}. 'mask' is the real baseline_mask for
         the baseline entry and a fresh Module-1-predicted mask for every synthesized step.
         'consistency' is None for the baseline entry and a bool (predicted grade == target
-        stage) for every synthesized step -- an internal Module-1-agreement signal, logged for
-        evaluation, never used to alter generation.
+        stage) for every synthesized step.
     """
     if end_stage <= start_stage:
         raise ValueError(

@@ -1,29 +1,15 @@
 """
 Saves labeled panel figures of Module 2's synthesized multi-stage trajectory, with Module 3's
-per-step progression-probability estimate captioned beneath each panel (manuscript Sec 3.4.4's
-"pipeline output" -- the two modules paired together, not evaluated in isolation).
+per-step progression-probability estimate captioned beneath each panel.
 
-Checked directly before writing this: nothing else in the repo writes Module 2's synthesized
-trajectory images to disk. train_module2_poc.py only saves a single-step training-sanity strip
-(training_samples_poc/epoch_N.jpg). evaluate_trajectory.py calls synthesize_trajectory() and
-reduces its output straight to PSNR/SSIM/FID/consistency numbers -- the images themselves are
-computed in memory and never saved. This script is the first thing that keeps them.
+Module 3 predicts a probability of progressing within a fixed horizon rather than an exact
+date; the only horizon it has training signal for is 2 years. Every caption reads "Est.
+P(further progression within 2yr): NN%".
 
-FRAMING, read before presenting a figure this script produces: Module 3 does not predict an
-exact date. It predicts a probability of progressing within a fixed horizon, and the only
-horizon it has real training signal for is 2 years (Tianjin's one checkpoint) -- see
-module3/train_module3_poc.py's own module docstring. Every caption below therefore reads
-"Est. P(further progression within 2yr): NN%", never a specific month or date.
-
-OPEN ARCHITECTURAL CAVEAT, not a bug: running Module 3 on a SYNTHESIZED intermediate-cascade
-image (treating step 2's generated image as a fresh "baseline" to ask "how long until step
-3?") is mechanically possible -- the model just takes an image + grade + LBS stratum -- but
-statistically untested, since Module 3 was only ever trained on real photographs. Every
-synthesized-image estimate below is captioned "(synthesized image -- untested)" distinctly
-from the real-baseline estimate, and this module prints the caveat once per run rather than
-silently treating both as equally validated. Whether to include synthesized-image estimates in
-the actual defense/presentation is a judgment call for the adviser, not something this script
-decides (see docs/IMPLEMENTATION_PLAN.md's Open decisions #6).
+Running Module 3 on a synthesized intermediate-cascade image is mechanically possible (the
+model takes an image + grade + LBS stratum) but was not part of its training distribution,
+since Module 3 is trained only on real photographs. Every synthesized-image estimate is
+captioned "(synthesized image -- untested)", distinct from the real-baseline estimate.
 
 Usage (after notebooks 06 AND 07 have both produced trained checkpoints):
     python visualize_trajectory.py \
@@ -127,11 +113,10 @@ def estimate_module3_progression(module3_model, image_tensor_pm1, mask_tensor, s
     """
     Runs Module 3 on one step's image (real or synthesized) and returns
     (probability_of_progression_within_2yr, lbs_value, stratum). Computes LBS fresh from the
-    step's own image + mask (compute_lbs.py), classifies it against the SAVED training
-    thresholds (classify_lbs_stratum -- not a refit), and reads the stage itself as the
-    baseline-grade input (Task H), consistent with how Module 3 was trained: the grade of the
-    image being scored, not the original real baseline's grade, once we're several cascade
-    steps in.
+    step's own image + mask (compute_lbs.py), classifies it against the saved training
+    thresholds (classify_lbs_stratum, not a refit), and passes the stage itself as the
+    baseline-grade input -- the grade of the image being scored, not the original baseline's
+    grade, once several cascade steps in.
     """
     rgb_uint8 = image_tensor_to_rgb_uint8(image_tensor_pm1)
     fov_mask = estimate_retinal_fov_mask(rgb_uint8)
@@ -241,8 +226,7 @@ def run(config):
         if "lbs_thresholds_by_grade" not in module3_results:
             raise KeyError(
                 f"{config.module3_thresholds_json} has no 'lbs_thresholds_by_grade' key -- "
-                "retrain with the current train_module3_poc.py (see docs/IMPLEMENTATION_PLAN.md "
-                "Task I), which saves this automatically."
+                "retrain with the current train_module3_poc.py, which saves this automatically."
             )
         thresholds_by_grade = {int(k): tuple(v) for k, v in module3_results["lbs_thresholds_by_grade"].items()}
 
@@ -250,11 +234,8 @@ def run(config):
         module3_model.load_state_dict(torch.load(config.module3_checkpoint, map_location=device))
         module3_model.eval()
         print(
-            "\nNOTE: Module 3 estimates on SYNTHESIZED (non-real) images are an untested "
-            "extrapolation -- Module 3 was only ever trained on real photographs. "
-            "Synthesized-image estimates are captioned '(synthesized image -- untested)' "
-            "below; treat them as illustrative, not validated (see this script's module "
-            "docstring and docs/IMPLEMENTATION_PLAN.md's Open decisions #6)."
+            "\nModule 3 estimates on synthesized images are captioned '(synthesized image -- "
+            "untested)' below, since Module 3 is trained only on real photographs."
         )
     else:
         print("\n[3/4] --module3-checkpoint not given -- figures will render Module 1/2 content only.")

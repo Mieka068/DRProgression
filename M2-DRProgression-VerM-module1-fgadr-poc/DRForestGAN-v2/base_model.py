@@ -21,12 +21,9 @@ class ResidualBlock(nn.Module):
 
 class AdaIN(nn.Module):
     """
-    AdaIN(x, s) = gamma(s) * (x - mu(x)) / sigma(x) + beta(s), per the manuscript's Sec 3.2
-    formula. gamma/beta are produced from the stage-conditioning vector s by a small linear
-    projection, following the standard AdaIN formulation (Huang & Belongie 2017, adopted by
-    StarGAN v2). Confirmed absent from the official DRForecastGAN release (see
-    docs/IMPLEMENTATION_PLAN.md Task C) -- this is new engineering on top of that base, not
-    something recovered from upstream code.
+    AdaIN(x, s) = gamma(s) * (x - mu(x)) / sigma(x) + beta(s). gamma/beta are produced from
+    the stage-conditioning vector s by a small linear projection, following the standard
+    AdaIN formulation (Huang & Belongie 2017, adopted by StarGAN v2).
     """
     def __init__(self, style_dim, num_features):
         super().__init__()
@@ -60,16 +57,11 @@ class AdaINResidualBlock(nn.Module):
 class Generator(nn.Module):
     """
     Generator network. Bottleneck residual blocks use AdaIN conditioning on the target-stage
-    vector (see AdaINResidualBlock above), ADDITIVE to the existing spatial channel-concat
-    conditioning on the down/up-sampling layers -- both mechanisms reinforce the same target
-    stage, rather than AdaIN replacing the original conditioning path wholesale. See
-    docs/IMPLEMENTATION_PLAN.md Task C for why this reading of the manuscript's formula was
-    chosen.
+    vector (see AdaINResidualBlock above), additive to the spatial channel-concat conditioning
+    on the down/up-sampling layers -- both mechanisms condition on the same target stage.
 
-    CHECKPOINT COMPATIBILITY: this changes the state_dict keys (self.main -> self.down /
-    self.bottleneck / self.up, and each bottleneck block gained AdaIN's fc layers). Any
-    checkpoint trained under the old architecture will NOT load into this one -- retrain from
-    scratch, don't attempt a partial load.
+    Checkpoint compatibility: state_dict keys are self.down / self.bottleneck / self.up (not
+    a single self.main), and each bottleneck block includes AdaIN's fc layers.
     """
     def __init__(self, conv_dim=64, c_dim=5, repeat_num=6, style_dim=None):
         super(Generator, self).__init__()

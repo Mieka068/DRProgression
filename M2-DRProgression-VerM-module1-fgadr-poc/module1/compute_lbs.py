@@ -1,16 +1,15 @@
 """
-Lesion Burden Score (LBS) computation -- this is NOT part of DRG-Net; it's the manuscript's
-own addition (Sec 3.2.6): LBS = (total lesion pixels) / (total retinal area pixels), used to
-stratify patients into low/medium/high burden strata (33rd/66th percentile thresholds) for
-Module 3's survival analysis, and as part of Module 1's output package forwarded to Module 2.
+Lesion Burden Score (LBS) computation: LBS = (total lesion pixels) / (total retinal area
+pixels), used to stratify patients into low/medium/high burden strata (33rd/66th percentile
+thresholds) for Module 3's survival analysis, and as part of Module 1's output package
+forwarded to Module 2.
 
 Works directly on DRG-Net's/FGADR's/IDRiD's own mask files, or on predicted mask arrays coming
 back from a trained segmentation model -- same function either way.
 
 Standalone self-test (no torch needed, just PIL/numpy/opencv): running this file directly
 loads one FGADR sample, combines its 4 lesion masks, estimates the retinal FOV, computes LBS,
-and saves a visualization PNG -- this is the "show one sample data" artifact for the
-presentation's data section.
+and saves a visualization PNG.
 """
 import os
 
@@ -66,7 +65,7 @@ def combine_lesion_masks(mask_paths, image_shape=None) -> np.ndarray:
 
 
 def compute_lbs(lesion_mask: np.ndarray, retinal_fov_mask: np.ndarray) -> float:
-    """LBS = lesion_pixels / retinal_area_pixels, per the manuscript's Sec 3.2.6 formula."""
+    """LBS = lesion_pixels / retinal_area_pixels."""
     lesion_pixels = float(np.count_nonzero(lesion_mask))
     retinal_pixels = float(np.count_nonzero(retinal_fov_mask))
     if retinal_pixels == 0:
@@ -76,9 +75,9 @@ def compute_lbs(lesion_mask: np.ndarray, retinal_fov_mask: np.ndarray) -> float:
 
 def stratify_lbs(lbs_values):
     """
-    low/medium/high via 33rd/66th percentile thresholds, per manuscript Sec 3.2.6. Intended
-    to be computed per severity stage (percentiles within each grade), not globally -- caller
-    should group by grade before calling this on more than a POC-sized sample.
+    low/medium/high via 33rd/66th percentile thresholds. Intended to be computed per severity
+    stage (percentiles within each grade), not globally -- caller should group by grade before
+    calling this.
     """
     lbs_values = np.asarray(lbs_values, dtype=float)
     p33, p66 = np.percentile(lbs_values, [33, 66])
@@ -95,13 +94,9 @@ def stratify_lbs(lbs_values):
 
 def stratify_lbs_by_grade(lbs_values, grades):
     """
-    Real caller for stratify_lbs's own documented intent: computes 33rd/66th percentile LBS
-    thresholds independently WITHIN each severity-grade group (burden is only meaningful
-    relative to peers at the same stage, not compared globally across stages -- see
-    stratify_lbs's docstring), then returns one low/medium/high label per input value in the
-    original order. Used by Module 3's survival input pipeline (see module3/dataset.py) --
-    previously stratify_lbs only had its own __main__ self-test as a caller (see
-    docs/ROADMAP.md's Objective 3 section).
+    Computes 33rd/66th percentile LBS thresholds independently within each severity-grade
+    group, then returns one low/medium/high label per input value in the original order. Used
+    by Module 3's survival input pipeline (see module3/dataset.py).
 
     Args:
         lbs_values: sequence of LBS floats.
@@ -125,17 +120,12 @@ def stratify_lbs_by_grade(lbs_values, grades):
 
 def classify_lbs_stratum(lbs_value, grade, thresholds_by_grade):
     """
-    Classifies a SINGLE new LBS value into low/medium/high using thresholds already fit on a
+    Classifies a single new LBS value into low/medium/high using thresholds already fit on a
     training cohort (as saved by train_module3_poc.py into poc_results.json's
-    lbs_thresholds_by_grade -- see docs/IMPLEMENTATION_PLAN.md Task I), NOT by refitting
-    percentiles on N=1 the way stratify_lbs_by_grade does for a training batch. Needed to score
-    any new image (including a Module-2-synthesized one) after Module 3 training has already
-    finished -- without this there was no way to classify a post-training image's LBS at all.
+    lbs_thresholds_by_grade), rather than refitting percentiles on N=1.
 
-    Falls back to the nearest available grade's thresholds if the exact grade has none (e.g.
-    too few training patients at that grade), and prints which grade's thresholds were
-    actually used, since a silent fallback here would misattribute a stratum without anyone
-    noticing.
+    Falls back to the nearest available grade's thresholds if the exact grade has none, and
+    prints which grade's thresholds were used.
     """
     grade = int(grade)
     if grade not in thresholds_by_grade:

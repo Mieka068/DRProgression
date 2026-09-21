@@ -4,33 +4,28 @@ Module 3 -- Tianjin survival dataset.
 Builds (baseline_image, LBS stratum, progression event, follow-up time) samples from the same
 Tianjin corrected_manifest.csv + Organized_Data of Patients.xlsx that Module 2's
 tianjin_dataset.py reads, plus the module1_outputs_tianjin.pt cache built by
-notebooks/05_tianjin_data_prep_colab.ipynb. This is a SEPARATE loader, not a reuse of
-TianjinLongitudinalDataset -- Module 3 needs the "2-Year Follow-up" sheet's grade too (to
-compute the progression event label), which Module 2 never touches (Module 2 only conditions
-on the BASELINE grade; see tianjin_dataset.py's own docstring for why).
+notebooks/05_tianjin_data_prep_colab.ipynb. This is a separate loader, not a reuse of
+TianjinLongitudinalDataset: Module 3 needs the "2-Year Follow-up" sheet's grade too, to
+compute the progression event label, which Module 2 never touches.
 
-Per docs/DECISIONS.md's module-independence rule, Module 3 takes the REAL baseline fundus
-image directly, in parallel with Module 2 -- never Module 2's synthesized output.
+Module 3 takes the real baseline fundus image directly, independent of Module 2's synthesized
+output.
 
-Per docs/ROADMAP.md's "Consequence of the Tianjin timing structure" note: every Tianjin
-patient's follow-up interval is a FIXED 2 years, not a variable one, and we only observe
-whether progression happened by that single checkpoint -- never the exact progression date
-within it. This is "current status" / case-1 interval-censored data, not exact-event-time
-survival data. `time_to_followup` is still threaded through as a per-sample field (not
-hardcoded into the loss) so this interface doesn't need to change if a future source
-(DCCT/EDIC, Moorfields) supplies real variable inter-visit timing.
+Every Tianjin patient's follow-up interval is a fixed 2 years, and only whether progression
+happened by that single checkpoint is observed, never the exact progression date within it.
+This is current-status / case-1 interval-censored data, not exact-event-time survival data.
+`time_to_followup` is threaded through as a per-sample field rather than hardcoded, so this
+interface doesn't need to change if a future source supplies real variable inter-visit timing.
 
-Unlike tianjin_dataset.py's placeholder-tolerant grade fallback (Module 2's conditioning
-degrades gracefully to a Stage-2 default when a grade is missing), Module 3 needs a REAL
+Unlike tianjin_dataset.py's placeholder-tolerant grade fallback, Module 3 needs a real
 progression label to train on at all -- a row with an excluded/missing baseline or follow-up
-grade is dropped here, not defaulted. This is a real, intentional divergence from Module 2's
-loader, not an inconsistency to "fix" back into agreement with it.
+grade is dropped here, not defaulted.
 
-GRADING IS PER-EYE, NOT PER-PATIENT: same fact and fix as tianjin_dataset.py (see its module
-docstring) -- Organized_Data of Patients.xlsx has separate OS/OD/at-risk-eye columns per
-sheet, not one flat "DR grade" column, and corrected_manifest.csv doesn't say which eye a row
-is. This loader requires the same laterality_resolved.csv that tianjin_dataset.py requires
-(module1/resolve_eye_laterality.py), and applies the same OD/OS/worse-eye fallback per row.
+Grading is per-eye, not per-patient: Organized_Data of Patients.xlsx has separate OS/OD/
+at-risk-eye columns per sheet, not one flat "DR grade" column, and corrected_manifest.csv
+doesn't say which eye a row is. This loader requires the same laterality_resolved.csv that
+tianjin_dataset.py requires (module1/resolve_eye_laterality.py), and applies the same
+OD/OS/worse-eye fallback per row.
 """
 import os
 import random
@@ -60,8 +55,8 @@ from tianjin_dataset import (  # noqa: E402
     tianjin_grade_to_icdr,
 )
 
-# ImageNet normalization stats -- correct choice here (unlike the [-1,1] range Module 2's
-# loaders use) because this feeds an ImageNet-pretrained EfficientNet-B4 backbone, not a GAN.
+# ImageNet normalization stats -- this feeds an ImageNet-pretrained EfficientNet-B4 backbone,
+# not a GAN, so it uses different stats than Module 2's [-1,1] range.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -71,7 +66,7 @@ STRATUM_TO_IDX = {"low": 0, "medium": 1, "high": 2}
 class TianjinSurvivalDataset(Dataset):
     """
     One sample per corrected_manifest.csv row (i.e. per baseline<->follow-up eye pair) whose
-    patient has BOTH a usable baseline grade and a usable follow-up grade. Multiple rows can
+    patient has both a usable baseline grade and a usable follow-up grade. Multiple rows can
     belong to the same patient (e.g. both eyes) -- use patient_level_split() below rather than
     a plain random split to avoid leaking a patient across train/val.
     """
@@ -81,18 +76,16 @@ class TianjinSurvivalDataset(Dataset):
         Args:
             dataset_dir: path to the extracted usama10/retinal-dr-longitudinal dataset (same
                 layout tianjin_dataset.py expects).
-            module1_cache_path: REQUIRED (unlike Module 2's optional cache) -- path to the
-                module1/apply_to_progression_data.py cache built over Tianjin's baseline
-                images (notebooks/05_tianjin_data_prep_colab.ipynb). Module 3's LBS input
-                feature comes entirely from this cache's precomputed 'lbs' field; there's no
-                placeholder fallback because an LBS stratum is the model's only non-image
-                input, not an optional conditioning channel.
+            module1_cache_path: required -- path to the module1/apply_to_progression_data.py
+                cache built over Tianjin's baseline images. Module 3's LBS input feature comes
+                entirely from this cache's precomputed 'lbs' field; there is no placeholder
+                fallback.
             image_size: resize images to this size. Default 380 matches EfficientNet-B4's
                 standard ImageNet input resolution.
             fixed_followup_years: the observation time for every sample. Tianjin's follow-up
-                interval is fixed at 2 years for the whole cohort (see module docstring) --
-                exposed as a parameter, not hardcoded, so a future variable-interval source
-                can reuse this same class/interface.
+                interval is fixed at 2 years for the whole cohort, exposed as a parameter
+                rather than hardcoded so a future variable-interval source can reuse this
+                class/interface.
         """
         self.dataset_dir = dataset_dir
         self.image_size = image_size
@@ -112,19 +105,15 @@ class TianjinSurvivalDataset(Dataset):
         manifest["patient_id"] = manifest["patient_id"].astype(str).str.strip()
         print(f"  Total eye-pairs in corrected_manifest.csv: {len(manifest)}")
 
-        # Grading is per-eye, not per-patient (see tianjin_dataset.py's module docstring and
-        # docs/IMPLEMENTATION_PLAN.md Task B.1) -- resolve which eye each manifest row is via
-        # module1/resolve_eye_laterality.py's precomputed output. The same resolved eye
-        # applies to both the baseline and follow-up image of a row, since corrected_manifest
-        # .csv pairs same-eye images by construction.
+        # Resolve which eye each manifest row is via module1/resolve_eye_laterality.py's
+        # precomputed output. The same resolved eye applies to both the baseline and
+        # follow-up image of a row, since corrected_manifest.csv pairs same-eye images by
+        # construction.
         laterality_path = os.path.join(dataset_dir, "laterality_resolved.csv")
         if not os.path.isfile(laterality_path):
             raise FileNotFoundError(
-                f"Could not find laterality_resolved.csv in {dataset_dir}. Tianjin's grade "
-                "columns are per-eye (OS/OD), not per-patient -- run "
-                f"`python module1/resolve_eye_laterality.py --dataset-dir {dataset_dir}` first "
-                "(see tianjin_dataset.py's module docstring and "
-                "docs/IMPLEMENTATION_PLAN.md Task B.3)."
+                f"Could not find laterality_resolved.csv in {dataset_dir}. Run "
+                f"`python module1/resolve_eye_laterality.py --dataset-dir {dataset_dir}` first."
             )
         laterality_df = pd.read_csv(laterality_path)[["key", "eye"]]
         manifest = manifest.merge(laterality_df, on="key", how="left")
@@ -139,9 +128,6 @@ class TianjinSurvivalDataset(Dataset):
                 return row["baseline_od_grade_raw"], row["followup_od_grade_raw"], True
             if row["eye"] == "OS":
                 return row["baseline_os_grade_raw"], row["followup_os_grade_raw"], True
-            # "uncertain" laterality -> fall back to the patient-level worse-eye summary for
-            # this row only, rather than dropping the eye-pair (maximizes usable data, per
-            # docs/IMPLEMENTATION_PLAN.md's explicit instruction to keep every eye-pair).
             return row["baseline_worse_eye_grade_raw"], row["followup_worse_eye_grade_raw"], False
 
         picked = manifest.apply(_pick_eye_grades, axis=1, result_type="expand")
@@ -161,25 +147,18 @@ class TianjinSurvivalDataset(Dataset):
         manifest["baseline_icdr"] = manifest["baseline_grade_raw"].astype(int).map(tianjin_grade_to_icdr)
         manifest["followup_icdr"] = manifest["followup_grade_raw"].astype(int).map(tianjin_grade_to_icdr)
         # Event = progressed by at least one ICDR stage within the fixed follow-up window.
-        # NOT clinically the same claim as "progressed to sight-threatening disease" -- any
-        # upward stage move counts. Flag if this thesis's definition of "progression" should
-        # instead require a specific stage threshold (e.g. reaching PDR).
         manifest["event"] = (manifest["followup_icdr"] > manifest["baseline_icdr"]).astype(int)
         manifest["time_to_followup"] = fixed_followup_years
 
         # Cross-check against the dataset's own reported progression column (1=No, 2=Yes),
-        # where present -- informational only, per docs/IMPLEMENTATION_PLAN.md Task B.5. Does
-        # NOT redefine `event` above -- a real disagreement is a methodology question for the
-        # adviser/Dr. Atienza (what "progression" should mean for this thesis), not something
-        # to resolve by picking whichever definition produces better-looking numbers.
+        # where present. Informational only -- does not redefine `event` above.
         has_dataset_flag = manifest["dataset_reported_progression_raw"].notna()
         if has_dataset_flag.any():
             dataset_event = (manifest.loc[has_dataset_flag, "dataset_reported_progression_raw"] == 2).astype(int)
             agreement = (dataset_event == manifest.loc[has_dataset_flag, "event"]).mean()
             print(
                 f"  Cross-check vs. dataset's own 'Progression' column: {agreement:.1%} "
-                f"agreement on {int(has_dataset_flag.sum())} rows with both labels (event "
-                "definition unchanged -- see module docstring)"
+                f"agreement on {int(has_dataset_flag.sum())} rows with both labels"
             )
 
         def lookup_lbs(baseline_path):
@@ -197,7 +176,7 @@ class TianjinSurvivalDataset(Dataset):
             raise RuntimeError(
                 "No usable rows after dropping excluded/missing grades and cache misses -- "
                 "Module 3 needs a real progression label and a real LBS value for every "
-                "training sample, unlike Module 2's placeholder-tolerant conditioning."
+                "training sample."
             )
 
         strata, thresholds_by_grade = stratify_lbs_by_grade(
@@ -223,32 +202,16 @@ class TianjinSurvivalDataset(Dataset):
     @staticmethod
     def _load_progression_labels(dataset_dir) -> pd.DataFrame:
         """
-        Reads BOTH the Baseline and 2-Year Follow-up sheets of Organized_Data of
+        Reads both the Baseline and 2-Year Follow-up sheets of Organized_Data of
         Patients.xlsx and returns one row per patient present in both, with separate per-eye
         grade columns for each sheet (baseline_os/od/worse_eye_grade_raw, and the followup_*
-        equivalents) -- grading is per-eye, not per-patient, confirmed against the real file
-        (see tianjin_dataset.py's module docstring and docs/IMPLEMENTATION_PLAN.md Task B.1).
-        Per-eye selection for a specific manifest row happens in __init__, using the same
-        resolved 'eye' column tianjin_dataset.py uses.
+        equivalents). Per-eye selection for a specific manifest row happens in __init__, using
+        the same resolved 'eye' column tianjin_dataset.py uses.
 
         Also reads the follow-up sheet's own "Progression (1=No; 2=Yes)" column as
         dataset_reported_progression_raw, purely as a cross-check against this loader's own
         `event = followup_icdr > baseline_icdr` computation -- see __init__'s agreement-rate
-        print. Missing entirely if that column can't be found (older/different sheet layout).
-
-        This cross-check was run directly against the real xlsx using the WORSE-EYE grade for
-        both sides (since that's well-defined without needing laterality resolution): 563/574
-        patients have a usable worse-eye grade at both timepoints, and the resulting event
-        label agrees with the dataset's own Progression column 97.2% of the time (16
-        disagreements, all in the same direction -- the dataset reports progression in cases
-        where the worse-eye grade delta alone does not). That asymmetry is plausibly because
-        "worse eye" is evaluated independently at each visit and need not be the same physical
-        eye at both timepoints (e.g. the left eye is worse at baseline, the right eye is worse
-        at follow-up) -- worth raising with the adviser/Dr. Atienza alongside the general
-        "what does progression mean here" question this cross-check already flags. The
-        per-eye-resolved (not worse-eye-proxy) version of this cross-check still needs the
-        real baseline photographs to compute, since it depends on module1/
-        resolve_eye_laterality.py's output.
+        print. Missing entirely if that column can't be found.
         """
         xlsx_path = os.path.join(dataset_dir, "Organized_Data of Patients.xlsx")
         if not os.path.isfile(xlsx_path):
@@ -302,7 +265,6 @@ class TianjinSurvivalDataset(Dataset):
         for c in ("followup_os_grade_raw", "followup_od_grade_raw", "followup_worse_eye_grade_raw"):
             fu_df[c] = pd.to_numeric(fu_df[c], errors="coerce")
 
-        # Cross-check only -- see this function's docstring. Never used to define `event`.
         try:
             progression_col = _find_column(fu_df.columns, ["progression"], "dataset-reported progression")
             fu_df = fu_df.rename(columns={progression_col: "dataset_reported_progression_raw"})
@@ -319,8 +281,6 @@ class TianjinSurvivalDataset(Dataset):
                    "followup_worse_eye_grade_raw", "dataset_reported_progression_raw"]
         base_df = base_df[base_cols].drop_duplicates(subset="patient_id")
         fu_df = fu_df[fu_cols].drop_duplicates(subset="patient_id")
-        # inner join: Module 3 needs BOTH grades to compute an event label, unlike Module 2
-        # which only ever needs the baseline grade.
         return base_df.merge(fu_df, on="patient_id", how="inner")
 
     def __len__(self):
@@ -349,10 +309,9 @@ class TianjinSurvivalDataset(Dataset):
 
 def patient_level_split(dataset: TianjinSurvivalDataset, val_fraction=0.2, seed=42):
     """
-    Splits at the PATIENT level, not the row level -- a plain torch.utils.data.random_split
-    could put the same patient's two eyes into both train and val, leaking the label (they
-    share one progression event) across the split. Matches docs/DATASETS.md's recommended
-    Tianjin split convention (patient-level, both eyes together).
+    Splits at the patient level, not the row level -- a plain torch.utils.data.random_split
+    could put the same patient's two eyes into both train and val, leaking the label across
+    the split.
     """
     patient_ids = dataset.manifest["patient_id"].tolist()
     unique_patients = sorted(set(patient_ids))

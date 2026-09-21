@@ -130,8 +130,7 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
             module1/train_registration.py, shared across all three sources (it's keyed by
             (source, baseline_path), see that script's docstring) -- substitutes a
             pre-registered, baseline-aligned follow-up image in place of the raw one wherever
-            an entry exists. None (the default) uses raw follow-up images everywhere, exactly
-            as before Task E/F (see docs/IMPLEMENTATION_PLAN.md).
+            an entry exists. None (the default) uses raw follow-up images everywhere.
 
     Returns:
         DataLoader yielding batches from all loaded datasets

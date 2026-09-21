@@ -3,15 +3,9 @@ Training-only affine registration network: predicts a 2x3 affine matrix that war
 follow-up image onto its baseline's coordinate frame, trained self-supervised via photometric
 reconstruction loss (no manual correspondence labels required).
 
-Used ONLY during Module 2's training-data preparation (to spatially align baseline<->follow-up
-pairs before they supervise the GAN) -- never at inference time, since inference only ever
-needs a single baseline image with no follow-up to align against. This matches the
-manuscript's "training-only image registration network" framing (see
-docs/IMPLEMENTATION_PLAN.md Task E). Confirmed absent from the official DRForecastGAN release
-(no "registration" hit anywhere in it -- see CLAUDE.md/docs/ROADMAP.md) -- this is new
-engineering, not something recovered from upstream code, scoped to a spatial transformer
-network rather than the lit review's full feature+intensity hybrid approach (Zhou et al.) for
-buildability in this timeframe.
+Used only during Module 2's training-data preparation, to spatially align baseline<->follow-up
+pairs before they supervise the GAN -- not used at inference time, since inference only needs
+a single baseline image with no follow-up to align against.
 """
 import torch
 import torch.nn as nn

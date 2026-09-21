@@ -2,33 +2,21 @@
 Module 3 proof-of-concept training run: EfficientNet-B4 + Weibull survival head, trained on
 Tianjin's baseline -> 2-year-follow-up progression labels (see dataset.py).
 
-Independently trained from Module 1's classifier -- no shared weights (docs/DECISIONS.md).
+Independently trained from Module 1's classifier -- no shared weights.
 
-HONEST FRAMING -- read before presenting any result from this script (docs/DECISIONS.md,
-docs/ROADMAP.md's "Consequence of the Tianjin timing structure" note):
-  - Tianjin's follow-up interval is a FIXED 2 years for every patient, not a variable one, and
-    we only ever observe whether progression happened by that single checkpoint -- not the
-    exact progression date. This is current-status / case-1 interval-censored data, and the
-    training loss (weibull_current_status_nll in model.py) is written for exactly that
-    likelihood, not the exact-event-time Weibull likelihood appropriate for variable-timing
-    data (e.g. a future DCCT/EDIC or Moorfields source).
-  - Because every training example is observed at the SAME t=2yr, this can only ever calibrate
-    the model's predicted P(progression by 2 years) = 1 - S(2) well. The predicted shape/scale
-    parameters extrapolate a full survival curve S(t) to other horizons t != 2 WITHOUT any
-    training signal at those horizons -- report S(2)/"probability of progression by 2 years"
-    as the result, not curves at other time points, unless/until a variable-timing source is
-    available to actually supervise them.
-  - Report predictions as population-level probabilistic estimates with the AUROC/calibration
-    numbers below, not as per-patient point predictions presented as certain (docs/DECISIONS.md's
-    "two-visit data means honest framing" rule).
-  - "Progression" here means "follow-up ICDR grade > baseline ICDR grade" (any upward stage
-    move). That is not necessarily the same clinical claim as "progressed to sight-threatening
-    disease" -- flag to the adviser/Dr. Atienza if the thesis needs a stricter definition
-    (e.g. reaching PDR specifically).
+Tianjin's follow-up interval is fixed at 2 years for every patient, and only whether
+progression happened by that single checkpoint is observed, not the exact progression date.
+This is current-status / case-1 interval-censored data, and the training loss
+(weibull_current_status_nll in model.py) is written for that likelihood, not the
+exact-event-time Weibull likelihood used for variable-timing data. Since every training
+example is observed at the same t=2yr, this calibrates the model's predicted P(progression by
+2 years) = 1 - S(2); the predicted shape/scale parameters extrapolate a full survival curve
+S(t) to other horizons t != 2 without training signal at those horizons.
 
-POC scale: ImageNet-pretrained EfficientNet-B4 backbone (fine-tuned, not trained from scratch
--- Tianjin's post-exclusion N is too small for that), reduced epochs, patient-level train/val
-split (see dataset.py::patient_level_split).
+"Progression" here means "follow-up ICDR grade > baseline ICDR grade" (any upward stage move).
+
+POC scale: ImageNet-pretrained EfficientNet-B4 backbone (fine-tuned, not trained from scratch),
+reduced epochs, patient-level train/val split (see dataset.py::patient_level_split).
 
 Usage (Colab, after notebook 05 has built module1_outputs_tianjin.pt):
     python train_module3_poc.py \
@@ -65,10 +53,10 @@ class Config:
 
 def evaluate(model, loader, device):
     """
-    POC eval AT t=2 years (Tianjin's only observed horizon): mean predicted P(progression) vs.
-    actual event rate, plus AUROC as a discrimination metric. This is NOT a concordance index
-    -- concordance needs varying observation/event times to compare risk orderings across
-    different horizons, and every Tianjin subject shares the same one (see module docstring).
+    Evaluation at t=2 years (Tianjin's only observed horizon): mean predicted P(progression)
+    vs. actual event rate, plus AUROC as a discrimination metric. Not a concordance index --
+    concordance needs varying observation/event times, and every Tianjin subject shares the
+    same one.
     """
     from sklearn.metrics import roc_auc_score
 
@@ -133,7 +121,7 @@ def train(config: Config):
     model = EfficientNetWeibullSurvival(pretrained=True).to(device)
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
 
-    print(f"\n[3/4] Training for {config.num_epochs} epochs (POC scale -- see module docstring)...")
+    print(f"\n[3/4] Training for {config.num_epochs} epochs (POC scale)...")
     start_time = time.time()
     for epoch in range(config.num_epochs):
         epoch_loss = 0.0
@@ -156,7 +144,7 @@ def train(config: Config):
         avg_loss = epoch_loss / len(train_loader) if len(train_loader) else float("nan")
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] | NLL: {avg_loss:.4f} | Elapsed: {elapsed / 60:.1f}min")
 
-    print("\n[4/4] Evaluating on held-out patients (see module docstring's honest-framing note)...")
+    print("\n[4/4] Evaluating on held-out patients...")
     metrics = evaluate(model, val_loader, device)
     print(
         f"✓ n={metrics['n']} | mean predicted P(progression by 2yr)="
@@ -174,12 +162,9 @@ def train(config: Config):
         "metrics": metrics,
         "total_time_min": (time.time() - start_time) / 60,
     }
-    # Without this, no new image (including a Module-2-synthesized one) can be classified
-    # into a low/medium/high LBS stratum after training ends -- stratify_lbs_by_grade only
-    # ever fits fresh percentiles from a whole batch, which is meaningless for a single new
-    # image (see module1/compute_lbs.py::classify_lbs_stratum and
-    # docs/IMPLEMENTATION_PLAN.md Task I). Keys are cast to plain int and values to list since
-    # JSON can't serialize numpy scalars or tuples directly.
+    # Saved so a new image's LBS can be classified into low/medium/high after training ends,
+    # via module1/compute_lbs.py::classify_lbs_stratum. Keys cast to plain int and values to
+    # list since JSON can't serialize numpy scalars or tuples directly.
     results["lbs_thresholds_by_grade"] = {
         int(k): list(v) for k, v in full_dataset.lbs_thresholds_by_grade.items()
     }
