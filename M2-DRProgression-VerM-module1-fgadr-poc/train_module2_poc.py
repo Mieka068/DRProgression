@@ -23,7 +23,17 @@ change:
   4. At the end of training, computes FID/PSNR/SSIM (torchmetrics + torch-fidelity) between
      synthesized and real follow-up images on a held-out slice of the loader -- small/short-run
      numbers, not a claim of matching DRForecastGAN's published benchmark
-     (FID 27.3/PSNR 25.3/SSIM 0.93).
+     (FID 27.3/PSNR 25.3/SSIM 0.93). This single-step number does NOT answer RQ1's per-step
+     question -- run evaluate_trajectory.py separately afterward for that (see its docstring
+     and docs/IMPLEMENTATION_PLAN.md Task D).
+  5. The Generator (DRForestGAN-v2/base_model.py) now uses AdaIN stage conditioning in its
+     bottleneck, additive to the original channel-concat conditioning (docs/IMPLEMENTATION_PLAN.md
+     Task C) -- this changes its state_dict keys, so a checkpoint from before this change will
+     NOT load here. Retrain from scratch.
+  6. registration_cache_path, if given, substitutes a pre-registered (baseline-aligned)
+     follow-up image wherever module1/train_registration.py produced one, in place of the raw
+     follow-up image (docs/IMPLEMENTATION_PLAN.md Task E/F). None (the default) uses raw
+     follow-up images everywhere, unchanged from before Task E.
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -68,11 +78,13 @@ class Config:
     longdr_module1_cache_path = None
     tianjin_module1_cache_path = None
     tianjin_min_pair_quality = None
+    registration_cache_path = None  # optional -- see module1/train_registration.py
 
-    # Model (unchanged from train_combined.py)
+    # Model
     g_conv_dim = 64
     d_conv_dim = 64
     c_dim = 5
+    style_dim = None  # AdaIN style vector size; None -> defaults to c_dim (see base_model.py)
     g_repeat_num = 6
     d_repeat_num = 6
 
@@ -192,11 +204,13 @@ def train(config: Config):
         longdr_module1_cache_path=config.longdr_module1_cache_path,
         tianjin_module1_cache_path=config.tianjin_module1_cache_path,
         tianjin_min_pair_quality=config.tianjin_min_pair_quality,
+        registration_cache_path=config.registration_cache_path,
     )
     print(f"✓ Real pairs: {num_pairs}, effective samples: {len(loader.dataset)}, batches/epoch: {len(loader)}")
 
     print("\n[2/4] Initializing models...")
-    G = Generator(conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num).to(device)
+    G = Generator(conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num,
+                  style_dim=config.style_dim).to(device)
     D = Discriminator(
         image_size=config.image_size, conv_dim=config.d_conv_dim, c_dim=config.c_dim, repeat_num=config.d_repeat_num
     ).to(device)
@@ -292,6 +306,7 @@ def train(config: Config):
         "longdr_module1_cache_path": config.longdr_module1_cache_path,
         "tianjin_dir": config.tianjin_dir,
         "tianjin_module1_cache_path": config.tianjin_module1_cache_path,
+        "registration_cache_path": config.registration_cache_path,
         "metrics": metrics,
         "total_time_min": (time.time() - start_time) / 60,
     }
@@ -312,6 +327,11 @@ if __name__ == "__main__":
     parser.add_argument("--longdr-module1-cache", default=None)
     parser.add_argument("--tianjin-module1-cache", default=None)
     parser.add_argument("--tianjin-min-pair-quality", type=float, default=None)
+    parser.add_argument("--registration-cache", default=None,
+                         help="Optional path to a module1/train_registration.py cache; omit to "
+                              "use raw follow-up images (default, unchanged from before Task E)")
+    parser.add_argument("--style-dim", type=int, default=None,
+                         help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     args = parser.parse_args()
@@ -324,6 +344,8 @@ if __name__ == "__main__":
     cfg.longdr_module1_cache_path = args.longdr_module1_cache
     cfg.tianjin_module1_cache_path = args.tianjin_module1_cache
     cfg.tianjin_min_pair_quality = args.tianjin_min_pair_quality
+    cfg.registration_cache_path = args.registration_cache
+    cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
 

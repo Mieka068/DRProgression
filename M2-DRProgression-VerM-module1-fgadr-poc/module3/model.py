@@ -6,9 +6,13 @@ weights, per docs/DECISIONS.md's module-independence rule; this is a different a
 entirely, not just a separate instance of the same one.
 
 Takes the LBS stratum (see module1/compute_lbs.py, reused here via
-module3/dataset.py::stratify_lbs_by_grade) as an auxiliary input alongside the fundus image,
-since LBS is meant to do double duty as both Module 2's fallback-synthesis target and Module
-3's own survival-analysis input feature (docs/DECISIONS.md).
+module3/dataset.py::stratify_lbs_by_grade) AND the baseline eye's own severity grade (ICDR
+0-4) as auxiliary inputs alongside the fundus image, since LBS is meant to do double duty as
+both Module 2's fallback-synthesis target and Module 3's own survival-analysis input feature
+(docs/DECISIONS.md). The baseline-grade embedding (added per
+docs/IMPLEMENTATION_PLAN.md Task H) is what lets the model distinguish "mild->moderate" risk
+from "severe->PDR" risk -- without it, the only severity signal available is whatever the
+image implicitly encodes.
 
 Outputs Weibull distribution parameters (shape k, scale lambda) per patient rather than a
 point estimate -- train_module3_poc.py's module docstring explains why this only calibrates
@@ -20,10 +24,12 @@ import torch.nn.functional as F
 from torchvision.models import efficientnet_b4, EfficientNet_B4_Weights
 
 NUM_LBS_STRATA = 3  # low/medium/high -- see module1/compute_lbs.py::stratify_lbs
+NUM_STAGES = 5  # ICDR 0-4, matching baseline_grade_icdr in module3/dataset.py
 
 
 class EfficientNetWeibullSurvival(nn.Module):
-    def __init__(self, pretrained=True, lbs_embedding_dim=8, hidden_dim=128, dropout=0.3):
+    def __init__(self, pretrained=True, lbs_embedding_dim=8, grade_embedding_dim=8,
+                 hidden_dim=128, dropout=0.3):
         super().__init__()
         weights = EfficientNet_B4_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = efficientnet_b4(weights=weights)
@@ -32,18 +38,20 @@ class EfficientNetWeibullSurvival(nn.Module):
         self.backbone = backbone
 
         self.lbs_embedding = nn.Embedding(NUM_LBS_STRATA, lbs_embedding_dim)
+        self.grade_embedding = nn.Embedding(NUM_STAGES, grade_embedding_dim)
 
         self.head = nn.Sequential(
-            nn.Linear(backbone_out_features + lbs_embedding_dim, hidden_dim),
+            nn.Linear(backbone_out_features + lbs_embedding_dim + grade_embedding_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 2),  # [pre_shape, pre_scale] -- squashed positive below
         )
 
-    def forward(self, image, lbs_stratum_idx):
+    def forward(self, image, lbs_stratum_idx, baseline_grade_icdr):
         features = self.backbone(image)
         lbs_emb = self.lbs_embedding(lbs_stratum_idx)
-        combined = torch.cat([features, lbs_emb], dim=1)
+        grade_emb = self.grade_embedding(baseline_grade_icdr)
+        combined = torch.cat([features, lbs_emb, grade_emb], dim=1)
         out = self.head(combined)
         # softplus keeps shape/scale strictly positive with better-behaved gradients near 0
         # than exp(); +eps avoids a degenerate zero-scale/zero-shape Weibull.
@@ -80,7 +88,8 @@ if __name__ == "__main__":
     model = EfficientNetWeibullSurvival(pretrained=False)
     image = torch.randn(2, 3, 380, 380)
     lbs_idx = torch.tensor([0, 2])
-    shape, scale = model(image, lbs_idx)
+    baseline_grade = torch.tensor([1, 3])
+    shape, scale = model(image, lbs_idx, baseline_grade)
     print(f"shape: {shape.tolist()}, scale: {scale.tolist()}")
 
     t = torch.tensor([2.0, 2.0])

@@ -31,16 +31,39 @@ retinal-dr-longitudinal), rooted at `dataset_dir`:
     Organized_Data of Patients.xlsx
     corrected_manifest.csv
 
-Grade scale mapping (FLAG THIS -- verify against DRG-Net's own scale before trusting numbers
-downstream): the dataset documents "DR grade: Ordinal, ETDRS severity scale (1-5)", while this
-pipeline's `target_grade` one-hot elsewhere (fire_dataset.py, longdr_dataset.py,
-module1/compute_lbs.py's self-test print) is DRG-Net's ICDR scale, 0-4 (0=no DR ... 4=PDR).
-We assume the Tianjin 1-5 scale is the same 5-stage ordering with a 1-based offset (so grade
-1 -> ICDR 0, ..., grade 5 -> ICDR 4) and map by subtracting 1. This is a naming/offset
-assumption, not a verified concordance between ETDRS and ICDR grading criteria -- flag it to
-Dr. Atienza or the adviser before using Tianjin-conditioned results as a grading claim.
-Grades 6 (post-photocoagulation) and 7 (ungradable) are dropped per the dataset card's own
-instruction, since neither reflects natural disease severity.
+Grade scale mapping: the dataset's embedded column legend reads "1=No Apparent Retinopathy;
+2=Mild NPDR; 3=Moderate NPDR; 4=Severe NPDR; 5=PDR; 6=After laser; 7=Missing" -- this matches
+ICDR's 5-stage ordering exactly, just 1-indexed, so mapping by subtracting 1 (grade 1 -> ICDR
+0, ..., grade 5 -> ICDR 4) is confirmed correct (see docs/IMPLEMENTATION_PLAN.md Task B.1).
+Whether ETDRS and ICDR are clinically equivalent staging *criteria* (not just numerically
+parallel labels) is still worth Dr. Atienza/the adviser's sign-off before this appears in the
+methodology chapter -- the numeric offset itself is not in question, the clinical equivalence
+claim is. Grades 6 (post-photocoagulation) and 7 (ungradable/missing) are dropped per the
+dataset's own column legend, since neither reflects natural disease severity.
+
+GRADING IS PER-EYE, NOT PER-PATIENT -- confirmed directly (this loader's own _load_grades()
+was run against the real Organized_Data of Patients.xlsx and corrected_manifest.csv, not
+inferred): Organized_Data of Patients.xlsx has no single "DR grade" column. Instead each
+sheet has three columns: an "OS Grade" (left eye), an "OD Grade" (right eye), and an
+"At-risk Eye Grade (Worse eye)" patient-level summary. corrected_manifest.csv has one row per
+EYE (a patient can appear twice) but carries no OD/OS marker, and neither do the baseline
+filenames. Per instruction, every eye-pair is kept as its own training sample (not collapsed
+to one row per patient) to maximize data, especially for Module 3 -- this means we cannot
+skip resolving which eye a given row actually is: of 613 real patients with both an OS and OD
+grade present, 102 (16.6%) have a different OS grade than OD grade, so guessing wrong is a
+real mislabeling risk, not a rounding error (both this exact count and the 476/473
+OS/OD-at-Stage-0 counts referenced in docs/ROADMAP.md's Task G note were independently
+reproduced against the real file, not just carried over from the plan that first reported
+them). All 1,115 real corrected_manifest.csv rows matched a patient_id present in the xlsx --
+no ID-format mismatch (e.g. zero-padding) actually occurs in this dataset, despite the
+generic warning below being kept as a safety net for a differently-formatted future export.
+Laterality is resolved by module1/resolve_eye_laterality.py (optic disc position heuristic)
+into `laterality_resolved.csv`, which this loader requires -- see __init__. That heuristic
+itself still needs validating against the real baseline photographs (not done as of this
+note -- it requires the actual images, which metadata-only verification can't substitute
+for). Rows whose laterality couldn't be confidently resolved ("uncertain") fall back to the
+At-risk Eye Grade (Worse eye) column for that row only, tracked via the
+`grade_is_eye_specific` output key, rather than being dropped.
 
 Module 1 cache key scheme (see module1/apply_to_progression_data.py): that script's cache is
 keyed by the image's path relative to whatever `--images-dir` it was pointed at, extension
@@ -85,8 +108,10 @@ def _find_column(columns, must_contain, label):
     """
     Case/space-insensitive match: returns the first column whose normalized name contains
     every token in `must_contain`. Raises with the real column list on a miss, rather than
-    silently mis-mapping a column -- see module docstring's note on the xlsx schema being
-    unverified against the real downloaded file.
+    silently mis-mapping a column. Verified directly against the real Organized_Data of
+    Patients.xlsx: `["id"]` and `["atrisk","grade"]` both match their intended column
+    correctly there (see _find_eye_grade_column for the one case -- "os"/"od" -- where a
+    plain substring match like this one is NOT safe).
     """
     for col in columns:
         norm = _normalize_colname(col)
@@ -97,6 +122,30 @@ def _find_column(columns, must_contain, label):
         f"{must_contain} (case/space-insensitive). Actual columns in the sheet: {list(columns)}. "
         f"Update the matching tokens in tianjin_dataset.py::_load_grades if the real header "
         f"wording differs."
+    )
+
+
+def _find_eye_grade_column(columns, eye_prefix, label):
+    """
+    Matches a column whose normalized name STARTS WITH `eye_prefix` ('os' or 'od') and also
+    contains 'grade'. A plain substring-anywhere match (like _find_column) is UNSAFE for these
+    two specifically: the real OS/OD Grade columns embed their full numeric legend inline
+    (e.g. "...3=Moderate Non-Proliferative Diabetic Retinopathy...") and "Moderate" itself
+    contains the literal substring "od" ("m-OD-erate"), which silently matches the OD lookup
+    against the OS column instead. This was caught with a synthetic fixture before the real
+    file was available, and this exact function has since been re-run directly against the
+    real Organized_Data of Patients.xlsx (both the Baseline and 2-Year Follow-up sheets) and
+    correctly resolves OS/OD/At-risk to three distinct columns -- not a hypothetical risk.
+    Requiring the eye token as a PREFIX, not just present anywhere, avoids the collision since
+    the real columns are always literally named "OS Grade(...)" / "OD Grade(...)".
+    """
+    for col in columns:
+        norm = _normalize_colname(col)
+        if norm.startswith(eye_prefix) and "grade" in norm:
+            return col
+    raise KeyError(
+        f"Could not find a column for {label}: looked for a column name STARTING WITH "
+        f"'{eye_prefix}' and containing 'grade'. Actual columns: {list(columns)}."
     )
 
 
@@ -127,11 +176,14 @@ class TianjinLongitudinalDataset(Dataset):
     grade filter keeps a row.
 
     Returns the same dict keys as FIREDataset/LongDRScreeningDataset so this drops straight
-    into combined_dataset.py's ConcatDataset, plus three extra keys ('grade_is_real',
-    'patient_id', 'pair_quality') that those two never set -- combined_dataset.py's
-    AugmentedPairDataset fills in defaults for those keys on FIRE/LongDR samples so every
-    sample in a mixed batch has the same dict shape (default_collate requires this).
+    into combined_dataset.py's ConcatDataset, plus four extra keys ('grade_is_real',
+    'patient_id', 'pair_quality', 'grade_is_eye_specific') that those two never set --
+    combined_dataset.py's AugmentedPairDataset fills in defaults for those keys on FIRE/LongDR
+    samples so every sample in a mixed batch has the same dict shape (default_collate requires
+    this).
     """
+
+    SOURCE_NAME = "Tianjin"
 
     def __init__(
         self,
@@ -139,6 +191,7 @@ class TianjinLongitudinalDataset(Dataset):
         image_size=128,
         min_pair_quality=None,
         module1_cache_path=None,
+        registration_cache_path=None,
     ):
         """
         Args:
@@ -158,6 +211,10 @@ class TianjinLongitudinalDataset(Dataset):
                 NOT fall back to this cache first -- the real clinical grade from the xlsx
                 always wins when present, since it's more reliable than a Module 1 prediction.
                 The cache is only consulted for the lesion mask channel.
+            registration_cache_path: Optional path to a cache produced by
+                module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
+                Same fallback behavior as FIREDataset -- see its docstring and
+                docs/IMPLEMENTATION_PLAN.md Task E/F.
         """
         self.dataset_dir = dataset_dir
         self.image_size = image_size
@@ -166,6 +223,11 @@ class TianjinLongitudinalDataset(Dataset):
         if module1_cache_path:
             self.module1_cache = torch.load(module1_cache_path, weights_only=False)
             print(f"✓ Loaded Module 1 cache: {len(self.module1_cache)} images ({module1_cache_path})")
+
+        self.registration_cache = None
+        if registration_cache_path:
+            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
+            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
 
         manifest_path = os.path.join(dataset_dir, "corrected_manifest.csv")
         if not os.path.isfile(manifest_path):
@@ -187,9 +249,43 @@ class TianjinLongitudinalDataset(Dataset):
             manifest = manifest[manifest["quality"] >= min_pair_quality]
             print(f"  Quality filter (>= {min_pair_quality}): {before} -> {len(manifest)} pairs")
 
-        grades = self._load_grades(dataset_dir)
+        # Grading is per-eye, not per-patient (see module docstring) -- resolve which eye each
+        # manifest row is via module1/resolve_eye_laterality.py's precomputed output. Required,
+        # not optional: without it there's no reliable way to pick OS vs. OD grade for a row.
+        laterality_path = os.path.join(dataset_dir, "laterality_resolved.csv")
+        if not os.path.isfile(laterality_path):
+            raise FileNotFoundError(
+                f"Could not find laterality_resolved.csv in {dataset_dir}. Tianjin's grade "
+                "columns are per-eye (OS/OD), not per-patient, and corrected_manifest.csv "
+                "doesn't say which eye a given row is -- run "
+                "`python module1/resolve_eye_laterality.py --dataset-dir " + dataset_dir + "` "
+                "first (see its module docstring and docs/IMPLEMENTATION_PLAN.md Task B.3)."
+            )
+        laterality_df = pd.read_csv(laterality_path)[["key", "eye"]]
+
         manifest["patient_id"] = manifest["patient_id"].astype(str).str.strip()
+        manifest = manifest.merge(laterality_df, on="key", how="left")
+        manifest["eye"] = manifest["eye"].fillna("uncertain")
+
+        grades = self._load_grades(dataset_dir)
         manifest = manifest.merge(grades, on="patient_id", how="left")
+
+        def _pick_grade(row):
+            if row["eye"] == "OD":
+                return row["od_grade_raw"], True
+            if row["eye"] == "OS":
+                return row["os_grade_raw"], True
+            # "uncertain" laterality -> fall back to the patient-level worse-eye summary for
+            # this row only (per docs/IMPLEMENTATION_PLAN.md's fallback policy), rather than
+            # dropping the eye-pair -- keeps every sample usable, maximizing training data.
+            return row["worse_eye_grade_raw"], False
+
+        picked = manifest.apply(_pick_grade, axis=1, result_type="expand")
+        manifest["dr_grade_raw"] = picked[0]
+        manifest["grade_is_eye_specific"] = picked[1]
+        n_eye_specific = int(manifest["grade_is_eye_specific"].sum())
+        print(f"  Eye-specific grade resolved for {n_eye_specific}/{len(manifest)} rows "
+              f"({len(manifest) - n_eye_specific} fell back to the worse-eye summary)")
 
         match_rate = manifest["dr_grade_raw"].notna().mean() if len(manifest) else 0.0
         if match_rate < 0.5:
@@ -224,15 +320,16 @@ class TianjinLongitudinalDataset(Dataset):
     def _load_grades(dataset_dir) -> pd.DataFrame:
         """
         Reads the Baseline sheet of Organized_Data of Patients.xlsx and returns a
-        (patient_id, dr_grade_raw) frame. Baseline grade is used (not the 2-year follow-up
-        grade) because Module 2's conditioning input is the baseline image's stage -- the
-        follow-up grade is exactly what a downstream evaluation would want to compare a
-        synthesized image's *predicted* stage against, not feed in as input.
+        (patient_id, os_grade_raw, od_grade_raw, worse_eye_grade_raw) frame -- one row per
+        patient, since the real xlsx has separate per-eye grade columns rather than one flat
+        "DR grade" column (confirmed against the real downloaded file -- see module docstring
+        and docs/IMPLEMENTATION_PLAN.md Task B.1). Per-eye selection for a specific manifest
+        row happens in __init__, using the resolved 'eye' column from
+        module1/resolve_eye_laterality.py's laterality_resolved.csv.
 
         Sheet and column names are matched case/space-insensitively rather than by exact
-        string, since the dataset card's documented schema hasn't been confirmed against a
-        real downloaded copy of the workbook -- see module docstring. A miss raises with the
-        actual sheet/column names found, rather than silently mis-mapping one.
+        string. A miss raises with the actual sheet/column names found, rather than silently
+        mis-mapping one.
         """
         xlsx_path = os.path.join(dataset_dir, "Organized_Data of Patients.xlsx")
         if not os.path.isfile(xlsx_path):
@@ -249,15 +346,32 @@ class TianjinLongitudinalDataset(Dataset):
             )
         df = xl.parse(sheet_name)
 
-        id_col = _find_column(df.columns, ["patient", "id"], "patient ID")
-        grade_col = _find_column(df.columns, ["dr", "grade"], "DR grade")
+        try:
+            id_col = _find_column(df.columns, ["id"], "patient ID")
+            os_col = _find_eye_grade_column(df.columns, "os", "OS (left eye) grade")
+            od_col = _find_eye_grade_column(df.columns, "od", "OD (right eye) grade")
+            worse_col = _find_column(df.columns, ["atrisk", "grade"], "at-risk (worse eye) grade")
+        except KeyError as e:
+            raise KeyError(
+                f"{e}\nAll normalized column names in sheet '{sheet_name}': "
+                f"{[(c, _normalize_colname(c)) for c in df.columns]}. If the real header "
+                "wording differs from what's expected here, fix the matching tokens in "
+                "tianjin_dataset.py::_load_grades (or reference the column by its exact "
+                "string directly, per docs/IMPLEMENTATION_PLAN.md Task B.4's note)."
+            ) from e
         print(f"  Reading grades from sheet '{sheet_name}': patient_id <- '{id_col}', "
-              f"dr_grade_raw <- '{grade_col}'")
+              f"OS <- '{os_col}', OD <- '{od_col}', worse-eye <- '{worse_col}'")
 
-        df = df.rename(columns={id_col: "patient_id", grade_col: "dr_grade_raw"})
+        df = df.rename(columns={
+            id_col: "patient_id", os_col: "os_grade_raw", od_col: "od_grade_raw",
+            worse_col: "worse_eye_grade_raw",
+        })
         df["patient_id"] = df["patient_id"].astype(str).str.strip()
-        df["dr_grade_raw"] = pd.to_numeric(df["dr_grade_raw"], errors="coerce")
-        return df[["patient_id", "dr_grade_raw"]].drop_duplicates(subset="patient_id")
+        for c in ("os_grade_raw", "od_grade_raw", "worse_eye_grade_raw"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df[["patient_id", "os_grade_raw", "od_grade_raw", "worse_eye_grade_raw"]].drop_duplicates(
+            subset="patient_id"
+        )
 
     def __len__(self):
         return len(self.manifest)
@@ -270,7 +384,18 @@ class TianjinLongitudinalDataset(Dataset):
 
         try:
             img1 = Image.open(baseline_path).convert("RGB")
-            img2 = Image.open(followup_path).convert("RGB")
+            warped = (
+                self.registration_cache.get((self.SOURCE_NAME, row["baseline_path"]))
+                if self.registration_cache
+                else None
+            )
+            if warped is not None:
+                # Pre-registered (baseline-aligned) follow-up, per
+                # docs/IMPLEMENTATION_PLAN.md Task F -- falls back to the raw follow-up
+                # image otherwise.
+                img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
+            else:
+                img2 = Image.open(followup_path).convert("RGB")
         except Exception:
             return self.__getitem__((idx + 1) % len(self.manifest))
 
@@ -316,6 +441,7 @@ class TianjinLongitudinalDataset(Dataset):
             "grade_is_real": grade_is_real,
             "patient_id": row["patient_id"],
             "pair_quality": float(row["quality"]) if "quality" in row and pd.notna(row["quality"]) else -1.0,
+            "grade_is_eye_specific": bool(row["grade_is_eye_specific"]) if "grade_is_eye_specific" in row else False,
         }
 
 

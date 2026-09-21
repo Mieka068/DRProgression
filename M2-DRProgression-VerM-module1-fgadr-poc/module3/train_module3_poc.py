@@ -78,10 +78,11 @@ def evaluate(model, loader, device):
         for batch in loader:
             image = batch["baseline"].to(device)
             lbs_idx = batch["lbs_stratum_idx"].to(device)
+            baseline_grade = batch["baseline_grade_icdr"].to(device)
             t = batch["time_to_followup"].to(device)
             event = batch["event"]
 
-            shape, scale = model(image, lbs_idx)
+            shape, scale = model(image, lbs_idx, baseline_grade)
             s_t = model.survival_function(shape, scale, t)
             prob_progression = (1 - s_t).cpu()
 
@@ -139,10 +140,11 @@ def train(config: Config):
         for batch in train_loader:
             image = batch["baseline"].to(device)
             lbs_idx = batch["lbs_stratum_idx"].to(device)
+            baseline_grade = batch["baseline_grade_icdr"].to(device)
             t = batch["time_to_followup"].to(device)
             event = batch["event"].to(device)
 
-            shape, scale = model(image, lbs_idx)
+            shape, scale = model(image, lbs_idx, baseline_grade)
             loss = weibull_current_status_nll(shape, scale, t, event)
 
             optimizer.zero_grad()
