@@ -93,6 +93,36 @@ def stratify_lbs(lbs_values):
     return [label(v) for v in lbs_values], (float(p33), float(p66))
 
 
+def stratify_lbs_by_grade(lbs_values, grades):
+    """
+    Real caller for stratify_lbs's own documented intent: computes 33rd/66th percentile LBS
+    thresholds independently WITHIN each severity-grade group (burden is only meaningful
+    relative to peers at the same stage, not compared globally across stages -- see
+    stratify_lbs's docstring), then returns one low/medium/high label per input value in the
+    original order. Used by Module 3's survival input pipeline (see module3/dataset.py) --
+    previously stratify_lbs only had its own __main__ self-test as a caller (see
+    docs/ROADMAP.md's Objective 3 section).
+
+    Args:
+        lbs_values: sequence of LBS floats.
+        grades: sequence of severity grades (e.g. ICDR 0-4), same length/order as lbs_values.
+    Returns:
+        (labels, thresholds_by_grade) -- labels is a list aligned to the input order;
+        thresholds_by_grade is {grade: (p33, p66)}.
+    """
+    lbs_values = np.asarray(lbs_values, dtype=float)
+    grades = np.asarray(grades)
+    labels = [None] * len(lbs_values)
+    thresholds_by_grade = {}
+    for grade in np.unique(grades):
+        idx = np.where(grades == grade)[0]
+        group_labels, thresholds = stratify_lbs(lbs_values[idx])
+        thresholds_by_grade[grade] = thresholds
+        for i, label in zip(idx, group_labels):
+            labels[i] = label
+    return labels, thresholds_by_grade
+
+
 if __name__ == "__main__":
     import argparse
 

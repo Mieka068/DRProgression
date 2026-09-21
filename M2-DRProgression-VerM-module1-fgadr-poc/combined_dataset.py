@@ -1,5 +1,5 @@
 """
-Combined FIRE + LongDRScreening Dataset Loader with Augmentation
+Combined FIRE + LongDRScreening + Tianjin Dataset Loader with Augmentation
 Maximizes training data for the GAN
 """
 
@@ -12,6 +12,7 @@ import random
 
 from fire_dataset import FIREDataset
 from longdr_dataset import LongDRScreeningDataset
+from tianjin_dataset import TianjinLongitudinalDataset
 
 
 class AugmentedPairDataset(Dataset):
@@ -43,7 +44,19 @@ class AugmentedPairDataset(Dataset):
         
         sample['baseline'] = baseline
         sample['follow_up'] = follow_up
-        
+
+        # TianjinLongitudinalDataset samples carry three extra keys (grade_is_real,
+        # patient_id, pair_quality) that FIRE/LongDR samples don't set. A DataLoader batch can
+        # mix samples from different sources (ConcatDataset + shuffle), and
+        # torch.utils.data.default_collate requires every sample dict in a batch to have the
+        # same keys -- it iterates the *first* sample's keys and indexes every other sample by
+        # them, so a missing key crashes collation as soon as a batch happens to start with a
+        # Tianjin sample. Default them here so every sample this dataset yields has the same
+        # shape regardless of source.
+        sample.setdefault('grade_is_real', False)
+        sample.setdefault('patient_id', sample.get('eye_id', 'n/a'))
+        sample.setdefault('pair_quality', -1.0)
+
         return sample
     
     def _sync_augment(self, img1, img2):
@@ -86,23 +99,34 @@ class AugmentedPairDataset(Dataset):
 
 def get_combined_loader(fire_dir='./FIRE_dataset',
                         longdr_dir='./LongDRScreening_20150209',
+                        tianjin_dir=None,
                         image_size=128,
                         batch_size=4,
                         augment=True,
                         num_workers=0,
                         fire_module1_cache_path=None,
-                        longdr_module1_cache_path=None):
+                        longdr_module1_cache_path=None,
+                        tianjin_module1_cache_path=None,
+                        tianjin_min_pair_quality=None):
     """
-    Get a DataLoader combining FIRE + LongDRScreening with augmentation.
+    Get a DataLoader combining FIRE + LongDRScreening + (optionally) Tianjin, with augmentation.
 
     Args:
         fire_module1_cache_path: Optional module1/apply_to_progression_data.py cache
             (see FIREDataset docstring) -- real grade/mask conditioning instead of the
             placeholder empty-mask/Stage-2 default when given.
         longdr_module1_cache_path: Same, for LongDRScreeningDataset.
+        tianjin_dir: Optional path to the extracted Tianjin (usama10/retinal-dr-longitudinal)
+            dataset. None (the default) skips Tianjin entirely, so existing FIRE+LongDR-only
+            callers are unaffected.
+        tianjin_module1_cache_path: Same fallback contract as the other two, for
+            TianjinLongitudinalDataset -- only used for the lesion mask, since Tianjin's real
+            clinical grade always wins over a Module 1 prediction (see its docstring).
+        tianjin_min_pair_quality: Optional float; drop Tianjin pairs below this
+            corrected_manifest.csv registration-quality threshold. None keeps every pair.
 
     Returns:
-        DataLoader yielding batches from both datasets
+        DataLoader yielding batches from all loaded datasets
     """
     from torch.utils.data import DataLoader
 
@@ -127,7 +151,22 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
             print(f"✓ LongDRScreening: {len(longdr)} pairs")
     except Exception as e:
         print(f"⚠ Could not load LongDRScreening: {e}")
-    
+
+    # Try to load Tianjin (only if a directory was given -- keeps this backward compatible
+    # with callers that don't know about Tianjin yet)
+    if tianjin_dir:
+        try:
+            tianjin = TianjinLongitudinalDataset(
+                tianjin_dir, image_size=image_size,
+                min_pair_quality=tianjin_min_pair_quality,
+                module1_cache_path=tianjin_module1_cache_path,
+            )
+            if len(tianjin) > 0:
+                datasets.append(tianjin)
+                print(f"✓ Tianjin: {len(tianjin)} pairs")
+        except Exception as e:
+            print(f"⚠ Could not load Tianjin: {e}")
+
     if not datasets:
         raise RuntimeError("No datasets loaded!")
     
@@ -152,13 +191,22 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
 
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--fire-dir', default='./FIRE_dataset')
+    parser.add_argument('--longdr-dir', default='./LongDRScreening_20150209')
+    parser.add_argument('--tianjin-dir', default=None, help='Omit to test FIRE+LongDR only')
+    args = parser.parse_args()
+
     print("="*70)
-    print("Testing Combined FIRE + LongDRScreening Loader")
+    print("Testing Combined FIRE + LongDRScreening + Tianjin Loader")
     print("="*70)
-    
+
     loader, num_pairs = get_combined_loader(
-        fire_dir='./FIRE_dataset',
-        longdr_dir='./LongDRScreening_20150209',
+        fire_dir=args.fire_dir,
+        longdr_dir=args.longdr_dir,
+        tianjin_dir=args.tianjin_dir,
         image_size=128,
         batch_size=4,
         augment=True
