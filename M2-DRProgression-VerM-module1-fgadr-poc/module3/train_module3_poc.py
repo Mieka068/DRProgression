@@ -174,6 +174,15 @@ def train(config: Config):
         "metrics": metrics,
         "total_time_min": (time.time() - start_time) / 60,
     }
+    # Without this, no new image (including a Module-2-synthesized one) can be classified
+    # into a low/medium/high LBS stratum after training ends -- stratify_lbs_by_grade only
+    # ever fits fresh percentiles from a whole batch, which is meaningless for a single new
+    # image (see module1/compute_lbs.py::classify_lbs_stratum and
+    # docs/IMPLEMENTATION_PLAN.md Task I). Keys are cast to plain int and values to list since
+    # JSON can't serialize numpy scalars or tuples directly.
+    results["lbs_thresholds_by_grade"] = {
+        int(k): list(v) for k, v in full_dataset.lbs_thresholds_by_grade.items()
+    }
     results_path = os.path.join(config.save_dir, "poc_results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)

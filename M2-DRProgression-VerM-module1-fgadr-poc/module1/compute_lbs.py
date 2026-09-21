@@ -123,6 +123,35 @@ def stratify_lbs_by_grade(lbs_values, grades):
     return labels, thresholds_by_grade
 
 
+def classify_lbs_stratum(lbs_value, grade, thresholds_by_grade):
+    """
+    Classifies a SINGLE new LBS value into low/medium/high using thresholds already fit on a
+    training cohort (as saved by train_module3_poc.py into poc_results.json's
+    lbs_thresholds_by_grade -- see docs/IMPLEMENTATION_PLAN.md Task I), NOT by refitting
+    percentiles on N=1 the way stratify_lbs_by_grade does for a training batch. Needed to score
+    any new image (including a Module-2-synthesized one) after Module 3 training has already
+    finished -- without this there was no way to classify a post-training image's LBS at all.
+
+    Falls back to the nearest available grade's thresholds if the exact grade has none (e.g.
+    too few training patients at that grade), and prints which grade's thresholds were
+    actually used, since a silent fallback here would misattribute a stratum without anyone
+    noticing.
+    """
+    grade = int(grade)
+    if grade not in thresholds_by_grade:
+        available = sorted(thresholds_by_grade.keys())
+        fallback_grade = min(available, key=lambda g: abs(g - grade))
+        print(f"  (no fitted LBS thresholds for grade {grade} -- using grade "
+              f"{fallback_grade}'s thresholds instead)")
+        grade = fallback_grade
+    p33, p66 = thresholds_by_grade[grade]
+    if lbs_value <= p33:
+        return "low"
+    elif lbs_value <= p66:
+        return "medium"
+    return "high"
+
+
 if __name__ == "__main__":
     import argparse
 
