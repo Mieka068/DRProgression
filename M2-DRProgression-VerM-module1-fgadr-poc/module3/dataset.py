@@ -235,6 +235,20 @@ class TianjinSurvivalDataset(Dataset):
         dataset_reported_progression_raw, purely as a cross-check against this loader's own
         `event = followup_icdr > baseline_icdr` computation -- see __init__'s agreement-rate
         print. Missing entirely if that column can't be found (older/different sheet layout).
+
+        This cross-check was run directly against the real xlsx using the WORSE-EYE grade for
+        both sides (since that's well-defined without needing laterality resolution): 563/574
+        patients have a usable worse-eye grade at both timepoints, and the resulting event
+        label agrees with the dataset's own Progression column 97.2% of the time (16
+        disagreements, all in the same direction -- the dataset reports progression in cases
+        where the worse-eye grade delta alone does not). That asymmetry is plausibly because
+        "worse eye" is evaluated independently at each visit and need not be the same physical
+        eye at both timepoints (e.g. the left eye is worse at baseline, the right eye is worse
+        at follow-up) -- worth raising with the adviser/Dr. Atienza alongside the general
+        "what does progression mean here" question this cross-check already flags. The
+        per-eye-resolved (not worse-eye-proxy) version of this cross-check still needs the
+        real baseline photographs to compute, since it depends on module1/
+        resolve_eye_laterality.py's output.
         """
         xlsx_path = os.path.join(dataset_dir, "Organized_Data of Patients.xlsx")
         if not os.path.isfile(xlsx_path):

@@ -41,20 +41,29 @@ methodology chapter -- the numeric offset itself is not in question, the clinica
 claim is. Grades 6 (post-photocoagulation) and 7 (ungradable/missing) are dropped per the
 dataset's own column legend, since neither reflects natural disease severity.
 
-GRADING IS PER-EYE, NOT PER-PATIENT (confirmed against the real downloaded file -- see
-docs/IMPLEMENTATION_PLAN.md Task B.1): Organized_Data of Patients.xlsx has no single "DR
-grade" column. Instead each sheet has three columns: an "OS Grade" (left eye), an "OD Grade"
-(right eye), and an "At-risk Eye Grade (Worse eye)" patient-level summary. corrected_manifest
-.csv has one row per EYE (a patient can appear twice) but carries no OD/OS marker, and neither
-do the baseline filenames. Per instruction, every eye-pair is kept as its own training sample
-(not collapsed to one row per patient) to maximize data, especially for Module 3 -- this means
-we cannot skip resolving which eye a given row actually is: 102/613 patients (16.6%) have a
-different OS grade than OD grade, so guessing wrong is a real mislabeling risk. Laterality is
-resolved by module1/resolve_eye_laterality.py (optic disc position heuristic) into
-`laterality_resolved.csv`, which this loader requires -- see __init__. Rows whose laterality
-couldn't be confidently resolved ("uncertain") fall back to the At-risk Eye Grade (Worse eye)
-column for that row only, tracked via the `grade_is_eye_specific` output key, rather than
-being dropped.
+GRADING IS PER-EYE, NOT PER-PATIENT -- confirmed directly (this loader's own _load_grades()
+was run against the real Organized_Data of Patients.xlsx and corrected_manifest.csv, not
+inferred): Organized_Data of Patients.xlsx has no single "DR grade" column. Instead each
+sheet has three columns: an "OS Grade" (left eye), an "OD Grade" (right eye), and an
+"At-risk Eye Grade (Worse eye)" patient-level summary. corrected_manifest.csv has one row per
+EYE (a patient can appear twice) but carries no OD/OS marker, and neither do the baseline
+filenames. Per instruction, every eye-pair is kept as its own training sample (not collapsed
+to one row per patient) to maximize data, especially for Module 3 -- this means we cannot
+skip resolving which eye a given row actually is: of 613 real patients with both an OS and OD
+grade present, 102 (16.6%) have a different OS grade than OD grade, so guessing wrong is a
+real mislabeling risk, not a rounding error (both this exact count and the 476/473
+OS/OD-at-Stage-0 counts referenced in docs/ROADMAP.md's Task G note were independently
+reproduced against the real file, not just carried over from the plan that first reported
+them). All 1,115 real corrected_manifest.csv rows matched a patient_id present in the xlsx --
+no ID-format mismatch (e.g. zero-padding) actually occurs in this dataset, despite the
+generic warning below being kept as a safety net for a differently-formatted future export.
+Laterality is resolved by module1/resolve_eye_laterality.py (optic disc position heuristic)
+into `laterality_resolved.csv`, which this loader requires -- see __init__. That heuristic
+itself still needs validating against the real baseline photographs (not done as of this
+note -- it requires the actual images, which metadata-only verification can't substitute
+for). Rows whose laterality couldn't be confidently resolved ("uncertain") fall back to the
+At-risk Eye Grade (Worse eye) column for that row only, tracked via the
+`grade_is_eye_specific` output key, rather than being dropped.
 
 Module 1 cache key scheme (see module1/apply_to_progression_data.py): that script's cache is
 keyed by the image's path relative to whatever `--images-dir` it was pointed at, extension
@@ -99,8 +108,10 @@ def _find_column(columns, must_contain, label):
     """
     Case/space-insensitive match: returns the first column whose normalized name contains
     every token in `must_contain`. Raises with the real column list on a miss, rather than
-    silently mis-mapping a column -- see module docstring's note on the xlsx schema being
-    unverified against the real downloaded file.
+    silently mis-mapping a column. Verified directly against the real Organized_Data of
+    Patients.xlsx: `["id"]` and `["atrisk","grade"]` both match their intended column
+    correctly there (see _find_eye_grade_column for the one case -- "os"/"od" -- where a
+    plain substring match like this one is NOT safe).
     """
     for col in columns:
         norm = _normalize_colname(col)
@@ -119,12 +130,14 @@ def _find_eye_grade_column(columns, eye_prefix, label):
     Matches a column whose normalized name STARTS WITH `eye_prefix` ('os' or 'od') and also
     contains 'grade'. A plain substring-anywhere match (like _find_column) is UNSAFE for these
     two specifically: the real OS/OD Grade columns embed their full numeric legend inline
-    (e.g. "...3=Moderate NPDR...") and "Moderate" itself contains the literal substring "od"
-    ("m-OD-erate"), which silently matches the OD lookup against the OS column instead
-    (confirmed by running this against a fixture built from the real header text -- not a
-    hypothetical). Requiring the eye token as a PREFIX, not just present anywhere, avoids
-    that collision since the real columns are always literally named "OS Grade(...)" /
-    "OD Grade(...)".
+    (e.g. "...3=Moderate Non-Proliferative Diabetic Retinopathy...") and "Moderate" itself
+    contains the literal substring "od" ("m-OD-erate"), which silently matches the OD lookup
+    against the OS column instead. This was caught with a synthetic fixture before the real
+    file was available, and this exact function has since been re-run directly against the
+    real Organized_Data of Patients.xlsx (both the Baseline and 2-Year Follow-up sheets) and
+    correctly resolves OS/OD/At-risk to three distinct columns -- not a hypothetical risk.
+    Requiring the eye token as a PREFIX, not just present anywhere, avoids the collision since
+    the real columns are always literally named "OS Grade(...)" / "OD Grade(...)".
     """
     for col in columns:
         norm = _normalize_colname(col)
