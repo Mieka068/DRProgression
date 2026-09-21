@@ -12,28 +12,23 @@ change:
      FIREDataset/LongDRScreeningDataset/TianjinLongitudinalDataset, so real grade/mask flow
      in. tianjin_dir is optional (default None) -- omit it to train on FIRE+LongDR only,
      exactly as before Tianjin was wired in.
-  2. num_epochs is reduced for a same-day POC run (see Config.num_epochs below) -- explicitly
-     NOT the manuscript's literature-matched 200 (train_fire.py/train_combined.py already
-     diverged from that to 50; this POC run goes further, to make sure at least one full run
-     finishes and produces samples/metrics tonight). Say so plainly in the presentation.
+  2. num_epochs is reduced to 5 for a short POC run (see Config.num_epochs below), well below
+     the 50 epochs train_fire.py/train_combined.py use, so a full run finishes and produces
+     samples/metrics in a single session.
   3. Optimizer settings are changed FROM train_combined.py's existing (lr=1e-4, β1=0.5,
-     β2=0.999) TO the manuscript's stated Adam settings (lr=2e-4, β1=0.0, β2=0.9, following
-     DRForecastGAN) -- this is a deliberate choice to match what the manuscript commits to,
-     not a bug; flag the discrepancy with train_combined.py's own existing defaults if asked.
+     β2=0.999) TO lr=2e-4, β1=0.0, β2=0.9, matching DRForecastGAN's reported Adam
+     hyperparameters.
   4. At the end of training, computes FID/PSNR/SSIM (torchmetrics + torch-fidelity) between
      synthesized and real follow-up images on a held-out slice of the loader -- small/short-run
      numbers, not a claim of matching DRForecastGAN's published benchmark
-     (FID 27.3/PSNR 25.3/SSIM 0.93). This single-step number does NOT answer RQ1's per-step
-     question -- run evaluate_trajectory.py separately afterward for that (see its docstring
-     and docs/IMPLEMENTATION_PLAN.md Task D).
-  5. The Generator (DRForestGAN-v2/base_model.py) now uses AdaIN stage conditioning in its
-     bottleneck, additive to the original channel-concat conditioning (docs/IMPLEMENTATION_PLAN.md
-     Task C) -- this changes its state_dict keys, so a checkpoint from before this change will
-     NOT load here. Retrain from scratch.
+     (FID 27.3/PSNR 25.3/SSIM 0.93). This single-step number does not report per-cascade-step
+     quality -- run evaluate_trajectory.py separately afterward for that.
+  5. The Generator (DRForestGAN-v2/base_model.py) uses AdaIN stage conditioning in its
+     bottleneck, additive to the original channel-concat conditioning -- this changes its
+     state_dict keys, so a checkpoint from before this change will not load here.
   6. registration_cache_path, if given, substitutes a pre-registered (baseline-aligned)
      follow-up image wherever module1/train_registration.py produced one, in place of the raw
-     follow-up image (docs/IMPLEMENTATION_PLAN.md Task E/F). None (the default) uses raw
-     follow-up images everywhere, unchanged from before Task E.
+     follow-up image. None (the default) uses raw follow-up images everywhere.
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -88,12 +83,10 @@ class Config:
     g_repeat_num = 6
     d_repeat_num = 6
 
-    # Training -- POC-scale, NOT the manuscript's literature-matched 200 epochs. See module
-    # docstring point 2.
+    # Training -- POC-scale (5 epochs). See module docstring point 2.
     num_epochs = 5
-    # Adam settings matching the manuscript's stated hyperparameters (DRForecastGAN-derived),
-    # intentionally overriding train_combined.py's own (1e-4, 0.5, 0.999) -- see docstring
-    # point 3.
+    # Adam settings matching DRForecastGAN's reported hyperparameters, overriding
+    # train_combined.py's own defaults (1e-4, 0.5, 0.999) -- see docstring point 3.
     g_lr = 0.0002
     d_lr = 0.0002
     beta1 = 0.0
@@ -329,7 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--tianjin-min-pair-quality", type=float, default=None)
     parser.add_argument("--registration-cache", default=None,
                          help="Optional path to a module1/train_registration.py cache; omit to "
-                              "use raw follow-up images (default, unchanged from before Task E)")
+                              "use raw follow-up images")
     parser.add_argument("--style-dim", type=int, default=None,
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)

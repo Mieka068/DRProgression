@@ -42,9 +42,9 @@ class FIREDataset(Dataset):
             registration_cache_path: Optional path to a cache produced by
                 module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
                 When given and an entry exists for this pair's baseline path, the pre-warped,
-                baseline-aligned follow-up image is used instead of the raw one -- see
-                docs/IMPLEMENTATION_PLAN.md Task E/F. Falls back to the raw follow-up image
-                for any pair not in the cache (or if no cache_path is given at all).
+                baseline-aligned follow-up image is used instead of the raw one. Falls back to
+                the raw follow-up image for any pair not in the cache (or if no cache_path is
+                given at all).
         """
         self.fire_dir = fire_dir
         self.image_size = image_size
@@ -134,8 +134,7 @@ class FIREDataset(Dataset):
         img1 = Image.open(img1_path).convert('RGB')
 
         # Use the pre-registered (baseline-aligned) follow-up image if a registration cache
-        # was supplied and has an entry for this pair, per docs/IMPLEMENTATION_PLAN.md Task F.
-        # Falls back to the raw follow-up image otherwise -- existing behavior unchanged.
+        # was supplied and has an entry for this pair, else fall back to the raw follow-up image.
         warped = self.registration_cache.get((self.SOURCE_NAME, img1_path)) if self.registration_cache else None
         if warped is not None:
             img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL

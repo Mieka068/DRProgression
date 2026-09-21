@@ -43,8 +43,7 @@ class LongDRScreeningDataset(Dataset):
                 directory walk. Same fallback behavior as FIREDataset -- see its docstring.
             registration_cache_path: Optional path to a cache produced by
                 module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
-                Same fallback behavior as FIREDataset -- see its docstring and
-                docs/IMPLEMENTATION_PLAN.md Task E/F.
+                Same fallback behavior as FIREDataset -- see its docstring.
         """
         self.dataset_dir = dataset_dir
         self.image_size = image_size
@@ -130,8 +129,7 @@ class LongDRScreeningDataset(Dataset):
             img1 = Image.open(pair['baseline']).convert('RGB')
             warped = self.registration_cache.get((self.SOURCE_NAME, pair['baseline'])) if self.registration_cache else None
             if warped is not None:
-                # Pre-registered (baseline-aligned) follow-up, per docs/IMPLEMENTATION_PLAN.md
-                # Task F -- falls back to the raw follow-up image otherwise.
+                # Pre-registered (baseline-aligned) follow-up image.
                 img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
             else:
                 img2 = Image.open(pair['follow_up']).convert('RGB')

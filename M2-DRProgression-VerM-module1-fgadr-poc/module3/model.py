@@ -1,22 +1,16 @@
 """
 Module 3 -- EfficientNet-B4 backbone + Weibull survival head.
 
-Independently trained from Module 1's classifier (a resnet50 + linear head) -- no shared
-weights, per docs/DECISIONS.md's module-independence rule; this is a different architecture
-entirely, not just a separate instance of the same one.
+Independently trained from Module 1's classifier (a resnet50 + linear head); no shared
+weights.
 
 Takes the LBS stratum (see module1/compute_lbs.py, reused here via
-module3/dataset.py::stratify_lbs_by_grade) AND the baseline eye's own severity grade (ICDR
-0-4) as auxiliary inputs alongside the fundus image, since LBS is meant to do double duty as
-both Module 2's fallback-synthesis target and Module 3's own survival-analysis input feature
-(docs/DECISIONS.md). The baseline-grade embedding (added per
-docs/IMPLEMENTATION_PLAN.md Task H) is what lets the model distinguish "mild->moderate" risk
-from "severe->PDR" risk -- without it, the only severity signal available is whatever the
-image implicitly encodes.
+module3/dataset.py::stratify_lbs_by_grade) and the baseline eye's own severity grade (ICDR
+0-4) as auxiliary inputs alongside the fundus image. The baseline-grade embedding lets the
+model distinguish "mild->moderate" risk from "severe->PDR" risk.
 
 Outputs Weibull distribution parameters (shape k, scale lambda) per patient rather than a
-point estimate -- train_module3_poc.py's module docstring explains why this only calibrates
-reliably at Tianjin's single observed 2-year checkpoint for now.
+point estimate.
 """
 import torch
 import torch.nn as nn
@@ -67,14 +61,12 @@ class EfficientNetWeibullSurvival(nn.Module):
 
 def weibull_current_status_nll(shape, scale, t, event, eps=1e-6):
     """
-    Negative log-likelihood for CURRENT-STATUS (case-1 interval-censored) survival data: each
-    subject is observed exactly once, at time t, and we only know whether the event had
-    already happened by then (event=1, likelihood = F(t) = 1-S(t)) or not (event=0,
-    likelihood = S(t)) -- NOT the exact event time. This is what Tianjin's fixed
-    baseline -> 2-year-follow-up structure actually gives us (see module3/dataset.py and
-    docs/ROADMAP.md's "Consequence of the Tianjin timing structure" note). Using the Weibull
-    density f(t) here, as ordinary right-censored survival NLL does for its observed events,
-    would incorrectly assume we know the exact progression date, which we don't.
+    Negative log-likelihood for current-status (case-1 interval-censored) survival data: each
+    subject is observed exactly once, at time t, and only whether the event had already
+    happened by then is known (event=1, likelihood = F(t) = 1-S(t)) or not (event=0,
+    likelihood = S(t)) -- not the exact event time. Using the Weibull density f(t) here, as
+    ordinary right-censored survival NLL does for its observed events, would assume the exact
+    event time is known.
     """
     s_t = torch.exp(-torch.pow(t / scale, shape))
     cdf = torch.clamp(1 - s_t, min=eps, max=1 - eps)

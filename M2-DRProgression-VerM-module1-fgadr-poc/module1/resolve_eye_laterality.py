@@ -3,16 +3,13 @@ Resolve OD (right eye) vs. OS (left eye) for each Tianjin baseline image by loca
 optic disc and checking which half of the image it falls in (standard fundus photography
 convention: optic disc left-of-center => OD/right eye; right-of-center => OS/left eye).
 
-Why this exists: Organized_Data of Patients.xlsx stores DR grade per EYE (separate OS Grade /
-OD Grade / At-risk Eye Grade columns), not per patient, but corrected_manifest.csv's rows
-(one per baseline<->follow-up pair) carry no OD/OS marker and baseline filenames
-(00194-7256.jpg) give no laterality hint either. Guessing (e.g. "first row = OD") is not
-acceptable: 102/613 patients (16.6%) have a different OS grade than OD grade in the real file,
-so a wrong guess is a real mislabeling risk, not a rounding error. See
-docs/IMPLEMENTATION_PLAN.md Task B for the full rationale.
+Organized_Data of Patients.xlsx stores DR grade per eye (separate OS Grade / OD Grade /
+At-risk Eye Grade columns), not per patient. corrected_manifest.csv's rows (one per
+baseline<->follow-up pair) carry no OD/OS marker, and baseline filenames give no laterality
+hint either.
 
 This is a one-time preprocessing pass, run before tianjin_dataset.py / module3/dataset.py can
-resolve real per-eye grades -- both raise a clear FileNotFoundError pointing here if
+resolve real per-eye grades -- both raise a FileNotFoundError pointing here if
 laterality_resolved.csv doesn't exist yet in the dataset directory.
 
 Usage:
@@ -21,13 +18,9 @@ Usage:
         --manifest corrected_manifest.csv \
         --out laterality_resolved.csv
 
-IMPORTANT -- validate before trusting this: after running, check the "same eye resolved
-twice" sanity check printed below. If more than ~5% of two-row patients resolve to the SAME
-eye on both rows, the heuristic needs tuning (larger --margin, or a smaller downscale for more
-precision) before it's trustworthy for training -- don't silently proceed with a high
-disagreement rate. This is an explicit open decision to report back, not something to
-resolve by adjusting parameters until the number looks better (see
-docs/IMPLEMENTATION_PLAN.md's "Open decisions" section).
+After running, check the "same eye resolved twice" sanity check printed below. If more than
+~5% of two-row patients resolve to the same eye on both rows, the heuristic needs tuning
+(larger --margin, or a smaller downscale for more precision).
 """
 import argparse
 import os
@@ -116,9 +109,6 @@ def main():
     print(f"Wrote {out_path}")
 
     # Sanity check: for patients with 2 rows, the two should resolve to different eyes.
-    # Report how often they don't -- a high disagreement rate would mean the heuristic itself
-    # needs tuning (margin, downscale) before trusting it. REPORT this number back rather than
-    # silently proceeding -- see this module's docstring.
     two_row_patients = manifest.groupby("patient_id").filter(lambda g: len(g) == 2)
     if len(two_row_patients) == 0:
         print("No patients with exactly 2 baseline rows found -- skipping same-eye sanity check.")
@@ -133,9 +123,8 @@ def main():
           f"(should be rare -- flags heuristic problems): {n_same}/{n_total} ({rate:.1%})")
     if rate > 0.05:
         print(
-            "⚠ Same-eye disagreement rate is above 5% -- per docs/IMPLEMENTATION_PLAN.md, do "
-            "NOT proceed to wire this into training yet. Try a larger --margin or smaller "
-            "--downscale and re-run, then report this number back before trusting the result."
+            "⚠ Same-eye disagreement rate is above 5% -- try a larger --margin or smaller "
+            "--downscale and re-run before using this output for training."
         )
 
 

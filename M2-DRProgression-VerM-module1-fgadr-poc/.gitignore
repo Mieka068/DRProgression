@@ -18,6 +18,7 @@ module3_runs_poc/
 laterality_resolved.csv
 registered_followups.pt
 trajectory_eval_results.json
+trajectory_figures/
 
 __pycache__/
 *.pyc
