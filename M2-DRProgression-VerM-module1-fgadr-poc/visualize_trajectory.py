@@ -211,7 +211,8 @@ def run(config):
     G = Generator(
         conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim
     ).to(device)
-    G.load_state_dict(torch.load(config.generator_checkpoint, map_location=device))
+    if not config.dry_run:
+        G.load_state_dict(torch.load(config.generator_checkpoint, map_location=device))
     G.eval()
     classifier, seg_models = load_module1_models(config, device)
 
@@ -276,7 +277,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tianjin-dir", required=True)
     parser.add_argument("--tianjin-module1-cache", required=True)
-    parser.add_argument("--generator-checkpoint", required=True)
+    parser.add_argument("--generator-checkpoint", default=None, help="Required unless --dry-run")
     parser.add_argument("--classifier-checkpoint", default=None, help="Required unless --dry-run")
     parser.add_argument(
         "--seg-checkpoint",
@@ -297,6 +298,8 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", default="./trajectory_figures/")
     args = parser.parse_args()
 
+    if not args.dry_run and not args.generator_checkpoint:
+        parser.error("--generator-checkpoint is required unless --dry-run is set")
     if not args.dry_run and not args.classifier_checkpoint:
         parser.error("--classifier-checkpoint is required unless --dry-run is set")
     if args.module3_checkpoint and not args.module3_thresholds_json:
