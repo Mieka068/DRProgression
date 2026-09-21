@@ -28,7 +28,10 @@ class LongDRScreeningDataset(Dataset):
     This gives us up to 4 pairs per eye × 140 eyes = 560 pairs.
     """
     
-    def __init__(self, dataset_dir, image_size=128, use_normalized=True, module1_cache_path=None):
+    SOURCE_NAME = "LongDRScreening"
+
+    def __init__(self, dataset_dir, image_size=128, use_normalized=True, module1_cache_path=None,
+                 registration_cache_path=None):
         """
         Args:
             dataset_dir: Path to LongDRScreening_20150209 folder
@@ -38,6 +41,10 @@ class LongDRScreeningDataset(Dataset):
                 module1/apply_to_progression_data.py ({image_id: {grade, mask, lbs}}), keyed
                 as "<eye_folder>__<baseline_filename_stem>" to match that script's recursive
                 directory walk. Same fallback behavior as FIREDataset -- see its docstring.
+            registration_cache_path: Optional path to a cache produced by
+                module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
+                Same fallback behavior as FIREDataset -- see its docstring and
+                docs/IMPLEMENTATION_PLAN.md Task E/F.
         """
         self.dataset_dir = dataset_dir
         self.image_size = image_size
@@ -46,6 +53,11 @@ class LongDRScreeningDataset(Dataset):
         if module1_cache_path:
             self.module1_cache = torch.load(module1_cache_path, weights_only=False)
             print(f"✓ Loaded Module 1 cache: {len(self.module1_cache)} images ({module1_cache_path})")
+
+        self.registration_cache = None
+        if registration_cache_path:
+            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
+            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
 
         # Choose which folder to use
         folder_name = 'FundusImagesNormalized' if use_normalized else 'FundusImagesColor'
@@ -116,11 +128,17 @@ class LongDRScreeningDataset(Dataset):
         # Load images
         try:
             img1 = Image.open(pair['baseline']).convert('RGB')
-            img2 = Image.open(pair['follow_up']).convert('RGB')
+            warped = self.registration_cache.get((self.SOURCE_NAME, pair['baseline'])) if self.registration_cache else None
+            if warped is not None:
+                # Pre-registered (baseline-aligned) follow-up, per docs/IMPLEMENTATION_PLAN.md
+                # Task F -- falls back to the raw follow-up image otherwise.
+                img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
+            else:
+                img2 = Image.open(pair['follow_up']).convert('RGB')
         except Exception as e:
             # If image fails to load, return next valid pair
             return self.__getitem__((idx + 1) % len(self.pairs))
-        
+
         img1 = self.transform(img1)
         img2 = self.transform(img2)
 

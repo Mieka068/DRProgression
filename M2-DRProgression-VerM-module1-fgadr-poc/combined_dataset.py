@@ -56,6 +56,7 @@ class AugmentedPairDataset(Dataset):
         sample.setdefault('grade_is_real', False)
         sample.setdefault('patient_id', sample.get('eye_id', 'n/a'))
         sample.setdefault('pair_quality', -1.0)
+        sample.setdefault('grade_is_eye_specific', False)
 
         return sample
     
@@ -107,7 +108,8 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
                         fire_module1_cache_path=None,
                         longdr_module1_cache_path=None,
                         tianjin_module1_cache_path=None,
-                        tianjin_min_pair_quality=None):
+                        tianjin_min_pair_quality=None,
+                        registration_cache_path=None):
     """
     Get a DataLoader combining FIRE + LongDRScreening + (optionally) Tianjin, with augmentation.
 
@@ -124,6 +126,12 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
             clinical grade always wins over a Module 1 prediction (see its docstring).
         tianjin_min_pair_quality: Optional float; drop Tianjin pairs below this
             corrected_manifest.csv registration-quality threshold. None keeps every pair.
+        registration_cache_path: Optional path to a single cache produced by
+            module1/train_registration.py, shared across all three sources (it's keyed by
+            (source, baseline_path), see that script's docstring) -- substitutes a
+            pre-registered, baseline-aligned follow-up image in place of the raw one wherever
+            an entry exists. None (the default) uses raw follow-up images everywhere, exactly
+            as before Task E/F (see docs/IMPLEMENTATION_PLAN.md).
 
     Returns:
         DataLoader yielding batches from all loaded datasets
@@ -135,7 +143,8 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
     # Try to load FIRE
     try:
         fire = FIREDataset(fire_dir, image_size=image_size, category='A',
-                            module1_cache_path=fire_module1_cache_path)
+                            module1_cache_path=fire_module1_cache_path,
+                            registration_cache_path=registration_cache_path)
         if len(fire) > 0:
             datasets.append(fire)
             print(f"✓ FIRE: {len(fire)} pairs")
@@ -145,7 +154,8 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
     # Try to load LongDRScreening
     try:
         longdr = LongDRScreeningDataset(longdr_dir, image_size=image_size, use_normalized=True,
-                                         module1_cache_path=longdr_module1_cache_path)
+                                         module1_cache_path=longdr_module1_cache_path,
+                                         registration_cache_path=registration_cache_path)
         if len(longdr) > 0:
             datasets.append(longdr)
             print(f"✓ LongDRScreening: {len(longdr)} pairs")
@@ -160,6 +170,7 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
                 tianjin_dir, image_size=image_size,
                 min_pair_quality=tianjin_min_pair_quality,
                 module1_cache_path=tianjin_module1_cache_path,
+                registration_cache_path=registration_cache_path,
             )
             if len(tianjin) > 0:
                 datasets.append(tianjin)

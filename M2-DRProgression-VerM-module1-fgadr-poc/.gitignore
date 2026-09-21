@@ -15,6 +15,9 @@ module1_outputs_*.pt
 training_samples_poc/
 outputs_poc/
 module3_runs_poc/
+laterality_resolved.csv
+registered_followups.pt
+trajectory_eval_results.json
 
 __pycache__/
 *.pyc

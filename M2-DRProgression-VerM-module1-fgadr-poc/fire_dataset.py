@@ -24,7 +24,10 @@ class FIREDataset(Dataset):
     For our GAN, we want Category A pairs (disease progression).
     """
     
-    def __init__(self, fire_dir, image_size=128, category='A', module1_cache_path=None):
+    SOURCE_NAME = "FIRE"
+
+    def __init__(self, fire_dir, image_size=128, category='A', module1_cache_path=None,
+                 registration_cache_path=None):
         """
         Args:
             fire_dir: Path to FIRE_dataset folder
@@ -36,6 +39,12 @@ class FIREDataset(Dataset):
                 mask/grade are used instead of the placeholder empty-mask/Stage-2 default
                 below. Falls back to the placeholder for any image not in the cache (or if
                 no cache_path is given at all) -- existing behavior is unchanged either way.
+            registration_cache_path: Optional path to a cache produced by
+                module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
+                When given and an entry exists for this pair's baseline path, the pre-warped,
+                baseline-aligned follow-up image is used instead of the raw one -- see
+                docs/IMPLEMENTATION_PLAN.md Task E/F. Falls back to the raw follow-up image
+                for any pair not in the cache (or if no cache_path is given at all).
         """
         self.fire_dir = fire_dir
         self.image_size = image_size
@@ -45,6 +54,11 @@ class FIREDataset(Dataset):
         if module1_cache_path:
             self.module1_cache = torch.load(module1_cache_path, weights_only=False)
             print(f"✓ Loaded Module 1 cache: {len(self.module1_cache)} images ({module1_cache_path})")
+
+        self.registration_cache = None
+        if registration_cache_path:
+            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
+            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
 
         # Find all image pairs in the specified category
         self.pairs = self._find_pairs()
@@ -118,8 +132,16 @@ class FIREDataset(Dataset):
         
         # Load images
         img1 = Image.open(img1_path).convert('RGB')
-        img2 = Image.open(img2_path).convert('RGB')
-        
+
+        # Use the pre-registered (baseline-aligned) follow-up image if a registration cache
+        # was supplied and has an entry for this pair, per docs/IMPLEMENTATION_PLAN.md Task F.
+        # Falls back to the raw follow-up image otherwise -- existing behavior unchanged.
+        warped = self.registration_cache.get((self.SOURCE_NAME, img1_path)) if self.registration_cache else None
+        if warped is not None:
+            img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
+        else:
+            img2 = Image.open(img2_path).convert('RGB')
+
         img1 = self.transform(img1)
         img2 = self.transform(img2)
 

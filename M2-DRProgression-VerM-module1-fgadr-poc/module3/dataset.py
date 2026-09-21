@@ -25,6 +25,12 @@ degrades gracefully to a Stage-2 default when a grade is missing), Module 3 need
 progression label to train on at all -- a row with an excluded/missing baseline or follow-up
 grade is dropped here, not defaulted. This is a real, intentional divergence from Module 2's
 loader, not an inconsistency to "fix" back into agreement with it.
+
+GRADING IS PER-EYE, NOT PER-PATIENT: same fact and fix as tianjin_dataset.py (see its module
+docstring) -- Organized_Data of Patients.xlsx has separate OS/OD/at-risk-eye columns per
+sheet, not one flat "DR grade" column, and corrected_manifest.csv doesn't say which eye a row
+is. This loader requires the same laterality_resolved.csv that tianjin_dataset.py requires
+(module1/resolve_eye_laterality.py), and applies the same OD/OS/worse-eye fallback per row.
 """
 import os
 import random
@@ -48,6 +54,7 @@ from compute_lbs import stratify_lbs_by_grade  # noqa: E402
 from tianjin_dataset import (  # noqa: E402
     EXCLUDED_GRADES,
     _find_column,
+    _find_eye_grade_column,
     _module1_image_id_candidates,
     _normalize_colname,
     tianjin_grade_to_icdr,
@@ -103,10 +110,47 @@ class TianjinSurvivalDataset(Dataset):
             raise FileNotFoundError(f"Could not find corrected_manifest.csv in {dataset_dir}")
         manifest = pd.read_csv(manifest_path)
         manifest["patient_id"] = manifest["patient_id"].astype(str).str.strip()
+        print(f"  Total eye-pairs in corrected_manifest.csv: {len(manifest)}")
+
+        # Grading is per-eye, not per-patient (see tianjin_dataset.py's module docstring and
+        # docs/IMPLEMENTATION_PLAN.md Task B.1) -- resolve which eye each manifest row is via
+        # module1/resolve_eye_laterality.py's precomputed output. The same resolved eye
+        # applies to both the baseline and follow-up image of a row, since corrected_manifest
+        # .csv pairs same-eye images by construction.
+        laterality_path = os.path.join(dataset_dir, "laterality_resolved.csv")
+        if not os.path.isfile(laterality_path):
+            raise FileNotFoundError(
+                f"Could not find laterality_resolved.csv in {dataset_dir}. Tianjin's grade "
+                "columns are per-eye (OS/OD), not per-patient -- run "
+                f"`python module1/resolve_eye_laterality.py --dataset-dir {dataset_dir}` first "
+                "(see tianjin_dataset.py's module docstring and "
+                "docs/IMPLEMENTATION_PLAN.md Task B.3)."
+            )
+        laterality_df = pd.read_csv(laterality_path)[["key", "eye"]]
+        manifest = manifest.merge(laterality_df, on="key", how="left")
+        manifest["eye"] = manifest["eye"].fillna("uncertain")
 
         labels = self._load_progression_labels(dataset_dir)
         manifest = manifest.merge(labels, on="patient_id", how="inner")
         print(f"  Patients with both a baseline and follow-up grade row: {manifest['patient_id'].nunique()}")
+
+        def _pick_eye_grades(row):
+            if row["eye"] == "OD":
+                return row["baseline_od_grade_raw"], row["followup_od_grade_raw"], True
+            if row["eye"] == "OS":
+                return row["baseline_os_grade_raw"], row["followup_os_grade_raw"], True
+            # "uncertain" laterality -> fall back to the patient-level worse-eye summary for
+            # this row only, rather than dropping the eye-pair (maximizes usable data, per
+            # docs/IMPLEMENTATION_PLAN.md's explicit instruction to keep every eye-pair).
+            return row["baseline_worse_eye_grade_raw"], row["followup_worse_eye_grade_raw"], False
+
+        picked = manifest.apply(_pick_eye_grades, axis=1, result_type="expand")
+        manifest["baseline_grade_raw"] = picked[0]
+        manifest["followup_grade_raw"] = picked[1]
+        manifest["grade_is_eye_specific"] = picked[2]
+        n_eye_specific = int(manifest["grade_is_eye_specific"].sum())
+        print(f"  Eye-specific grade resolved for {n_eye_specific}/{len(manifest)} rows "
+              f"({len(manifest) - n_eye_specific} fell back to the worse-eye summary)")
 
         before = len(manifest)
         manifest = manifest[~manifest["baseline_grade_raw"].isin(EXCLUDED_GRADES)]
@@ -122,6 +166,21 @@ class TianjinSurvivalDataset(Dataset):
         # instead require a specific stage threshold (e.g. reaching PDR).
         manifest["event"] = (manifest["followup_icdr"] > manifest["baseline_icdr"]).astype(int)
         manifest["time_to_followup"] = fixed_followup_years
+
+        # Cross-check against the dataset's own reported progression column (1=No, 2=Yes),
+        # where present -- informational only, per docs/IMPLEMENTATION_PLAN.md Task B.5. Does
+        # NOT redefine `event` above -- a real disagreement is a methodology question for the
+        # adviser/Dr. Atienza (what "progression" should mean for this thesis), not something
+        # to resolve by picking whichever definition produces better-looking numbers.
+        has_dataset_flag = manifest["dataset_reported_progression_raw"].notna()
+        if has_dataset_flag.any():
+            dataset_event = (manifest.loc[has_dataset_flag, "dataset_reported_progression_raw"] == 2).astype(int)
+            agreement = (dataset_event == manifest.loc[has_dataset_flag, "event"]).mean()
+            print(
+                f"  Cross-check vs. dataset's own 'Progression' column: {agreement:.1%} "
+                f"agreement on {int(has_dataset_flag.sum())} rows with both labels (event "
+                "definition unchanged -- see module docstring)"
+            )
 
         def lookup_lbs(baseline_path):
             for candidate_id in _module1_image_id_candidates(baseline_path):
@@ -165,10 +224,17 @@ class TianjinSurvivalDataset(Dataset):
     def _load_progression_labels(dataset_dir) -> pd.DataFrame:
         """
         Reads BOTH the Baseline and 2-Year Follow-up sheets of Organized_Data of
-        Patients.xlsx and returns one (patient_id, baseline_grade_raw, followup_grade_raw)
-        row per patient present in both. Sheet/column matching is case/space-insensitive with
-        a loud failure on a miss -- see tianjin_dataset.py's identical convention and its
-        module docstring's note on the xlsx schema being unverified against the real file.
+        Patients.xlsx and returns one row per patient present in both, with separate per-eye
+        grade columns for each sheet (baseline_os/od/worse_eye_grade_raw, and the followup_*
+        equivalents) -- grading is per-eye, not per-patient, confirmed against the real file
+        (see tianjin_dataset.py's module docstring and docs/IMPLEMENTATION_PLAN.md Task B.1).
+        Per-eye selection for a specific manifest row happens in __init__, using the same
+        resolved 'eye' column tianjin_dataset.py uses.
+
+        Also reads the follow-up sheet's own "Progression (1=No; 2=Yes)" column as
+        dataset_reported_progression_raw, purely as a cross-check against this loader's own
+        `event = followup_icdr > baseline_icdr` computation -- see __init__'s agreement-rate
+        print. Missing entirely if that column can't be found (older/different sheet layout).
         """
         xlsx_path = os.path.join(dataset_dir, "Organized_Data of Patients.xlsx")
         if not os.path.isfile(xlsx_path):
@@ -186,23 +252,59 @@ class TianjinSurvivalDataset(Dataset):
         base_df = xl.parse(baseline_sheet)
         fu_df = xl.parse(followup_sheet)
 
-        base_id_col = _find_column(base_df.columns, ["patient", "id"], "baseline patient ID")
-        base_grade_col = _find_column(base_df.columns, ["dr", "grade"], "baseline DR grade")
-        fu_id_col = _find_column(fu_df.columns, ["patient", "id"], "follow-up patient ID")
-        fu_grade_col = _find_column(fu_df.columns, ["dr", "grade"], "follow-up DR grade")
-        print(f"  Baseline sheet '{baseline_sheet}': patient_id <- '{base_id_col}', grade <- '{base_grade_col}'")
-        print(f"  Follow-up sheet '{followup_sheet}': patient_id <- '{fu_id_col}', grade <- '{fu_grade_col}'")
+        def _match_eye_cols(df, sheet_label):
+            try:
+                id_col = _find_column(df.columns, ["id"], f"{sheet_label} patient ID")
+                os_col = _find_eye_grade_column(df.columns, "os", f"{sheet_label} OS grade")
+                od_col = _find_eye_grade_column(df.columns, "od", f"{sheet_label} OD grade")
+                worse_col = _find_column(df.columns, ["atrisk", "grade"], f"{sheet_label} worse-eye grade")
+            except KeyError as e:
+                raise KeyError(
+                    f"{e}\nAll normalized column names in '{sheet_label}' sheet: "
+                    f"{[(c, _normalize_colname(c)) for c in df.columns]}."
+                ) from e
+            return id_col, os_col, od_col, worse_col
 
-        base_df = base_df.rename(columns={base_id_col: "patient_id", base_grade_col: "baseline_grade_raw"})
-        fu_df = fu_df.rename(columns={fu_id_col: "patient_id", fu_grade_col: "followup_grade_raw"})
+        base_id, base_os, base_od, base_worse = _match_eye_cols(base_df, "baseline")
+        fu_id, fu_os, fu_od, fu_worse = _match_eye_cols(fu_df, "follow-up")
+        print(f"  Baseline sheet '{baseline_sheet}': patient_id <- '{base_id}', OS <- '{base_os}', "
+              f"OD <- '{base_od}', worse-eye <- '{base_worse}'")
+        print(f"  Follow-up sheet '{followup_sheet}': patient_id <- '{fu_id}', OS <- '{fu_os}', "
+              f"OD <- '{fu_od}', worse-eye <- '{fu_worse}'")
+
+        base_df = base_df.rename(columns={
+            base_id: "patient_id", base_os: "baseline_os_grade_raw", base_od: "baseline_od_grade_raw",
+            base_worse: "baseline_worse_eye_grade_raw",
+        })
+        fu_df = fu_df.rename(columns={
+            fu_id: "patient_id", fu_os: "followup_os_grade_raw", fu_od: "followup_od_grade_raw",
+            fu_worse: "followup_worse_eye_grade_raw",
+        })
 
         base_df["patient_id"] = base_df["patient_id"].astype(str).str.strip()
         fu_df["patient_id"] = fu_df["patient_id"].astype(str).str.strip()
-        base_df["baseline_grade_raw"] = pd.to_numeric(base_df["baseline_grade_raw"], errors="coerce")
-        fu_df["followup_grade_raw"] = pd.to_numeric(fu_df["followup_grade_raw"], errors="coerce")
+        for c in ("baseline_os_grade_raw", "baseline_od_grade_raw", "baseline_worse_eye_grade_raw"):
+            base_df[c] = pd.to_numeric(base_df[c], errors="coerce")
+        for c in ("followup_os_grade_raw", "followup_od_grade_raw", "followup_worse_eye_grade_raw"):
+            fu_df[c] = pd.to_numeric(fu_df[c], errors="coerce")
 
-        base_df = base_df[["patient_id", "baseline_grade_raw"]].drop_duplicates(subset="patient_id")
-        fu_df = fu_df[["patient_id", "followup_grade_raw"]].drop_duplicates(subset="patient_id")
+        # Cross-check only -- see this function's docstring. Never used to define `event`.
+        try:
+            progression_col = _find_column(fu_df.columns, ["progression"], "dataset-reported progression")
+            fu_df = fu_df.rename(columns={progression_col: "dataset_reported_progression_raw"})
+            fu_df["dataset_reported_progression_raw"] = pd.to_numeric(
+                fu_df["dataset_reported_progression_raw"], errors="coerce"
+            )
+            print(f"  Found dataset's own progression column: '{progression_col}' (cross-check only)")
+        except KeyError:
+            fu_df["dataset_reported_progression_raw"] = np.nan
+            print("  No dataset-reported progression column found -- skipping the cross-check.")
+
+        base_cols = ["patient_id", "baseline_os_grade_raw", "baseline_od_grade_raw", "baseline_worse_eye_grade_raw"]
+        fu_cols = ["patient_id", "followup_os_grade_raw", "followup_od_grade_raw",
+                   "followup_worse_eye_grade_raw", "dataset_reported_progression_raw"]
+        base_df = base_df[base_cols].drop_duplicates(subset="patient_id")
+        fu_df = fu_df[fu_cols].drop_duplicates(subset="patient_id")
         # inner join: Module 3 needs BOTH grades to compute an event label, unlike Module 2
         # which only ever needs the baseline grade.
         return base_df.merge(fu_df, on="patient_id", how="inner")
@@ -227,6 +329,7 @@ class TianjinSurvivalDataset(Dataset):
             "lbs_stratum_idx": torch.tensor(STRATUM_TO_IDX[row["lbs_stratum"]], dtype=torch.long),
             "baseline_grade_icdr": torch.tensor(int(row["baseline_icdr"]), dtype=torch.long),
             "patient_id": row["patient_id"],
+            "grade_is_eye_specific": bool(row["grade_is_eye_specific"]),
         }
 
 
