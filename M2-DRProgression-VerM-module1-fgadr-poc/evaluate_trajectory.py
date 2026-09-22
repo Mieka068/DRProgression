@@ -36,9 +36,9 @@ classifier/segmentation checkpoints all exist):
         --seg-checkpoint EX=/path/model_EX.pth.tar --seg-checkpoint MA=/path/model_MA.pth.tar \
         --out ./trajectory_eval_results.json
 
-Dry run (random-init Module 1 weights, for smoke-testing the plumbing):
+Dry run (random-init Module 1/2 weights, for smoke-testing the plumbing, no checkpoints needed):
     python evaluate_trajectory.py --tianjin-dir ... --tianjin-module1-cache ... \
-        --generator-checkpoint ... --dry-run --out /tmp/dry_run.json
+        --dry-run --out /tmp/dry_run.json
 """
 import argparse
 import json
@@ -218,7 +218,8 @@ def evaluate(config):
     G = Generator(
         conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim
     ).to(device)
-    G.load_state_dict(torch.load(config.generator_checkpoint, map_location=device))
+    if not config.dry_run:
+        G.load_state_dict(torch.load(config.generator_checkpoint, map_location=device))
     G.eval()
     classifier, seg_models = load_module1_models(config, device)
 
@@ -366,7 +367,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tianjin-dir", required=True)
     parser.add_argument("--tianjin-module1-cache", required=True)
-    parser.add_argument("--generator-checkpoint", required=True)
+    parser.add_argument("--generator-checkpoint", default=None, help="Required unless --dry-run")
     parser.add_argument("--classifier-checkpoint", default=None, help="Required unless --dry-run")
     parser.add_argument(
         "--seg-checkpoint",
@@ -404,6 +405,8 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="./trajectory_eval_results.json")
     args = parser.parse_args()
 
+    if not args.dry_run and not args.generator_checkpoint:
+        parser.error("--generator-checkpoint is required unless --dry-run is set")
     if not args.dry_run and not args.classifier_checkpoint:
         parser.error("--classifier-checkpoint is required unless --dry-run is set")
 

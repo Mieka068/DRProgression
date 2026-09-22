@@ -46,9 +46,10 @@ Burden Score, and the bridge into Module 2's `fire_dataset.py`/`longdr_dataset.p
 
 ## Known, deliberate scope limits (say these plainly if asked)
 
-- Segmentation is trained for **2 of 4 lesion classes tonight (EX, MA)** — HE/SE use FGADR's
-  own ground-truth masks as a stand-in in the bridge step, clearly labeled as such. Same
-  script/config trains HE/SE next — just rerun with `--lesion HE` / `--lesion SE`.
+- Segmentation is trained for **2 of 4 lesion classes tonight (EX, MA)** — HE/SE have no
+  --seg-checkpoint yet, so `apply_to_progression_data.py` simply omits those channels from the
+  combined mask (FIRE/LongDR have no ground truth to substitute). Same script/config trains
+  HE/SE next — just rerun with `--lesion HE` / `--lesion SE`, then pass their checkpoints in.
 - Segmentation epoch count is a **POC-scale reduction** from the paper's 1500/2500, not a
   claim of matching published performance.
 - DRG-Net's own segmentation eval metric is **AP + ROC-AUC** (not Dice/IoU); we report both —
