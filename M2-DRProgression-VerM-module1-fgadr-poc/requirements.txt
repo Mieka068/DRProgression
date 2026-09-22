@@ -1,0 +1,10 @@
+# torch/torchvision/numpy/Pillow come from the base image (pytorch/pytorch:*) already,
+# matched to its CUDA build -- do not add them here, pip would fetch CPU-only or
+# CUDA-mismatched wheels and override the working ones.
+pandas
+openpyxl
+opencv-python-headless
+segmentation-models-pytorch
+matplotlib
+torchmetrics
+torch-fidelity

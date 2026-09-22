@@ -1,0 +1,13 @@
+# Requires Docker Compose v2 (`docker compose ...`, built into recent Docker Desktop/Engine)
+# and the NVIDIA Container Toolkit installed on the host. See DOCKER.md.
+services:
+  drprogression:
+    build: .
+    image: drprogression:local
+    gpus: all
+    volumes:
+      - ./datasets:/data
+      - ./runtime_outputs:/outputs
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
