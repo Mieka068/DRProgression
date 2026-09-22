@@ -1,0 +1,19 @@
+# Core deep learning stack. Colab notebooks already ship a compatible torch/torchvision --
+# only needed for running the top-level scripts (train_*.py, evaluate_trajectory.py,
+# visualize_trajectory.py, apply_to_progression_data.py, etc.) outside Colab.
+torch>=2.0
+torchvision>=0.15
+torchmetrics>=1.0
+segmentation_models_pytorch>=0.3
+
+# Data handling / classic ML
+numpy
+pandas
+scipy
+scikit-learn
+opencv-python-headless
+pillow
+openpyxl
+
+# Figures
+matplotlib
