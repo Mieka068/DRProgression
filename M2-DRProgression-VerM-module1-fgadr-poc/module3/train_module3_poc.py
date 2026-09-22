@@ -15,6 +15,15 @@ S(t) to other horizons t != 2 without training signal at those horizons.
 
 "Progression" here means "follow-up ICDR grade > baseline ICDR grade" (any upward stage move).
 
+Evaluation reports AUROC and Brier Score at the single fixed 2-year horizon, not a concordance
+index or an integrated Brier score (the metrics DeepDR Plus reports). This isn't a downgrade
+from DeepDR Plus's numbers -- concordance/integrated Brier need patients observed at *varying*
+follow-up times, which is what makes ranking-by-observed-time meaningful; Tianjin gives every
+patient the same fixed 24-month checkpoint, so there's no varying time axis to rank against.
+AUROC + Brier Score at that one horizon is the statistically correct tool for this data
+structure. DeepDR Plus's published numbers are context for what metadata-augmented models can
+achieve with richer temporal data, not a target this number should match.
+
 POC scale: ImageNet-pretrained EfficientNet-B4 backbone (fine-tuned, not trained from scratch),
 reduced epochs, patient-level train/val split (see dataset.py::patient_level_split).
 
@@ -58,7 +67,7 @@ def evaluate(model, loader, device):
     concordance needs varying observation/event times, and every Tianjin subject shares the
     same one.
     """
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import brier_score_loss, roc_auc_score
 
     model.eval()
     all_probs, all_events = [], []
@@ -85,12 +94,14 @@ def evaluate(model, loader, device):
         auroc = roc_auc_score(all_events, all_probs) if len(set(all_events)) > 1 else float("nan")
     except Exception:
         auroc = float("nan")
+    brier = brier_score_loss(all_events, all_probs) if n else float("nan")
 
     return {
         "n": n,
         "mean_predicted_progression_by_2yr": mean_pred,
         "actual_progression_rate": actual_rate,
         "auroc": auroc,
+        "brier_score": brier,
     }
 
 
@@ -123,6 +134,7 @@ def train(config: Config):
 
     print(f"\n[3/4] Training for {config.num_epochs} epochs (POC scale)...")
     start_time = time.time()
+    loss_history = []  # per-epoch {epoch, nll_loss} -- for the NLL-vs-epoch figure
     for epoch in range(config.num_epochs):
         epoch_loss = 0.0
         for batch in train_loader:
@@ -142,6 +154,7 @@ def train(config: Config):
 
         elapsed = time.time() - start_time
         avg_loss = epoch_loss / len(train_loader) if len(train_loader) else float("nan")
+        loss_history.append({"epoch": epoch + 1, "nll_loss": avg_loss})
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] | NLL: {avg_loss:.4f} | Elapsed: {elapsed / 60:.1f}min")
 
     print("\n[4/4] Evaluating on held-out patients...")
@@ -149,7 +162,8 @@ def train(config: Config):
     print(
         f"✓ n={metrics['n']} | mean predicted P(progression by 2yr)="
         f"{metrics['mean_predicted_progression_by_2yr']:.3f} | actual rate="
-        f"{metrics['actual_progression_rate']:.3f} | AUROC={metrics['auroc']:.3f}"
+        f"{metrics['actual_progression_rate']:.3f} | AUROC={metrics['auroc']:.3f} | "
+        f"Brier={metrics['brier_score']:.4f}"
     )
 
     ckpt_path = os.path.join(config.save_dir, "final-model.ckpt")
@@ -160,7 +174,12 @@ def train(config: Config):
         "n_val": len(val_set),
         "tianjin_module1_cache_path": config.tianjin_module1_cache_path,
         "metrics": metrics,
+        "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
+        "seed": config.seed,
+        "val_fraction": config.val_fraction,
+        "image_size": config.image_size,
+        "batch_size": config.batch_size,
     }
     # Saved so a new image's LBS can be classified into low/medium/high after training ends,
     # via module1/compute_lbs.py::classify_lbs_stratum. Keys cast to plain int and values to

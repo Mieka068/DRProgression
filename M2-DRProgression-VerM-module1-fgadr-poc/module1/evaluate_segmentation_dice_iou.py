@@ -1,9 +1,13 @@
 """
-Compute Dice + IoU for a trained DRG-Net segmentation checkpoint, on the SAME test split
-DRG-Net's own train_fgadr.py used (see dr_segmentation/utils.py::get_images_fgadr_from_pd --
-60/20/20 sequential slice of the Filtered CSV's row order). This is IN ADDITION to DRG-Net's
-own AP/ROC-AUC eval (train_fgadr.py::eval_model) -- the manuscript separately commits to
-Dice/IoU as Module 1's segmentation metric, so we report both (see module1/README.md).
+Compute Dice + IoU, plus AUC-ROC and AUC-PR, for a trained DRG-Net segmentation checkpoint, on
+the SAME test split DRG-Net's own train_fgadr.py used (see
+dr_segmentation/utils.py::get_images_fgadr_from_pd -- 60/20/20 sequential slice of the
+Filtered CSV's row order). AUC-ROC/AUC-PR are DRG-Net's own published segmentation metric
+(Tusfiqur et al. 2022, Section VI-B, Table III) -- computed here the same way
+train_fgadr.py::eval_model does (average_precision_score / roc_auc_score on the raw
+soft/probability output, before thresholding), so these numbers are directly comparable to the
+paper's. Dice/IoU is reported alongside for its own sake but is not in the paper, so it should
+not be presented as a comparison to DRG-Net's published numbers.
 
 Usage (after training, from anywhere with this repo + the checkpoint available):
     python evaluate_segmentation_dice_iou.py \
@@ -13,12 +17,14 @@ Usage (after training, from anywhere with this repo + the checkpoint available):
         --lesion EX
 """
 import argparse
+import json
 import os
 
 import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
+from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 from torchvision import transforms
 
 LESION_TO_FOLDER = {
@@ -63,7 +69,18 @@ def main():
     parser.add_argument("--lesion", required=True, choices=list(LESION_TO_FOLDER.keys()))
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--curve-out", default=None,
+                         help="If given, writes {auc, ap, fpr, tpr} (pooled ROC curve, "
+                              "downsampled to --curve-points) to this JSON path, for "
+                              "module1/plot_figures.py's per-lesion ROC curve figure.")
+    parser.add_argument("--curve-points", type=int, default=200,
+                         help="Number of (fpr, tpr) points to keep in --curve-out.")
+    parser.add_argument("--curve-max-pixels-per-image", type=int, default=20000,
+                         help="Random pixel subsample per image before pooling for the ROC "
+                              "curve -- bounds memory on a large test set without meaningfully "
+                              "changing the curve's shape.")
     args = parser.parse_args()
+    rng = np.random.default_rng(0)
 
     import segmentation_models_pytorch as smp
 
@@ -79,7 +96,8 @@ def main():
     mask_folder = os.path.join(args.fgadr_root, LESION_TO_FOLDER[args.lesion])
     image_dir = os.path.join(args.fgadr_root, "Original_Images")
 
-    dices, ious = [], []
+    dices, ious, aps, aucs = [], [], [], []
+    pooled_gt, pooled_score = [], []
     for name in test_names:
         image_path = os.path.join(image_dir, name)
         mask_path = os.path.join(mask_folder, name)
@@ -91,9 +109,13 @@ def main():
         x = tfm(img).unsqueeze(0).to(args.device)
         with torch.no_grad():
             probs = torch.softmax(model(x), dim=1)
-            pred = (probs[0, 1] > 0.5).cpu().numpy().astype(np.uint8)
-        pred_img = Image.fromarray(pred * 255).resize(orig_size, Image.NEAREST)
-        pred_full = (np.array(pred_img) > 0).astype(np.uint8)
+            soft_pred = probs[0, 1].cpu().numpy()
+        # Resize the raw soft prediction (not yet thresholded) back to the mask's original
+        # size for the AP/AUC computation, same soft output DRG-Net's own eval_model scores.
+        soft_pred_full = np.array(
+            Image.fromarray(soft_pred.astype(np.float32), mode="F").resize(orig_size, Image.BILINEAR)
+        )
+        pred_full = (soft_pred_full > 0.5).astype(np.uint8)
 
         gt = (np.array(Image.open(mask_path).convert("L")) > 127).astype(np.uint8)
 
@@ -101,10 +123,48 @@ def main():
         dices.append(d)
         ious.append(i)
 
+        gt_flat, soft_flat = gt.flatten(), soft_pred_full.flatten()
+        aps.append(average_precision_score(gt_flat, soft_flat))
+        if gt_flat.max() > 0:
+            aucs.append(roc_auc_score(gt_flat, soft_flat))
+        # else: this image has no positive pixels for this lesion -- AUC-ROC is undefined,
+        # skip it rather than counting a NaN into the mean (AP handles this case natively).
+
+        if args.curve_out and gt_flat.size > args.curve_max_pixels_per_image:
+            sample_idx = rng.choice(gt_flat.size, size=args.curve_max_pixels_per_image, replace=False)
+            pooled_gt.append(gt_flat[sample_idx])
+            pooled_score.append(soft_flat[sample_idx])
+        elif args.curve_out:
+            pooled_gt.append(gt_flat)
+            pooled_score.append(soft_flat)
+
     print(f"Lesion: {args.lesion}")
     print(f"N test images evaluated: {len(dices)}")
-    print(f"Mean Dice: {np.mean(dices):.4f}")
-    print(f"Mean IoU:  {np.mean(ious):.4f}")
+    print(f"Mean Dice:    {np.mean(dices):.4f}")
+    print(f"Mean IoU:     {np.mean(ious):.4f}")
+    print(f"Mean AUC-PR:  {np.mean(aps):.4f}")
+    print(f"Mean AUC-ROC: {np.mean(aucs):.4f} (n={len(aucs)}/{len(dices)} images had >=1 positive pixel)")
+
+    if args.curve_out:
+        y_true = np.concatenate(pooled_gt)
+        y_score = np.concatenate(pooled_score)
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        # Downsample to --curve-points evenly-spaced points along fpr for a compact,
+        # plottable curve (roc_curve's own output can have as many points as pixels).
+        if len(fpr) > args.curve_points:
+            keep_idx = np.linspace(0, len(fpr) - 1, args.curve_points).astype(int)
+            fpr, tpr = fpr[keep_idx], tpr[keep_idx]
+        curve_data = {
+            "lesion": args.lesion,
+            "auc": float(np.mean(aucs)),
+            "ap": float(np.mean(aps)),
+            "n_pixels_pooled": int(y_true.size),
+            "fpr": fpr.tolist(),
+            "tpr": tpr.tolist(),
+        }
+        with open(args.curve_out, "w") as f:
+            json.dump(curve_data, f)
+        print(f"✓ Wrote pooled ROC curve ({curve_data['n_pixels_pooled']} pixels) to {args.curve_out}")
 
 
 if __name__ == "__main__":
