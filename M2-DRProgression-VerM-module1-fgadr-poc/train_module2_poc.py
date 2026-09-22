@@ -69,6 +69,7 @@ class Config:
     image_size = 128
     batch_size = 4
     augment = True
+    num_workers = 0
     fire_module1_cache_path = None
     longdr_module1_cache_path = None
     tianjin_module1_cache_path = None
@@ -198,6 +199,7 @@ def train(config: Config):
         tianjin_module1_cache_path=config.tianjin_module1_cache_path,
         tianjin_min_pair_quality=config.tianjin_min_pair_quality,
         registration_cache_path=config.registration_cache_path,
+        num_workers=config.num_workers,
     )
     print(f"✓ Real pairs: {num_pairs}, effective samples: {len(loader.dataset)}, batches/epoch: {len(loader)}")
 
@@ -327,6 +329,10 @@ if __name__ == "__main__":
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--num-workers", type=int, default=Config.num_workers,
+                         help="DataLoader worker processes for image decode/resize/augment. "
+                              "0 (the default) loads serially on the main process, which can "
+                              "make the GPU sit idle between batches -- try 2 on Colab.")
     parser.add_argument("--save-dir", default=Config.save_dir,
                          help="Where to write {epoch}-G.ckpt / final-G.ckpt / poc_results.json. "
                               "Give each run its own directory -- this script always trains G/D "
@@ -346,6 +352,7 @@ if __name__ == "__main__":
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
+    cfg.num_workers = args.num_workers
     cfg.save_dir = args.save_dir
 
     train(cfg)
