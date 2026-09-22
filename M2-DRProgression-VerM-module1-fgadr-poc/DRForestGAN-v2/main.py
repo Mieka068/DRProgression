@@ -6,7 +6,7 @@ from torch.backends import cudnn
 
 
 def str2bool(v):
-    return v.lower() in ('true')
+    return v.lower() == 'true'
 
 def main(config):
     # For fast training.
