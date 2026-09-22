@@ -11,6 +11,12 @@ something implausible, or that Module 1's own grader is unreliable on synthesize
 (out-of-distribution) images. This script measures both without attempting to disentangle
 which.
 
+Consistency is reported two ways: a raw agreement rate (argmax prediction == target stage --
+interpretable at a glance) and an AUC (roc_auc_score on Module 1's softmax score for the
+target stage against whether the pair's real follow-up actually reached that stage --
+directly comparable to DRForecastGAN's own published 0.87 internal / 0.85 external AUC for
+this exact idea, which the raw rate is not since it discards ranking/confidence information).
+
 Only Tianjin has a grade on both the baseline and the follow-up image (see
 module3/dataset.py) -- FIRE and LongDR have no follow-up grade, so they cannot participate in
 this evaluation. For a given pair, only the cascade step whose target stage equals the real
@@ -47,7 +53,7 @@ from torchvision import transforms
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
 from base_model import Generator  # noqa: E402
-from trajectory_inference import synthesize_trajectory  # noqa: E402
+from trajectory_inference import _module1_predict, synthesize_trajectory  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module3"))
 from dataset import TianjinSurvivalDataset  # noqa: E402
@@ -57,6 +63,12 @@ from apply_to_progression_data import ALL_LESIONS, load_classifier, load_segment
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tianjin_dataset import _module1_image_id_candidates  # noqa: E402
+from fire_dataset import FIREDataset  # noqa: E402
+from longdr_dataset import LongDRScreeningDataset  # noqa: E402
+from image_quality_metrics import compute_fid_kid_stats  # noqa: E402
+
+SELF_CONSISTENCY_DATASETS = {"fire": FIREDataset, "longdr": LongDRScreeningDataset}
+SELF_CONSISTENCY_TAG = "self-consistency -- not validated against ground truth"
 
 
 def denorm(x):
@@ -100,6 +112,94 @@ def load_module1_models(config, device):
     return classifier, seg_models
 
 
+def evaluate_self_consistency(source_name, dataset_dir, G, classifier, seg_models, device, config):
+    """
+    FID/PSNR/SSIM for FIRE/LongDRScreening pairs, which have real baseline+follow-up images
+    but NO real DR grade for either (see combined_dataset.py's module docstring). Since there
+    is no ground-truth grade to synthesize a trajectory toward, this uses Module 1's own
+    classifier prediction on the real follow-up image as the trajectory's target stage --
+    i.e. it asks "if Module 1 itself thinks this pair progressed from stage X to stage Y, does
+    the generator's stage-X-to-Y synthesis look like the real photo at stage Y?" That is a
+    self-consistency check against Module 1's own (unverified) grading, not a validated
+    comparison against ground truth the way the Tianjin path is -- every number this function
+    returns must stay labeled with SELF_CONSISTENCY_TAG wherever it's shown.
+    """
+    from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
+    dataset_cls = SELF_CONSISTENCY_DATASETS[source_name]
+    dataset = dataset_cls(dataset_dir, image_size=config.image_size)
+    n_pairs = len(dataset)
+    if config.self_consistency_max_pairs:
+        n_pairs = min(n_pairs, config.self_consistency_max_pairs)
+
+    per_step_psnr = defaultdict(list)
+    per_step_ssim = defaultdict(list)
+    per_step_images = defaultdict(lambda: {"real": [], "fake": []})
+    n_skipped_no_progression = 0
+    mask_size = config.image_size
+
+    with torch.no_grad():
+        for idx in range(n_pairs):
+            sample = dataset[idx]
+            baseline = sample["baseline"].unsqueeze(0).to(device)
+            follow_up = sample["follow_up"].unsqueeze(0).to(device)
+
+            baseline_stage, _, baseline_mask = _module1_predict(baseline, classifier, seg_models, device, mask_size)
+            target_stage, _, _ = _module1_predict(follow_up, classifier, seg_models, device, mask_size)
+            baseline_mask = baseline_mask.to(device)
+
+            if target_stage <= baseline_stage:
+                n_skipped_no_progression += 1
+                continue  # Module 1 itself doesn't think this pair progressed -- nothing to evaluate
+
+            trajectory = synthesize_trajectory(
+                G, classifier, seg_models, baseline, baseline_mask,
+                start_stage=baseline_stage, end_stage=target_stage, c_dim=config.c_dim, device=device,
+            )
+            synthesized = trajectory[-1]["image"]
+
+            real_01 = denorm(follow_up)
+            fake_01 = denorm(synthesized)
+            step_count = target_stage - baseline_stage
+            per_step_psnr[step_count].append(float(psnr_metric(fake_01, real_01)))
+            per_step_ssim[step_count].append(float(ssim_metric(fake_01, real_01)))
+            per_step_images[step_count]["real"].append(real_01.cpu())
+            per_step_images[step_count]["fake"].append(fake_01.cpu())
+
+    print(
+        f"  [{source_name}] {n_pairs - n_skipped_no_progression}/{n_pairs} pairs used "
+        f"(skipped {n_skipped_no_progression} Module-1-says-no-progression pairs)"
+    )
+
+    results = {}
+    for step_count in sorted(per_step_psnr.keys()):
+        n = len(per_step_psnr[step_count])
+        entry = {
+            "n_pairs": n,
+            "mean_psnr": float(np.mean(per_step_psnr[step_count])),
+            "mean_ssim": float(np.mean(per_step_ssim[step_count])),
+            "note": SELF_CONSISTENCY_TAG,
+        }
+        fid_kid = compute_fid_kid_stats(
+            per_step_images[step_count]["real"], per_step_images[step_count]["fake"], device,
+            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
+        )
+        entry["fid"] = fid_kid["fid"]
+        entry["fid_bootstrap_range"] = fid_kid["fid_bootstrap_range"]
+        entry["kid_mean"] = fid_kid["kid_mean"]
+        entry["kid_std"] = fid_kid["kid_std"]
+        if fid_kid["note"]:
+            entry["fid_note"] = fid_kid["note"]
+        results[f"step_{step_count}"] = entry
+        print(f"    [{source_name}] step_count={step_count}: n={n}, PSNR={entry['mean_psnr']:.3f}, "
+              f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']}, KID={entry['kid_mean']} "
+              f"({SELF_CONSISTENCY_TAG})")
+    return results
+
+
 def evaluate(config):
     from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
@@ -130,6 +230,10 @@ def evaluate(config):
     per_step_ssim = defaultdict(list)
     per_step_images = defaultdict(lambda: {"real": [], "fake": []})
     consistency_by_step = defaultdict(list)  # step index within a trajectory (1, 2, ...) -> [bool]
+    # AUC version of the same signal: score = Module 1's own softmax score for the target stage
+    # (not just its argmax), label = whether this pair's real follow-up actually reached (>=)
+    # that stage. roc_auc_score needs both classes present, so these are scored per-step below.
+    consistency_scores_by_step = defaultdict(list)  # step index -> [(score, label)]
     n_skipped_no_progression = 0
 
     for _, row in manifest.iterrows():
@@ -155,9 +259,14 @@ def evaluate(config):
             c_dim=config.c_dim,
             device=device,
         )
+        real_followup_stage = int(row["followup_icdr"])
         for step_idx, entry in enumerate(trajectory[1:], start=1):
             if entry["consistency"] is not None:
                 consistency_by_step[step_idx].append(bool(entry["consistency"]))
+            if entry["grade_probs"] is not None:
+                score = float(entry["grade_probs"][entry["stage"]])
+                label = int(real_followup_stage >= entry["stage"])
+                consistency_scores_by_step[step_idx].append((score, label))
 
         final_stage, synthesized = trajectory[-1]["stage"], trajectory[-1]["image"]
         assert final_stage == int(row["followup_icdr"])
@@ -186,40 +295,66 @@ def evaluate(config):
             "mean_psnr": float(np.mean(per_step_psnr[step_count])),
             "mean_ssim": float(np.mean(per_step_ssim[step_count])),
         }
-        if n >= config.min_n_for_fid:
-            try:
-                from torchmetrics.image.fid import FrechetInceptionDistance
-
-                fid_metric = FrechetInceptionDistance(feature=64, normalize=True).to(device)
-                for img in per_step_images[step_count]["real"]:
-                    fid_metric.update(img.to(device), real=True)
-                for img in per_step_images[step_count]["fake"]:
-                    fid_metric.update(img.to(device), real=False)
-                entry["fid"] = float(fid_metric.compute())
-            except ImportError:
-                entry["fid"] = None
-        else:
-            entry["fid"] = None
-            entry["fid_note"] = (
-                f"n_pairs ({n}) < min_n_for_fid ({config.min_n_for_fid}) -- FID is a "
-                "distributional metric and unreliable on very few samples, so it's omitted "
-                "here rather than reported misleadingly."
-            )
+        # feature=2048 (standard Inception pool features), matching train_module2_poc.py's
+        # convention -- see image_quality_metrics.py for why feature=64 is the wrong default
+        # to compare against DRForecastGAN's published FID, and why a bootstrap range + KID
+        # are reported alongside the point estimate at this sample size.
+        fid_kid = compute_fid_kid_stats(
+            per_step_images[step_count]["real"], per_step_images[step_count]["fake"], device,
+            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
+        )
+        entry["fid"] = fid_kid["fid"]
+        entry["fid_bootstrap_range"] = fid_kid["fid_bootstrap_range"]
+        entry["kid_mean"] = fid_kid["kid_mean"]
+        entry["kid_std"] = fid_kid["kid_std"]
+        if fid_kid["note"]:
+            entry["fid_note"] = fid_kid["note"]
         results["quality"][f"step_{step_count}"] = entry
+        fid_range = entry["fid_bootstrap_range"]
+        fid_range_str = f" (95% range [{fid_range[0]:.3f}, {fid_range[1]:.3f}])" if fid_range else ""
         print(
             f"  step_count={step_count}: n={n}, PSNR={entry['mean_psnr']:.3f}, "
-            f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']}"
+            f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']}{fid_range_str}, KID={entry['kid_mean']}"
         )
+
+    from sklearn.metrics import roc_auc_score
 
     for step_idx in sorted(consistency_by_step.keys()):
         flags = consistency_by_step[step_idx]
         rate = float(np.mean(flags))
-        results["module1_consistency"][f"cascade_step_{step_idx}"] = {
+        entry = {
             "n": len(flags),
             "module1_agrees_with_target_stage_rate": rate,
         }
+
+        scored = consistency_scores_by_step.get(step_idx, [])
+        labels = [label for _, label in scored]
+        if scored and len(set(labels)) > 1:
+            scores = [score for score, _ in scored]
+            auc = float(roc_auc_score(labels, scores))
+            entry["module1_consistency_auc"] = auc
+            auc_str = f"{auc:.3f}"
+        else:
+            entry["module1_consistency_auc"] = None
+            entry["module1_consistency_auc_note"] = (
+                "only one class present among this step's real-followup-reached-target-stage "
+                "labels -- AUC is undefined, omitted rather than reported misleadingly."
+            )
+            auc_str = "None"
+
+        results["module1_consistency"][f"cascade_step_{step_idx}"] = entry
         print(f"  cascade step {step_idx}: Module 1 re-grading agreed with the target stage "
-              f"{rate:.1%} of the time (n={len(flags)})")
+              f"{rate:.1%} of the time (n={len(flags)}); AUC={auc_str} "
+              "(DRForecastGAN reports 0.87 internal / 0.85 external for this comparison)")
+
+    if config.self_consistency_dirs:
+        print(f"\n[extra] Self-consistency eval ({SELF_CONSISTENCY_TAG}) for "
+              f"{list(config.self_consistency_dirs.keys())}...")
+        results["self_consistency"] = {"note": SELF_CONSISTENCY_TAG}
+        for source_name, source_dir in config.self_consistency_dirs.items():
+            results["self_consistency"][source_name] = evaluate_self_consistency(
+                source_name, source_dir, G, classifier, seg_models, device, config
+            )
 
     with open(config.out, "w") as f:
         json.dump(results, f, indent=2)
@@ -249,10 +384,38 @@ if __name__ == "__main__":
         "--style-dim", type=int, default=None, help="Defaults to c_dim, matching Generator's own default"
     )
     parser.add_argument("--min-n-for-fid", type=int, default=5)
+    parser.add_argument("--fid-n-bootstrap", type=int, default=10,
+                         help="With-replacement resamples for each step's FID stability range.")
+    parser.add_argument(
+        "--self-consistency-dirs",
+        action="append",
+        default=[],
+        metavar="SOURCE=PATH",
+        help="Repeatable. SOURCE is 'fire' or 'longdr'. Runs FID/PSNR/SSIM for that source's "
+             "real pairs against the generator's synthesis, with the target stage taken from "
+             "Module 1's own classifier prediction on the real follow-up image (neither "
+             "source has a real grade) -- every number this produces is tagged "
+             f"'{SELF_CONSISTENCY_TAG}' and must not be read alongside the Tianjin numbers as "
+             "the same kind of claim. e.g. --self-consistency-dirs fire=./FIRE_dataset "
+             "--self-consistency-dirs longdr=./LongDRScreening_20150209",
+    )
+    parser.add_argument("--self-consistency-max-pairs", type=int, default=200,
+                         help="Cap on pairs evaluated per self-consistency source (0 = no cap).")
     parser.add_argument("--out", default="./trajectory_eval_results.json")
     args = parser.parse_args()
 
     if not args.dry_run and not args.classifier_checkpoint:
         parser.error("--classifier-checkpoint is required unless --dry-run is set")
+
+    self_consistency_dirs = {}
+    for item in args.self_consistency_dirs:
+        if "=" not in item:
+            parser.error(f"--self-consistency-dirs must be SOURCE=PATH, got: {item}")
+        source_name, source_dir = item.split("=", 1)
+        if source_name not in SELF_CONSISTENCY_DATASETS:
+            parser.error(f"Unknown self-consistency source '{source_name}', "
+                         f"must be one of {list(SELF_CONSISTENCY_DATASETS.keys())}")
+        self_consistency_dirs[source_name] = source_dir
+    args.self_consistency_dirs = self_consistency_dirs
 
     evaluate(args)

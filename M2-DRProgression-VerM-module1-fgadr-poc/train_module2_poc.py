@@ -69,6 +69,7 @@ class Config:
     image_size = 128
     batch_size = 4
     augment = True
+    num_workers = 0
     fire_module1_cache_path = None
     longdr_module1_cache_path = None
     tianjin_module1_cache_path = None
@@ -100,7 +101,13 @@ class Config:
     sample_dir = "./training_samples_poc/"
     log_step = 1
     save_step = 1
-    eval_batches = 5  # how many held-out batches to use for FID/PSNR/SSIM at the end
+    # How many batches of the (in-sample, not held-out -- see compute_poc_metrics' docstring)
+    # loader to use for FID/PSNR/SSIM/KID at the end. 5 was an unexamined POC default, not a
+    # real ceiling -- raise it via --eval-batches if the dataset has more to spare (see
+    # IMPLEMENTATION_PLAN_3.md Task L).
+    eval_batches = 5
+    min_n_for_fid = 50  # below this, FID (feature=2048)/KID are unreliable -- report None instead
+    fid_n_bootstrap = 10  # number of with-replacement resamples for the FID stability range
 
 
 def gradient_penalty(D, real, fake, device):
@@ -123,24 +130,36 @@ def denorm(x):
     return ((x + 1) / 2).clamp_(0, 1)
 
 
-def compute_poc_metrics(G, loader, device, n_batches, image_size):
+def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50, n_bootstrap=10):
     """
     FID/PSNR/SSIM between synthesized follow-ups and real follow-ups, over a handful of
     batches -- a small/short-run number, explicitly not a claim of matching DRForecastGAN's
     published benchmark (see module docstring point 4). Requires torchmetrics AND
     torch-fidelity (pip install torchmetrics torch-fidelity on Colab -- FID specifically
     needs the latter, PSNR/SSIM don't).
+
+    Note on what "held-out" means here: `loader` is the SAME shuffled loader used for
+    training, not a separate validation split (get_combined_loader/combined_dataset.py don't
+    do a train/val split) -- this evaluates on a random slice of in-sample data, not a true
+    held-out set. Framed honestly rather than silently as "held-out" (see
+    IMPLEMENTATION_PLAN_3.md Task L).
+
+    FID/KID: see image_quality_metrics.py's own docstring for why feature=2048 is used
+    (matching DRForecastGAN's assumed convention) despite being a biased small-N estimator,
+    and why a bootstrap range + KID are reported alongside the point estimate rather than
+    silently falling back to a more-stable-but-non-comparable feature=64.
     """
     from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-    from torchmetrics.image.fid import FrechetInceptionDistance
+
+    from image_quality_metrics import compute_fid_kid_stats
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    # FID's InceptionV3 backbone expects >=75x75 images; our POC image_size (128) is fine.
-    fid_metric = FrechetInceptionDistance(feature=64, normalize=True).to(device)
 
     G.eval()
     n_seen = 0
+    n_samples = 0
+    real_imgs, fake_imgs = [], []
     with torch.no_grad():
         for batch in loader:
             if n_seen >= n_batches:
@@ -158,17 +177,30 @@ def compute_poc_metrics(G, loader, device, n_batches, image_size):
 
             psnr_metric.update(fake_01, real_01)
             ssim_metric.update(fake_01, real_01)
-            fid_metric.update(real_01, real=True)
-            fid_metric.update(fake_01, real=False)
+            # Split the batch into per-image [1,3,H,W] CPU tensors for compute_fid_kid_stats's
+            # bootstrap resampling, which needs to index individual images.
+            real_imgs.extend(img.unsqueeze(0).cpu() for img in real_01)
+            fake_imgs.extend(img.unsqueeze(0).cpu() for img in fake_01)
             n_seen += 1
+            n_samples += baseline.size(0)
     G.train()
 
-    return {
+    fid_kid = compute_fid_kid_stats(
+        real_imgs, fake_imgs, device, min_n_for_fid=min_n_for_fid, n_bootstrap=n_bootstrap
+    )
+    result = {
         "psnr": float(psnr_metric.compute()),
         "ssim": float(ssim_metric.compute()),
-        "fid": float(fid_metric.compute()),
         "n_batches_used": n_seen,
+        "n_samples_used": n_samples,
+        "fid": fid_kid["fid"],
+        "fid_bootstrap_range": fid_kid["fid_bootstrap_range"],
+        "kid_mean": fid_kid["kid_mean"],
+        "kid_std": fid_kid["kid_std"],
     }
+    if fid_kid["note"]:
+        result["fid_note"] = fid_kid["note"]
+    return result
 
 
 def train(config: Config):
@@ -198,6 +230,7 @@ def train(config: Config):
         tianjin_module1_cache_path=config.tianjin_module1_cache_path,
         tianjin_min_pair_quality=config.tianjin_min_pair_quality,
         registration_cache_path=config.registration_cache_path,
+        num_workers=config.num_workers,
     )
     print(f"✓ Real pairs: {num_pairs}, effective samples: {len(loader.dataset)}, batches/epoch: {len(loader)}")
 
@@ -215,6 +248,7 @@ def train(config: Config):
     print(f"\n[3/4] Training for {config.num_epochs} epochs (POC scale -- see module docstring)...")
     start_time = time.time()
     x_real = target_grade = baseline = follow_up = None  # for the post-loop sample save
+    loss_history = []  # per-epoch {epoch, d_loss, g_loss, rec_loss} -- for the G/D loss curve figure
 
     for epoch in range(config.num_epochs):
         epoch_g_loss = epoch_d_loss = epoch_rec_loss = 0
@@ -255,9 +289,15 @@ def train(config: Config):
             epoch_d_loss += d_loss.item()
 
         elapsed = time.time() - start_time
+        mean_d_loss = epoch_d_loss / len(loader)
+        mean_g_loss = epoch_g_loss / len(loader)
+        mean_rec_loss = epoch_rec_loss / len(loader)
+        loss_history.append({
+            "epoch": epoch + 1, "d_loss": mean_d_loss, "g_loss": mean_g_loss, "rec_loss": mean_rec_loss,
+        })
         print(
-            f"Epoch [{epoch + 1}/{config.num_epochs}] | D_loss: {epoch_d_loss / len(loader):.4f} | "
-            f"G_loss: {epoch_g_loss / len(loader):.4f} | Rec_loss: {epoch_rec_loss / len(loader):.4f} | "
+            f"Epoch [{epoch + 1}/{config.num_epochs}] | D_loss: {mean_d_loss:.4f} | "
+            f"G_loss: {mean_g_loss:.4f} | Rec_loss: {mean_rec_loss:.4f} | "
             f"Elapsed: {elapsed / 60:.1f}min"
         )
 
@@ -274,11 +314,24 @@ def train(config: Config):
             G.train()
             torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
 
-    print("\n[4/4] Computing POC metrics (FID/PSNR/SSIM on a held-out slice)...")
+    print(f"\n[4/4] Computing POC metrics (FID/PSNR/SSIM on {config.eval_batches} batches of the "
+          "training loader -- see compute_poc_metrics' docstring on why this is not a true "
+          "held-out split)...")
     try:
-        metrics = compute_poc_metrics(G, loader, device, config.eval_batches, config.image_size)
-        print(f"✓ PSNR: {metrics['psnr']:.3f} | SSIM: {metrics['ssim']:.3f} | FID: {metrics['fid']:.3f} "
-              f"(n_batches={metrics['n_batches_used']})")
+        metrics = compute_poc_metrics(
+            G, loader, device, config.eval_batches, config.image_size,
+            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
+        )
+        if metrics["fid"] is not None:
+            fid_range = metrics["fid_bootstrap_range"]
+            fid_range_str = f" (bootstrap 95% range: [{fid_range[0]:.3f}, {fid_range[1]:.3f}])" if fid_range else ""
+            fid_str = f"{metrics['fid']:.3f}{fid_range_str}"
+        else:
+            fid_str = f"None ({metrics.get('fid_note', '')})"
+        kid_str = (f"{metrics['kid_mean']:.5f} +/- {metrics['kid_std']:.5f}"
+                   if metrics["kid_mean"] is not None else "None")
+        print(f"✓ PSNR: {metrics['psnr']:.3f} | SSIM: {metrics['ssim']:.3f} | FID: {fid_str} | KID: {kid_str} "
+              f"(n_batches={metrics['n_batches_used']}, n_samples={metrics['n_samples_used']})")
     except ImportError:
         print("⚠ torchmetrics/torch-fidelity not installed -- skipping FID/PSNR/SSIM "
               "(pip install torchmetrics torch-fidelity)")
@@ -301,6 +354,7 @@ def train(config: Config):
         "tianjin_module1_cache_path": config.tianjin_module1_cache_path,
         "registration_cache_path": config.registration_cache_path,
         "metrics": metrics,
+        "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
     }
     results_path = os.path.join(config.save_dir, "poc_results.json")
@@ -327,6 +381,25 @@ if __name__ == "__main__":
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--num-workers", type=int, default=Config.num_workers,
+                         help="DataLoader worker processes for image decode/resize/augment. "
+                              "0 (the default) loads serially on the main process, which can "
+                              "make the GPU sit idle between batches -- try 2 on Colab.")
+    parser.add_argument("--save-dir", default=Config.save_dir,
+                         help="Where to write {epoch}-G.ckpt / final-G.ckpt / poc_results.json. "
+                              "Give each run its own directory -- this script always trains G/D "
+                              "from scratch and will silently overwrite an earlier run's "
+                              "checkpoints left at the same path.")
+    parser.add_argument("--min-n-for-fid", type=int, default=Config.min_n_for_fid,
+                         help="Minimum eval samples before FID (feature=2048)/KID are reported "
+                              "instead of None.")
+    parser.add_argument("--eval-batches", type=int, default=Config.eval_batches,
+                         help="Batches of the loader to use for end-of-run FID/PSNR/SSIM/KID "
+                              "(not a held-out split -- see compute_poc_metrics' docstring). "
+                              "5 is an unexamined POC default, not a real ceiling -- raise it "
+                              "if more data is available.")
+    parser.add_argument("--fid-n-bootstrap", type=int, default=Config.fid_n_bootstrap,
+                         help="With-replacement resamples for the FID stability range.")
     args = parser.parse_args()
 
     cfg = Config()
@@ -341,5 +414,10 @@ if __name__ == "__main__":
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
+    cfg.num_workers = args.num_workers
+    cfg.save_dir = args.save_dir
+    cfg.min_n_for_fid = args.min_n_for_fid
+    cfg.eval_batches = args.eval_batches
+    cfg.fid_n_bootstrap = args.fid_n_bootstrap
 
     train(cfg)

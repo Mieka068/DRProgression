@@ -1,6 +1,20 @@
 """
 Combined FIRE + LongDRScreening + Tianjin Dataset Loader with Augmentation
 Maximizes training data for the GAN
+
+How FIRE and LongDRScreening actually flow through training, precisely: this file wraps
+FIREDataset and LongDRScreeningDataset (each reading real longitudinal image pairs from their
+own raw data directories -- no real DR grade available in either) and concatenates them with
+TianjinLongitudinalDataset into one combined dataset that train_module2_poc.py trains on.
+Neither FIRE nor LongDRScreening carries a real grade, so both fall back to a placeholder
+Stage-2 one-hot target during training whenever no module1_cache_path entry is given for a
+pair (see fire_dataset.py's __getitem__ / longdr_dataset.py's equivalent) -- meaning every
+FIRE/LongDR training pair without a cache entry teaches the generator "make this image look
+like Stage 2," regardless of what stage the pair might actually represent. Their contribution
+is real image-pair volume and photographic diversity for the adversarial/reconstruction
+losses, not genuine stage-transition supervision. Because of this, FIRE/LongDR pairs cannot be
+scored against a real follow-up grade the way Tianjin's can (see evaluate_trajectory.py's
+--self-consistency-dirs option for the metric this file's sources use instead).
 """
 
 import torch
