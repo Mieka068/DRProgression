@@ -327,6 +327,11 @@ if __name__ == "__main__":
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--save-dir", default=Config.save_dir,
+                         help="Where to write {epoch}-G.ckpt / final-G.ckpt / poc_results.json. "
+                              "Give each run its own directory -- this script always trains G/D "
+                              "from scratch and will silently overwrite an earlier run's "
+                              "checkpoints left at the same path.")
     args = parser.parse_args()
 
     cfg = Config()
@@ -341,5 +346,6 @@ if __name__ == "__main__":
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
+    cfg.save_dir = args.save_dir
 
     train(cfg)
