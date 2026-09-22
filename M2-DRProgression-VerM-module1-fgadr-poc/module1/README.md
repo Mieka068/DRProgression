@@ -53,3 +53,21 @@ Burden Score, and the bridge into Module 2's `fire_dataset.py`/`longdr_dataset.p
   claim of matching published performance.
 - DRG-Net's own segmentation eval metric is **AP + ROC-AUC** (not Dice/IoU); we report both —
   AP/AUC to match the paper, Dice/IoU because the manuscript separately commits to that pair.
+  `evaluate_segmentation_dice_iou.py` computes AP/ROC-AUC on the model's raw soft prediction
+  (before thresholding), matching `train_fgadr.py::eval_model`'s own computation, so these are
+  directly comparable to DRG-Net's Table III (FGADR-source, `S-Net+PD-Net+TATL`, the closest
+  published setting to ours):
+
+  | Lesion | Published AUC-ROC | Published AUC-PR |
+  |---|---|---|
+  | MA | 0.937 | 0.417 |
+  | HE | 0.963 | 0.652 |
+  | EX | 0.970 | 0.714 |
+  | SE | 0.954 | 0.553 |
+
+  `LESION_TO_FOLDER` (EX→HardExudate, HE→Hemohedge, MA→Microaneurysms, SE→SoftExudate) matches
+  FGADR's own mask folder names and DRG-Net's own `LESION_IDS`, so there is no label-swap risk
+  in this comparison.
+- Classification eval reports **only Accuracy and Quadratic Weighted Kappa**, matching what
+  DRG-Net's paper reports (Section VI-B) — sensitivity/specificity/F1 are deliberately not
+  computed, since there is no published number to compare them against.

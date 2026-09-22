@@ -61,7 +61,7 @@ def _module1_predict(image_tensor, classifier, seg_models, device, mask_size):
         (mask_size, mask_size), Image.NEAREST
     )
     mask_tensor = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0).unsqueeze(0)
-    return result["grade"], mask_tensor
+    return result["grade"], result["grade_probs"], mask_tensor
 
 
 def synthesize_trajectory(generator, classifier, seg_models, baseline_image, baseline_mask,
@@ -88,10 +88,13 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
 
     Returns:
         list of dicts, one per stage from start_stage (the real baseline) through end_stage,
-        each {'stage', 'image', 'mask', 'consistency'}. 'mask' is the real baseline_mask for
-        the baseline entry and a fresh Module-1-predicted mask for every synthesized step.
-        'consistency' is None for the baseline entry and a bool (predicted grade == target
-        stage) for every synthesized step.
+        each {'stage', 'image', 'mask', 'consistency', 'grade_probs'}. 'mask' is the real
+        baseline_mask for the baseline entry and a fresh Module-1-predicted mask for every
+        synthesized step. 'consistency' is None for the baseline entry and a bool (predicted
+        grade == target stage) for every synthesized step. 'grade_probs' is None for the
+        baseline entry and Module 1's per-class softmax score array for every synthesized
+        step -- the raw score an AUC-based consistency metric needs (evaluate_trajectory.py),
+        since the argmax alone throws away ranking/confidence information.
     """
     if end_stage <= start_stage:
         raise ValueError(
@@ -107,7 +110,13 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
     baseline_mask = baseline_mask.to(device)
 
     trajectory = [
-        {"stage": start_stage, "image": baseline_image, "mask": baseline_mask, "consistency": None}
+        {
+            "stage": start_stage,
+            "image": baseline_image,
+            "mask": baseline_mask,
+            "consistency": None,
+            "grade_probs": None,
+        }
     ]
     current_image, current_mask = baseline_image, baseline_mask
 
@@ -118,11 +127,19 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
             x = torch.cat([current_image, current_mask], dim=1)
             synthesized = generator(x, c_target)
 
-            predicted_grade, new_mask = _module1_predict(synthesized, classifier, seg_models, device, mask_size)
+            predicted_grade, grade_probs, new_mask = _module1_predict(
+                synthesized, classifier, seg_models, device, mask_size
+            )
             new_mask = new_mask.to(device)
             consistent = predicted_grade == stage
 
-            trajectory.append({"stage": stage, "image": synthesized, "mask": new_mask, "consistency": consistent})
+            trajectory.append({
+                "stage": stage,
+                "image": synthesized,
+                "mask": new_mask,
+                "consistency": consistent,
+                "grade_probs": grade_probs,
+            })
             current_image, current_mask = synthesized, new_mask
 
     return trajectory

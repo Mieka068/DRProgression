@@ -72,7 +72,8 @@ def load_segmentation_model(checkpoint_path, device="cpu", dry_run=False):
     return model
 
 
-def predict_grade(model, image_path, image_size=512, mean=FGADR_MEAN, std=FGADR_STD, device="cpu"):
+def predict_grade(model, image_path, image_size=512, mean=FGADR_MEAN, std=FGADR_STD, device="cpu",
+                   return_probs=False):
     tfm = transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
@@ -84,7 +85,10 @@ def predict_grade(model, image_path, image_size=512, mean=FGADR_MEAN, std=FGADR_
     x = tfm(img).unsqueeze(0).to(device)
     with torch.no_grad():
         logits = model(x)
+        probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
         grade = int(torch.argmax(logits, dim=1).item())
+    if return_probs:
+        return grade, probs
     return grade
 
 
@@ -102,7 +106,7 @@ def predict_lesion_mask(model, image_path, image_size=512, device="cpu"):
 
 
 def process_image(image_path, classifier, seg_models: dict, device="cpu"):
-    grade = predict_grade(classifier, image_path, device=device)
+    grade, grade_probs = predict_grade(classifier, image_path, device=device, return_probs=True)
     rgb = np.array(Image.open(image_path).convert("RGB"))
     fov_mask = estimate_retinal_fov_mask(rgb)
 
@@ -116,7 +120,13 @@ def process_image(image_path, classifier, seg_models: dict, device="cpu"):
         trained_lesions.append(lesion_name)
 
     lbs = compute_lbs(combined_mask, fov_mask)
-    return {"grade": grade, "mask": combined_mask, "lbs": lbs, "trained_lesions": trained_lesions}
+    return {
+        "grade": grade,
+        "grade_probs": grade_probs,  # per-class softmax scores, for AUC-based consistency (evaluate_trajectory.py)
+        "mask": combined_mask,
+        "lbs": lbs,
+        "trained_lesions": trained_lesions,
+    }
 
 
 def main():
