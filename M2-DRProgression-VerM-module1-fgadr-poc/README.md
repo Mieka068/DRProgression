@@ -19,3 +19,16 @@ and Longitudinal DR dataset: https://academictorrents.com/details/744717095e5937
 # Updates
 May 3: inference preliminary testing is a success.
 May 5: batch inference (with 5 images) preliminary testing is a success.
+
+# Module 2 FID comparison -- sentence to use in the manuscript/defense
+FID (feature=2048) is biased at small sample sizes, not just noisy (Binkowski et al. 2018),
+so `train_module2_poc.py`/`evaluate_trajectory.py` also report a bootstrap 95% range and
+Kernel Inception Distance (KID, unbiased at any N) alongside the point estimate -- see
+`image_quality_metrics.py`. Frame the comparison directionally, not competitively:
+
+> "Our FID is computed on a substantially smaller held-out set than DRForecastGAN's (n=X vs.
+> their 2,734-8,523), so it indicates general range rather than a strict head-to-head result;
+> KID is reported alongside as a sample-size-robust complement."
+
+Say it once, plainly, rather than either overclaiming comparability or quietly reporting
+`feature=64` and hoping it isn't questioned.

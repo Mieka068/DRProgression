@@ -37,6 +37,13 @@ def _step_sort_key(key):
 
 
 def plot_per_step_quality(trajectory_eval_json: str, out_path: str):
+    """
+    PSNR/SSIM on the left axis, FID on the right -- FID shown with its bootstrap 95% range as
+    error bars (see image_quality_metrics.py: FID is a biased small-N estimator, so a wide
+    range here is an honest finding, not noise to hide). Each FID point is annotated with the
+    KID mean +/- std, a sample-size-robust complement DRForecastGAN doesn't report but which
+    is worth showing alongside for a POC-scale eval set.
+    """
     with open(trajectory_eval_json) as f:
         results = json.load(f)
     quality = results["quality"]
@@ -45,6 +52,9 @@ def plot_per_step_quality(trajectory_eval_json: str, out_path: str):
     psnr = [quality[s]["mean_psnr"] for s in steps]
     ssim = [quality[s]["mean_ssim"] for s in steps]
     fid = [quality[s]["fid"] for s in steps]  # may contain None below min_n_for_fid
+    fid_ranges = [quality[s].get("fid_bootstrap_range") for s in steps]
+    kid_means = [quality[s].get("kid_mean") for s in steps]
+    kid_stds = [quality[s].get("kid_std") for s in steps]
     n_pairs = [quality[s]["n_pairs"] for s in steps]
 
     fig, ax1 = plt.subplots(figsize=(7, 4.5))
@@ -57,14 +67,26 @@ def plot_per_step_quality(trajectory_eval_json: str, out_path: str):
     ax2 = ax1.twinx()
     fid_steps = [s for s, v in zip(step_nums, fid) if v is not None]
     fid_vals = [v for v in fid if v is not None]
+    fid_yerr = None
     if fid_vals:
-        ax2.plot(fid_steps, fid_vals, marker="^", color="tab:red", label="FID")
+        ranges = [r for s, r, v in zip(step_nums, fid_ranges, fid) if v is not None]
+        if all(r is not None for r in ranges):
+            fid_yerr = [
+                [v - r[0] for v, r in zip(fid_vals, ranges)],
+                [r[1] - v for v, r in zip(fid_vals, ranges)],
+            ]
+        ax2.errorbar(fid_steps, fid_vals, yerr=fid_yerr, marker="^", color="tab:red",
+                     label="FID (95% bootstrap range)" if fid_yerr else "FID", capsize=3)
+        for s, v, km, ks in zip(step_nums, fid, kid_means, kid_stds):
+            if v is not None and km is not None:
+                ax2.annotate(f"KID={km:.4f}±{ks:.4f}", (s, v), textcoords="offset points",
+                             xytext=(6, 6), fontsize=6.5, color="dimgray")
     ax2.set_ylabel("FID (lower is better)", color="tab:red")
     ax2.tick_params(axis="y", labelcolor="tab:red")
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=8)
     ax1.set_title("Module 2: quality vs. cascade step\n(n_pairs per step: "
                   + ", ".join(f"{n}={c}" for n, c in zip(step_nums, n_pairs)) + ")", fontsize=9)
     fig.tight_layout()

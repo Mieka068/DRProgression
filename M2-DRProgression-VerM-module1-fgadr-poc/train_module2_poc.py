@@ -101,8 +101,13 @@ class Config:
     sample_dir = "./training_samples_poc/"
     log_step = 1
     save_step = 1
-    eval_batches = 5  # how many held-out batches to use for FID/PSNR/SSIM at the end
-    min_n_for_fid = 50  # below this, FID (feature=2048) is unreliable -- report None instead
+    # How many batches of the (in-sample, not held-out -- see compute_poc_metrics' docstring)
+    # loader to use for FID/PSNR/SSIM/KID at the end. 5 was an unexamined POC default, not a
+    # real ceiling -- raise it via --eval-batches if the dataset has more to spare (see
+    # IMPLEMENTATION_PLAN_3.md Task L).
+    eval_batches = 5
+    min_n_for_fid = 50  # below this, FID (feature=2048)/KID are unreliable -- report None instead
+    fid_n_bootstrap = 10  # number of with-replacement resamples for the FID stability range
 
 
 def gradient_penalty(D, real, fake, device):
@@ -125,7 +130,7 @@ def denorm(x):
     return ((x + 1) / 2).clamp_(0, 1)
 
 
-def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50):
+def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50, n_bootstrap=10):
     """
     FID/PSNR/SSIM between synthesized follow-ups and real follow-ups, over a handful of
     batches -- a small/short-run number, explicitly not a claim of matching DRForecastGAN's
@@ -133,25 +138,28 @@ def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=
     torch-fidelity (pip install torchmetrics torch-fidelity on Colab -- FID specifically
     needs the latter, PSNR/SSIM don't).
 
-    FID uses feature=2048 (standard Inception pool features), which needs more real samples
-    to be numerically stable than the feature=64 variant does -- below min_n_for_fid samples,
-    'fid' is reported as None (with 'fid_note' explaining why) rather than as an unstable
-    number, the same pattern evaluate_trajectory.py uses for its per-cascade-step FID.
+    Note on what "held-out" means here: `loader` is the SAME shuffled loader used for
+    training, not a separate validation split (get_combined_loader/combined_dataset.py don't
+    do a train/val split) -- this evaluates on a random slice of in-sample data, not a true
+    held-out set. Framed honestly rather than silently as "held-out" (see
+    IMPLEMENTATION_PLAN_3.md Task L).
+
+    FID/KID: see image_quality_metrics.py's own docstring for why feature=2048 is used
+    (matching DRForecastGAN's assumed convention) despite being a biased small-N estimator,
+    and why a bootstrap range + KID are reported alongside the point estimate rather than
+    silently falling back to a more-stable-but-non-comparable feature=64.
     """
     from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-    from torchmetrics.image.fid import FrechetInceptionDistance
+
+    from image_quality_metrics import compute_fid_kid_stats
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    # FID's InceptionV3 backbone expects >=75x75 images; our POC image_size (128) is fine.
-    # feature=2048 (the standard Inception pool features, Heusel et al. 2017) matches the
-    # convention DRForecastGAN's own reported FID is assumed to use -- feature=64 is a
-    # low-sample-friendly variant unlikely to be what a published FID number reflects.
-    fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
 
     G.eval()
     n_seen = 0
     n_samples = 0
+    real_imgs, fake_imgs = [], []
     with torch.no_grad():
         for batch in loader:
             if n_seen >= n_batches:
@@ -169,27 +177,29 @@ def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=
 
             psnr_metric.update(fake_01, real_01)
             ssim_metric.update(fake_01, real_01)
-            fid_metric.update(real_01, real=True)
-            fid_metric.update(fake_01, real=False)
+            # Split the batch into per-image [1,3,H,W] CPU tensors for compute_fid_kid_stats's
+            # bootstrap resampling, which needs to index individual images.
+            real_imgs.extend(img.unsqueeze(0).cpu() for img in real_01)
+            fake_imgs.extend(img.unsqueeze(0).cpu() for img in fake_01)
             n_seen += 1
             n_samples += baseline.size(0)
     G.train()
 
+    fid_kid = compute_fid_kid_stats(
+        real_imgs, fake_imgs, device, min_n_for_fid=min_n_for_fid, n_bootstrap=n_bootstrap
+    )
     result = {
         "psnr": float(psnr_metric.compute()),
         "ssim": float(ssim_metric.compute()),
         "n_batches_used": n_seen,
         "n_samples_used": n_samples,
+        "fid": fid_kid["fid"],
+        "fid_bootstrap_range": fid_kid["fid_bootstrap_range"],
+        "kid_mean": fid_kid["kid_mean"],
+        "kid_std": fid_kid["kid_std"],
     }
-    if n_samples >= min_n_for_fid:
-        result["fid"] = float(fid_metric.compute())
-    else:
-        result["fid"] = None
-        result["fid_note"] = (
-            f"n_samples ({n_samples}) < min_n_for_fid ({min_n_for_fid}) -- FID (feature=2048) "
-            "is unreliable on this few samples, so it's omitted here rather than reported "
-            "misleadingly."
-        )
+    if fid_kid["note"]:
+        result["fid_note"] = fid_kid["note"]
     return result
 
 
@@ -304,13 +314,23 @@ def train(config: Config):
             G.train()
             torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
 
-    print("\n[4/4] Computing POC metrics (FID/PSNR/SSIM on a held-out slice)...")
+    print(f"\n[4/4] Computing POC metrics (FID/PSNR/SSIM on {config.eval_batches} batches of the "
+          "training loader -- see compute_poc_metrics' docstring on why this is not a true "
+          "held-out split)...")
     try:
         metrics = compute_poc_metrics(
-            G, loader, device, config.eval_batches, config.image_size, min_n_for_fid=config.min_n_for_fid
+            G, loader, device, config.eval_batches, config.image_size,
+            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
         )
-        fid_str = f"{metrics['fid']:.3f}" if metrics["fid"] is not None else f"None ({metrics.get('fid_note', '')})"
-        print(f"✓ PSNR: {metrics['psnr']:.3f} | SSIM: {metrics['ssim']:.3f} | FID: {fid_str} "
+        if metrics["fid"] is not None:
+            fid_range = metrics["fid_bootstrap_range"]
+            fid_range_str = f" (bootstrap 95% range: [{fid_range[0]:.3f}, {fid_range[1]:.3f}])" if fid_range else ""
+            fid_str = f"{metrics['fid']:.3f}{fid_range_str}"
+        else:
+            fid_str = f"None ({metrics.get('fid_note', '')})"
+        kid_str = (f"{metrics['kid_mean']:.5f} +/- {metrics['kid_std']:.5f}"
+                   if metrics["kid_mean"] is not None else "None")
+        print(f"✓ PSNR: {metrics['psnr']:.3f} | SSIM: {metrics['ssim']:.3f} | FID: {fid_str} | KID: {kid_str} "
               f"(n_batches={metrics['n_batches_used']}, n_samples={metrics['n_samples_used']})")
     except ImportError:
         print("⚠ torchmetrics/torch-fidelity not installed -- skipping FID/PSNR/SSIM "
@@ -371,8 +391,15 @@ if __name__ == "__main__":
                               "from scratch and will silently overwrite an earlier run's "
                               "checkpoints left at the same path.")
     parser.add_argument("--min-n-for-fid", type=int, default=Config.min_n_for_fid,
-                         help="Minimum eval samples before FID (feature=2048) is reported "
+                         help="Minimum eval samples before FID (feature=2048)/KID are reported "
                               "instead of None.")
+    parser.add_argument("--eval-batches", type=int, default=Config.eval_batches,
+                         help="Batches of the loader to use for end-of-run FID/PSNR/SSIM/KID "
+                              "(not a held-out split -- see compute_poc_metrics' docstring). "
+                              "5 is an unexamined POC default, not a real ceiling -- raise it "
+                              "if more data is available.")
+    parser.add_argument("--fid-n-bootstrap", type=int, default=Config.fid_n_bootstrap,
+                         help="With-replacement resamples for the FID stability range.")
     args = parser.parse_args()
 
     cfg = Config()
@@ -390,5 +417,7 @@ if __name__ == "__main__":
     cfg.num_workers = args.num_workers
     cfg.save_dir = args.save_dir
     cfg.min_n_for_fid = args.min_n_for_fid
+    cfg.eval_batches = args.eval_batches
+    cfg.fid_n_bootstrap = args.fid_n_bootstrap
 
     train(cfg)

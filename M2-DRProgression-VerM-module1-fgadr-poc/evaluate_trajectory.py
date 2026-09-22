@@ -65,6 +65,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tianjin_dataset import _module1_image_id_candidates  # noqa: E402
 from fire_dataset import FIREDataset  # noqa: E402
 from longdr_dataset import LongDRScreeningDataset  # noqa: E402
+from image_quality_metrics import compute_fid_kid_stats  # noqa: E402
 
 SELF_CONSISTENCY_DATASETS = {"fire": FIREDataset, "longdr": LongDRScreeningDataset}
 SELF_CONSISTENCY_TAG = "self-consistency -- not validated against ground truth"
@@ -182,24 +183,20 @@ def evaluate_self_consistency(source_name, dataset_dir, G, classifier, seg_model
             "mean_ssim": float(np.mean(per_step_ssim[step_count])),
             "note": SELF_CONSISTENCY_TAG,
         }
-        if n >= config.min_n_for_fid:
-            try:
-                from torchmetrics.image.fid import FrechetInceptionDistance
-
-                fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-                for img in per_step_images[step_count]["real"]:
-                    fid_metric.update(img.to(device), real=True)
-                for img in per_step_images[step_count]["fake"]:
-                    fid_metric.update(img.to(device), real=False)
-                entry["fid"] = float(fid_metric.compute())
-            except ImportError:
-                entry["fid"] = None
-        else:
-            entry["fid"] = None
-            entry["fid_note"] = f"n_pairs ({n}) < min_n_for_fid ({config.min_n_for_fid})"
+        fid_kid = compute_fid_kid_stats(
+            per_step_images[step_count]["real"], per_step_images[step_count]["fake"], device,
+            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
+        )
+        entry["fid"] = fid_kid["fid"]
+        entry["fid_bootstrap_range"] = fid_kid["fid_bootstrap_range"]
+        entry["kid_mean"] = fid_kid["kid_mean"]
+        entry["kid_std"] = fid_kid["kid_std"]
+        if fid_kid["note"]:
+            entry["fid_note"] = fid_kid["note"]
         results[f"step_{step_count}"] = entry
         print(f"    [{source_name}] step_count={step_count}: n={n}, PSNR={entry['mean_psnr']:.3f}, "
-              f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']} ({SELF_CONSISTENCY_TAG})")
+              f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']}, KID={entry['kid_mean']} "
+              f"({SELF_CONSISTENCY_TAG})")
     return results
 
 
@@ -298,32 +295,26 @@ def evaluate(config):
             "mean_psnr": float(np.mean(per_step_psnr[step_count])),
             "mean_ssim": float(np.mean(per_step_ssim[step_count])),
         }
-        if n >= config.min_n_for_fid:
-            try:
-                from torchmetrics.image.fid import FrechetInceptionDistance
-
-                # feature=2048 (standard Inception pool features), matching train_module2_poc.py's
-                # convention -- see that file for why feature=64 is the wrong default to compare
-                # against DRForecastGAN's published FID.
-                fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-                for img in per_step_images[step_count]["real"]:
-                    fid_metric.update(img.to(device), real=True)
-                for img in per_step_images[step_count]["fake"]:
-                    fid_metric.update(img.to(device), real=False)
-                entry["fid"] = float(fid_metric.compute())
-            except ImportError:
-                entry["fid"] = None
-        else:
-            entry["fid"] = None
-            entry["fid_note"] = (
-                f"n_pairs ({n}) < min_n_for_fid ({config.min_n_for_fid}) -- FID is a "
-                "distributional metric and unreliable on very few samples, so it's omitted "
-                "here rather than reported misleadingly."
-            )
+        # feature=2048 (standard Inception pool features), matching train_module2_poc.py's
+        # convention -- see image_quality_metrics.py for why feature=64 is the wrong default
+        # to compare against DRForecastGAN's published FID, and why a bootstrap range + KID
+        # are reported alongside the point estimate at this sample size.
+        fid_kid = compute_fid_kid_stats(
+            per_step_images[step_count]["real"], per_step_images[step_count]["fake"], device,
+            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
+        )
+        entry["fid"] = fid_kid["fid"]
+        entry["fid_bootstrap_range"] = fid_kid["fid_bootstrap_range"]
+        entry["kid_mean"] = fid_kid["kid_mean"]
+        entry["kid_std"] = fid_kid["kid_std"]
+        if fid_kid["note"]:
+            entry["fid_note"] = fid_kid["note"]
         results["quality"][f"step_{step_count}"] = entry
+        fid_range = entry["fid_bootstrap_range"]
+        fid_range_str = f" (95% range [{fid_range[0]:.3f}, {fid_range[1]:.3f}])" if fid_range else ""
         print(
             f"  step_count={step_count}: n={n}, PSNR={entry['mean_psnr']:.3f}, "
-            f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']}"
+            f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']}{fid_range_str}, KID={entry['kid_mean']}"
         )
 
     from sklearn.metrics import roc_auc_score
@@ -393,6 +384,8 @@ if __name__ == "__main__":
         "--style-dim", type=int, default=None, help="Defaults to c_dim, matching Generator's own default"
     )
     parser.add_argument("--min-n-for-fid", type=int, default=5)
+    parser.add_argument("--fid-n-bootstrap", type=int, default=10,
+                         help="With-replacement resamples for each step's FID stability range.")
     parser.add_argument(
         "--self-consistency-dirs",
         action="append",
