@@ -7,12 +7,16 @@ FIRE_dataset/
 FIRE/
 LongDRScreening_20150209/
 retinal-dr-longitudinal/
+eyepacs/
+aptos/
 
 # Derived artifacts that live on Drive only (module1 pkls/caches, checkpoints, samples)
 *.pth.tar
 *.ckpt
 module1_outputs_*.pt
 training_samples_poc/
+training_samples_nonlong/
+stage_biomarker_profiles.png
 outputs_poc/
 module3_runs_poc/
 laterality_resolved.csv

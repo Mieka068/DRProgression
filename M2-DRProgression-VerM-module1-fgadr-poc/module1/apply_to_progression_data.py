@@ -105,6 +105,21 @@ def predict_lesion_mask(model, image_path, image_size=512, device="cpu"):
     return (np.array(mask_img) > 0).astype(np.uint8)
 
 
+def lesion_stats(lesion_mask: np.ndarray, fov_mask: np.ndarray) -> dict:
+    """
+    Per-lesion biomarkers for one binary lesion mask: area fraction of the retinal FOV (the
+    same per-lesion LBS) and the number of connected components (lesion count). These are what
+    stage_biomarker_profiles.py aggregates per DR stage on cross-sectional data (EyePACS etc.).
+    """
+    import cv2
+
+    n_components, _ = cv2.connectedComponents(lesion_mask.astype(np.uint8), connectivity=8)
+    return {
+        "area_frac": compute_lbs(lesion_mask, fov_mask),
+        "count": int(n_components - 1),  # label 0 is background
+    }
+
+
 def process_image(image_path, classifier, seg_models: dict, device="cpu"):
     grade, grade_probs = predict_grade(classifier, image_path, device=device, return_probs=True)
     rgb = np.array(Image.open(image_path).convert("RGB"))
@@ -112,12 +127,14 @@ def process_image(image_path, classifier, seg_models: dict, device="cpu"):
 
     combined_mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
     trained_lesions = []
+    per_lesion = {}
     for lesion_name, model in seg_models.items():
         if model is None:
             continue
         m = predict_lesion_mask(model, image_path, device=device)
         combined_mask = np.logical_or(combined_mask, m).astype(np.uint8)
         trained_lesions.append(lesion_name)
+        per_lesion[lesion_name] = lesion_stats(m, fov_mask)
 
     lbs = compute_lbs(combined_mask, fov_mask)
     return {
@@ -126,12 +143,22 @@ def process_image(image_path, classifier, seg_models: dict, device="cpu"):
         "mask": combined_mask,
         "lbs": lbs,
         "trained_lesions": trained_lesions,
+        "lesion_stats": per_lesion,  # {lesion: {area_frac, count}} -- only for trained lesions
     }
+
+
+def downsample_mask(mask: np.ndarray, size: int) -> np.ndarray:
+    """Nearest-neighbour resize of a 0/1 mask to size x size (all Module 2 loaders resize to
+    image_size anyway, so storing a full-resolution mask is only needed for LBS, which is
+    already computed by then)."""
+    resized = Image.fromarray((mask * 255).astype(np.uint8)).resize((size, size), Image.NEAREST)
+    return (np.array(resized) > 0).astype(np.uint8)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--images-dir", required=True, help="FIRE/LongDR Images folder to run inference over")
+    parser.add_argument("--images-dir", required=True,
+                        help="FIRE/LongDR/Tianjin/EyePACS images folder to run inference over")
     parser.add_argument("--classifier-checkpoint", help="Required unless --dry-run")
     parser.add_argument(
         "--seg-checkpoint",
@@ -144,6 +171,15 @@ def main():
     parser.add_argument("--out", required=True, help="Output cache path, e.g. module1_outputs_fire.pt")
     parser.add_argument("--limit", type=int, default=None, help="Only process first N images (debug)")
     parser.add_argument("--dry-run", action="store_true", help="Random-init weights, no checkpoints needed")
+    parser.add_argument(
+        "--mask-size",
+        type=int,
+        default=None,
+        help="Store each mask downsampled to N x N instead of full resolution. Recommended "
+             "(e.g. 256) for large cross-sectional sets like EyePACS (~35k images), where "
+             "full-res masks would make the cache tens of GB. LBS/lesion_stats are always "
+             "computed at full resolution first.",
+    )
     args = parser.parse_args()
 
     if not args.dry_run and not args.classifier_checkpoint:
@@ -168,7 +204,7 @@ def main():
     image_files = []
     for root, _dirs, files in os.walk(args.images_dir):
         for f in sorted(files):
-            if f.lower().endswith((".jpg", ".png")):
+            if f.lower().endswith((".jpg", ".jpeg", ".png")):
                 image_files.append(os.path.relpath(os.path.join(root, f), args.images_dir))
     image_files.sort()
     if args.limit:
@@ -180,11 +216,15 @@ def main():
         image_id = os.path.splitext(relpath)[0].replace(os.sep, "__")
         try:
             result = process_image(image_path, classifier, seg_models, device=device)
+            mask = result["mask"]
+            if args.mask_size:
+                mask = downsample_mask(mask, args.mask_size)
             cache[image_id] = {
                 "grade": result["grade"],
-                "mask": result["mask"],
+                "mask": mask,
                 "lbs": result["lbs"],
                 "trained_lesions": result["trained_lesions"],
+                "lesion_stats": result["lesion_stats"],
             }
             print(
                 f"✓ {image_id}: grade={result['grade']} lbs={result['lbs']:.5f} "

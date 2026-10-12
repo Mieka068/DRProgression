@@ -29,6 +29,11 @@ change:
   6. registration_cache_path, if given, substitutes a pre-registered (baseline-aligned)
      follow-up image wherever module1/train_registration.py produced one, in place of the raw
      follow-up image. None (the default) uses raw follow-up images everywhere.
+  7. init_generator_path / init_discriminator_path, if given, start G/D from a checkpoint
+     instead of random init -- e.g. train_module2_nonlong_pretrain.py's final-G/final-D.ckpt,
+     which were pretrained on a large cross-sectional graded set (EyePACS) to learn stage
+     appearance + per-stage biomarkers. This script is then the longitudinal fine-tuning stage.
+     Architecture args (image_size, conv dims, repeat nums, style_dim) must match the pretrain.
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -75,6 +80,8 @@ class Config:
     tianjin_module1_cache_path = None
     tianjin_min_pair_quality = None
     registration_cache_path = None  # optional -- see module1/train_registration.py
+    init_generator_path = None  # optional -- see docstring point 7
+    init_discriminator_path = None
 
     # Model
     g_conv_dim = 64
@@ -241,6 +248,13 @@ def train(config: Config):
         image_size=config.image_size, conv_dim=config.d_conv_dim, c_dim=config.c_dim, repeat_num=config.d_repeat_num
     ).to(device)
 
+    if config.init_generator_path:
+        G.load_state_dict(torch.load(config.init_generator_path, map_location=device))
+        print(f"✓ Initialized Generator from {config.init_generator_path}")
+    if config.init_discriminator_path:
+        D.load_state_dict(torch.load(config.init_discriminator_path, map_location=device))
+        print(f"✓ Initialized Discriminator from {config.init_discriminator_path}")
+
     g_optimizer = optim.Adam(G.parameters(), lr=config.g_lr, betas=(config.beta1, config.beta2))
     d_optimizer = optim.Adam(D.parameters(), lr=config.d_lr, betas=(config.beta1, config.beta2))
     l1_loss = nn.L1Loss()
@@ -353,6 +367,8 @@ def train(config: Config):
         "tianjin_dir": config.tianjin_dir,
         "tianjin_module1_cache_path": config.tianjin_module1_cache_path,
         "registration_cache_path": config.registration_cache_path,
+        "init_generator_path": config.init_generator_path,
+        "init_discriminator_path": config.init_discriminator_path,
         "metrics": metrics,
         "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
@@ -377,6 +393,11 @@ if __name__ == "__main__":
     parser.add_argument("--registration-cache", default=None,
                          help="Optional path to a module1/train_registration.py cache; omit to "
                               "use raw follow-up images")
+    parser.add_argument("--init-generator", default=None,
+                         help="Optional G checkpoint to start from, e.g. "
+                              "train_module2_nonlong_pretrain.py's final-G.ckpt")
+    parser.add_argument("--init-discriminator", default=None,
+                         help="Optional D checkpoint to start from (final-D.ckpt from the pretrain)")
     parser.add_argument("--style-dim", type=int, default=None,
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
@@ -411,6 +432,8 @@ if __name__ == "__main__":
     cfg.tianjin_module1_cache_path = args.tianjin_module1_cache
     cfg.tianjin_min_pair_quality = args.tianjin_min_pair_quality
     cfg.registration_cache_path = args.registration_cache
+    cfg.init_generator_path = args.init_generator
+    cfg.init_discriminator_path = args.init_discriminator
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
