@@ -46,6 +46,7 @@ BIOMARKER_NAMES = [f"{l}_{k}" for l in LESIONS for k in ("area", "count")] + ["l
 N_BIOMARKERS = len(BIOMARKER_NAMES)
 AREA_EPS = 1e-5
 SHARED_D_THRESHOLD = 0.2  # |Cohen's d| below this = "small" effect (Cohen 1988)
+MIN_POOLED_SD = 0.05
 
 
 def biomarker_vector(entry):
@@ -72,7 +73,9 @@ def _cohens_d(a, b):
     if len(a) < 2 or len(b) < 2:
         return float("nan")
     pooled = np.sqrt(((len(a) - 1) * a.var(ddof=1) + (len(b) - 1) * b.var(ddof=1)) / (len(a) + len(b) - 2))
-    return float((b.mean() - a.mean()) / pooled) if pooled > 0 else 0.0
+    # Floor the pooled SD (in transformed units) so a near-constant feature, e.g. zero lesions
+    # at every stage-0 eye, gives a large-but-finite d instead of 1e6 or a false "shared" 0.
+    return float((b.mean() - a.mean()) / max(pooled, MIN_POOLED_SD))
 
 
 def build_profiles(cache, labels, num_stages=5):
@@ -171,7 +174,7 @@ def build_profiles(cache, labels, num_stages=5):
             "stages": stages, "transitions": transitions}
 
 
-def profile_tensors(profiles, num_stages=5, min_std=0.05):
+def profile_tensors(profiles, num_stages=5, min_std=0.25):
     """
     (mu, sigma) float32 arrays of shape [num_stages, N_BIOMARKERS] for the training loss.
     Stages/features with no data get NaN, which the loss masks out. sigma is floored at

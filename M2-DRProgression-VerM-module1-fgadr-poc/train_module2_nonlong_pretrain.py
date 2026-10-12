@@ -154,11 +154,14 @@ def masked_mse(pred, target, mask):
 
 
 def biomarker_profile_loss(pred, trg, mu, sd, margin):
-    """Hinge on how many stage-SDs pred sits from the target stage's population mean."""
+    """Hinge on how many stage-SDs pred sits from the target stage's population mean.
+    Huber-shaped (quadratic just past the margin, linear further out) so a few far-off
+    predictions early in training can't swamp the adversarial/cycle terms."""
     m, s = mu[trg], sd[trg]
     valid = torch.isfinite(m)
     z = (pred - torch.nan_to_num(m)) / torch.nan_to_num(s, nan=1.0)
-    pen = F.relu(z.abs() - margin) ** 2
+    excess = F.relu(z.abs() - margin)
+    pen = F.smooth_l1_loss(excess, torch.zeros_like(excess), reduction="none")
     return (pen * valid).sum() / valid.sum().clamp(min=1)
 
 
