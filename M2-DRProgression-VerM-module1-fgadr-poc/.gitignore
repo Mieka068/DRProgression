@@ -23,6 +23,7 @@ laterality_resolved.csv
 registered_followups.pt
 trajectory_eval_results.json
 trajectory_figures/
+progression_outputs/
 
 __pycache__/
 *.pyc

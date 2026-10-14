@@ -96,3 +96,31 @@ Without `--module1-cache/--profiles`, step (c) still runs as plain stage transla
 losses off). `python train_module2_nonlong_pretrain.py --dry-run --save-dir /tmp/nl` smoke-tests the
 whole pipeline on synthetic data. Compare `models_poc_from_nonlong/` against a from-scratch
 `train_module2_poc.py` run with `evaluate_trajectory.py` to show whether pretraining helps.
+
+# Notebooks -- what each runs, in order (Colab, `notebooks/`)
+| # | Notebook | Runs | Needs |
+|---|---|---|---|
+| 01 | `01_module1_data_prep_colab` | FGADR + IDRiD grading pickles, sample LBS figure | dataset zips on Drive |
+| 02 | `02_module1_classification_train_colab` | DRG-Net ResNet50 grading classifier (FGADR 20 ep, IDRiD 60 ep) | 01 |
+| 03 | `03_module1_segmentation_train_colab` | DRG-Net U-Net lesion segmenters EX/MA/HE/SE (25 ep) + Dice/IoU/ROC figures | 01 |
+| 04_05 | `04_05_combined_module1_caches_colab` | Module 1 over FIRE + LongDR + Tianjin -> `module1_outputs_*.pt` (replaces 04 + 05's caching) | 02, 03 |
+| 04 / 05 | older split versions of 04_05 (04 also had a throwaway 5-epoch Module 2 run) | -- | -- |
+| 06 | `06_module2_poc_with_tianjin_colab` | Module 2 training on FIRE + LongDR + Tianjin (registration, 50 ep) + `evaluate_trajectory.py` + figures. `USE_NONLONG_PRETRAIN = True` fine-tunes from 09 | 04_05 (and 09 if pretraining) |
+| 07 | `07_module3_poc_colab` | Module 3 (EfficientNet-B4 + Weibull) time-to-progression on Tianjin | 04_05 |
+| 08 | `08_visualize_trajectory_colab` | Cascade figures for Tianjin patients + Module 3 captions; `END_STAGE = 4` goes to PDR | 06, 07 (same runtime) |
+| 09 | `09_eyepacs_module1_and_module2_pretrain_colab` | **new** -- EyePACS: Module 1 grading pickle (+ optional classifier training); Module 1 cache over an EyePACS subset; stage biomarker profiles; Module 2 non-longitudinal pretraining | 02, 03, EyePACS zip on Drive |
+| 10 | `10_generate_progression_to_pdr_colab` | **new** -- any fundus image(s) -> Module 1 grade -> cascade to stage 4 (PDR), saves per-stage images/figure/JSON | 02, 03, 06 (07 optional) |
+
+Order: **01 -> 02 + 03 -> 04_05 -> 09 -> 06 (once without, once with `USE_NONLONG_PRETRAIN`) -> 07 -> 08 -> 10**.
+09 can run any time after 02/03; 07 only needs 04_05.
+
+## Any-image inference to PDR (`generate_progression.py`)
+```bash
+python generate_progression.py --input ./my_fundus.jpg \   # or a folder
+    --generator-checkpoint .../final-G.ckpt --classifier-checkpoint .../final_weights.pt \
+    --seg-checkpoint EX=... --seg-checkpoint MA=... --seg-checkpoint HE=... --seg-checkpoint SE=... \
+    --end-stage 4 --out-dir ./progression_outputs/      # --start-stage N to force a known grade
+```
+Per image: `stage<k>_{input,synth}.png`, `trajectory.png`, `trajectory.json` (Module 1 grade,
+LBS and consistency per stage; Module 3 estimate if `--module3-checkpoint` is given).
+`--dry-run` checks the plumbing with random weights.

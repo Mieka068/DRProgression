@@ -21,6 +21,9 @@ Usage (after notebooks 06 AND 07 have both produced trained checkpoints):
         --module3-thresholds-json ./module3_runs_poc/poc_results.json \
         --num-patients 4 --out-dir ./trajectory_figures/
 
+--end-stage 4 cascades every selected patient up to PDR instead of stopping at their real
+follow-up grade (for any-image inference without a Tianjin pair, see generate_progression.py).
+
 Omitting --module3-checkpoint still works -- figures render with the Module 1/2 content only
 (image + stage label + Module 1 consistency check), no progression-probability caption.
 
@@ -247,14 +250,21 @@ def run(config):
         baseline_img = load_module2_image(baseline_path, config.image_size).to(device)
         mask = load_mask(cache, row["baseline_path"], config.image_size)
 
+        start_stage = int(row["baseline_icdr"])
+        # Default: stop at this patient's real follow-up grade. --end-stage 4 instead projects
+        # every patient forward to PDR (stages beyond the real follow-up have no ground truth).
+        end_stage = config.end_stage if config.end_stage is not None else int(row["followup_icdr"])
+        if end_stage <= start_stage:
+            print(f"  Skipping patient {row['patient_id']}: baseline stage {start_stage} >= end stage {end_stage}")
+            continue
         trajectory = synthesize_trajectory(
             G,
             classifier,
             seg_models,
             baseline_img,
             mask,
-            start_stage=int(row["baseline_icdr"]),
-            end_stage=int(row["followup_icdr"]),
+            start_stage=start_stage,
+            end_stage=end_stage,
             c_dim=config.c_dim,
             device=device,
         )
@@ -295,6 +305,9 @@ if __name__ == "__main__":
     parser.add_argument("--g-repeat-num", type=int, default=6)
     parser.add_argument("--style-dim", type=int, default=None, help="Defaults to c_dim, matching Generator's own default")
     parser.add_argument("--num-patients", type=int, default=4)
+    parser.add_argument("--end-stage", type=int, default=None,
+                        help="Cascade every patient up to this stage (e.g. 4 = PDR). Omit to stop at "
+                             "each patient's real follow-up grade (the original behaviour).")
     parser.add_argument("--out-dir", default="./trajectory_figures/")
     args = parser.parse_args()
 

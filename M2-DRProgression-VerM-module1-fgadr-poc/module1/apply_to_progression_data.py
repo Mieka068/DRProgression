@@ -180,6 +180,21 @@ def main():
              "full-res masks would make the cache tens of GB. LBS/lesion_stats are always "
              "computed at full resolution first.",
     )
+    parser.add_argument(
+        "--image-list",
+        default=None,
+        help="Optional text file of image file names/stems (one per line) to process instead of "
+             "everything under --images-dir -- e.g. a per-grade EyePACS subset (notebook 09).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="If --out already exists, load it and skip images already in it (for long runs "
+             "that get cut off by a Colab disconnect).",
+    )
+    parser.add_argument("--save-every", type=int, default=0,
+                        help="Write the partial cache to --out every N new images (0 = only at the end)")
+    parser.add_argument("--quiet", action="store_true", help="Only print progress every 100 images")
     args = parser.parse_args()
 
     if not args.dry_run and not args.classifier_checkpoint:
@@ -207,13 +222,25 @@ def main():
             if f.lower().endswith((".jpg", ".jpeg", ".png")):
                 image_files.append(os.path.relpath(os.path.join(root, f), args.images_dir))
     image_files.sort()
+    if args.image_list:
+        with open(args.image_list) as f:
+            wanted = {os.path.splitext(os.path.basename(line.strip()))[0] for line in f if line.strip()}
+        image_files = [r for r in image_files if os.path.splitext(os.path.basename(r))[0] in wanted]
+        print(f"--image-list: {len(image_files)} of {len(wanted)} listed images found under {args.images_dir}")
     if args.limit:
         image_files = image_files[: args.limit]
 
     cache = {}
-    for relpath in image_files:
+    if args.resume and os.path.isfile(args.out):
+        cache = torch.load(args.out, weights_only=False)
+        print(f"--resume: {len(cache)} images already cached in {args.out}, skipping them")
+
+    n_new = 0
+    for i, relpath in enumerate(image_files):
         image_path = os.path.join(args.images_dir, relpath)
         image_id = os.path.splitext(relpath)[0].replace(os.sep, "__")
+        if image_id in cache:
+            continue
         try:
             result = process_image(image_path, classifier, seg_models, device=device)
             mask = result["mask"]
@@ -226,10 +253,14 @@ def main():
                 "trained_lesions": result["trained_lesions"],
                 "lesion_stats": result["lesion_stats"],
             }
-            print(
-                f"✓ {image_id}: grade={result['grade']} lbs={result['lbs']:.5f} "
-                f"(lesions: {result['trained_lesions']})"
-            )
+            n_new += 1
+            if not args.quiet or n_new % 100 == 0:
+                print(
+                    f"✓ [{i + 1}/{len(image_files)}] {image_id}: grade={result['grade']} "
+                    f"lbs={result['lbs']:.5f} (lesions: {result['trained_lesions']})"
+                )
+            if args.save_every and n_new % args.save_every == 0:
+                torch.save(cache, args.out)
         except Exception as e:
             print(f"⚠ {image_id}: failed ({e})")
 
