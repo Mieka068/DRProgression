@@ -10,7 +10,10 @@ between adjacent stages (see stage_biomarker_profiles.py). The pretrained Genera
 fine-tuned on the real longitudinal pairs with train_module2_poc.py --init-generator.
 
 Supported label layouts (pick with --preset, or pass --labels-csv/--image-col/--label-col):
-    eyepacs:  Kaggle "Diabetic Retinopathy Detection"
+    eyepacs_resized: OUR copy -- kaggle.com/datasets/mohlamin/resized-eyepacs-diabetic-retinopathy-dataset
+              all_labels.csv (train+test merged), found anywhere under --dataset-dir; image and
+              grade columns auto-detected; images indexed recursively by file stem
+    eyepacs:  original Kaggle "Diabetic Retinopathy Detection"
               trainLabels.csv (image, level), images in train/<image>.jpeg
     aptos:    Kaggle "APTOS 2019 Blindness Detection"
               train.csv (id_code, diagnosis), images in train_images/<id_code>.png
@@ -20,9 +23,9 @@ All three use the ICDR 0-4 scale already, the same scale as target_grade elsewhe
 repo, so no grade remapping is applied. Rows with a label outside 0-4 are dropped.
 
 Module 1 cache key scheme: module1/apply_to_progression_data.py keys its cache by the image
-path relative to --images-dir with the extension stripped (and os.sep -> "__"). Point
---images-dir at the same folder this loader's `images_dir` points at, and EyePACS keys come out
-as "10_left", matching the CSV's image column directly.
+path relative to --images-dir with the extension stripped (and os.sep -> "__"), e.g.
+"train__10_left". This loader matches on the last "__" component (the file stem), so it doesn't
+matter which folder --images-dir pointed at, as long as image file names are unique.
 
 Each sample is a single image (no follow-up):
     image        [3,H,W] in [-1,1] (same normalisation as the longitudinal loaders)
@@ -54,42 +57,114 @@ from stage_biomarker_profiles import N_BIOMARKERS, biomarker_vector
 NUM_STAGES = 5
 
 PRESETS = {
+    # Our copy: https://www.kaggle.com/datasets/mohlamin/resized-eyepacs-diabetic-retinopathy-dataset
+    # -- resized EyePACS with train+test labels merged into one all_labels.csv. Columns and the
+    # image folder layout are auto-detected (see detect_column / index_images), so this works
+    # whether images sit in one folder or in train/ + test/ subfolders.
+    "eyepacs_resized": {"labels_csv": "all_labels.csv", "images_subdir": ""},
+    # Original Kaggle competition layout.
     "eyepacs": {"labels_csv": "trainLabels.csv", "images_subdir": "train",
-                "image_col": "image", "label_col": "level", "ext": ".jpeg"},
+                "image_col": "image", "label_col": "level"},
     "aptos": {"labels_csv": "train.csv", "images_subdir": "train_images",
-              "image_col": "id_code", "label_col": "diagnosis", "ext": ".png"},
+              "image_col": "id_code", "label_col": "diagnosis"},
 }
 
+IMAGE_COL_CANDIDATES = ["image", "id_code", "image_id", "img", "filename", "file_name", "file", "name", "path"]
+LABEL_COL_CANDIDATES = ["level", "diagnosis", "label", "grade", "dr_grade", "class", "severity", "target"]
+IMAGE_EXTS = (".jpeg", ".jpg", ".png", ".tif", ".tiff")
 
-def load_labels(labels_csv, image_col, label_col):
-    """Returns a (image_id, grade) frame with grades restricted to ICDR 0-4."""
+
+def image_stem(name):
+    """'train/10_left.jpeg' -> '10_left' (labels CSVs vary on path/extension)."""
+    base = os.path.basename(str(name).strip().replace("\\", "/"))
+    root, ext = os.path.splitext(base)
+    return root if ext.lower() in IMAGE_EXTS else base
+
+
+def detect_column(columns, candidates, label, explicit=None):
+    if explicit is not None:
+        if explicit not in columns:
+            raise KeyError(f"Column '{explicit}' not found. Actual columns: {list(columns)}")
+        return explicit
+    lower = {str(c).strip().lower(): c for c in columns}
+    for cand in candidates:
+        if cand in lower:
+            return lower[cand]
+    raise KeyError(f"Could not auto-detect the {label} column among {list(columns)} -- pass it "
+                   f"explicitly (--image-col / --label-col).")
+
+
+def find_file(root, name):
+    """root/name if it exists, else the first file called `name` anywhere under root."""
+    direct = os.path.join(root, name)
+    if os.path.isfile(direct):
+        return direct
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            if f.lower() == os.path.basename(name).lower():
+                return os.path.join(dirpath, f)
+    raise FileNotFoundError(f"Could not find {name} under {root}")
+
+
+def index_images(root, ext=None):
+    """{stem: path} for every image under root (recursive). Duplicate stems keep the first."""
+    exts = (ext.lower(),) if ext else IMAGE_EXTS
+    index, n_dupes = {}, 0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in sorted(files):
+            if f.lower().endswith(exts):
+                stem = os.path.splitext(f)[0]
+                if stem in index:
+                    n_dupes += 1
+                    continue
+                index[stem] = os.path.join(dirpath, f)
+    if n_dupes:
+        print(f"  ⚠ {n_dupes} duplicate image names under {root} -- kept the first of each")
+    return index
+
+
+def load_labels(labels_csv, image_col=None, label_col=None):
+    """Returns an (image_id, grade) frame with grades restricted to ICDR 0-4. image_id is the
+    bare file stem, e.g. '10_left'. Columns are auto-detected when not given."""
     df = pd.read_csv(labels_csv)
-    for col in (image_col, label_col):
-        if col not in df.columns:
-            raise KeyError(f"Column '{col}' not in {labels_csv}. Actual columns: {list(df.columns)}")
+    image_col = detect_column(df.columns, IMAGE_COL_CANDIDATES, "image-id", image_col)
+    label_col = detect_column(df.columns, LABEL_COL_CANDIDATES, "grade", label_col)
+    print(f"  Labels: {os.path.basename(labels_csv)} -- image <- '{image_col}', grade <- '{label_col}' "
+          f"({len(df)} rows; columns {list(df.columns)})")
     df = df[[image_col, label_col]].rename(columns={image_col: "image_id", label_col: "grade"})
-    df["image_id"] = df["image_id"].astype(str).str.strip()
+    df["image_id"] = df["image_id"].map(image_stem)
     df["grade"] = pd.to_numeric(df["grade"], errors="coerce")
     before = len(df)
     df = df[df["grade"].between(0, NUM_STAGES - 1)].copy()
     df["grade"] = df["grade"].astype(int)
     if len(df) < before:
-        print(f"  Dropped {before - len(df)} rows with a missing/out-of-range grade")
+        print(f"  Dropped {before - len(df)} rows with a missing/out-of-range grade "
+              "(e.g. unlabelled test rows)")
+    n_dup = int(df["image_id"].duplicated().sum())
+    if n_dup:
+        print(f"  Dropped {n_dup} duplicate image rows")
+        df = df.drop_duplicates("image_id")
     return df.reset_index(drop=True)
+
+
+def cache_stem_lookup(cache):
+    """Module 1 cache keys are relpath-with-'__' (e.g. 'train__10_left'); map stem -> key."""
+    return {k.split("__")[-1]: k for k in cache}
 
 
 class CrossSectionalDRDataset(Dataset):
     """Single graded fundus images (no pairs). See module docstring for the sample dict."""
 
-    def __init__(self, dataset_dir, preset="eyepacs", labels_csv=None, images_dir=None,
+    def __init__(self, dataset_dir, preset="eyepacs_resized", labels_csv=None, images_dir=None,
                  image_col=None, label_col=None, ext=None, image_size=128, augment=True,
                  module1_cache_path=None, max_per_grade=None, seed=0):
         """
         Args:
             dataset_dir: root folder of the dataset (relative labels_csv/images_dir resolve
                 against it).
-            preset: 'eyepacs', 'aptos', or 'generic' (then labels_csv/image_col/label_col/
-                images_dir/ext are required). Explicit args override preset values.
+            preset: 'eyepacs_resized', 'eyepacs', 'aptos', or 'generic' (then labels_csv is
+                required; columns are auto-detected unless given). Explicit args override
+                preset values. ext optionally restricts which image extension is indexed.
             module1_cache_path: optional module1/apply_to_progression_data.py cache over this
                 dataset's images (ideally built with --mask-size 256). Supplies the lesion mask
                 channel and the per-lesion biomarkers; images missing from it get a zero mask
@@ -101,20 +176,19 @@ class CrossSectionalDRDataset(Dataset):
         """
         cfg = dict(PRESETS.get(preset, {}))
         for key, val in (("labels_csv", labels_csv), ("images_subdir", images_dir),
-                         ("image_col", image_col), ("label_col", label_col), ("ext", ext)):
+                         ("image_col", image_col), ("label_col", label_col)):
             if val is not None:
                 cfg[key] = val
-        missing = [k for k in ("labels_csv", "images_subdir", "image_col", "label_col") if k not in cfg]
-        if missing:
-            raise ValueError(f"preset '{preset}' needs explicit {missing}")
+        if "labels_csv" not in cfg:
+            raise ValueError(f"preset '{preset}' needs an explicit labels_csv")
 
-        self.images_dir = os.path.join(dataset_dir, cfg["images_subdir"])
-        self.ext = cfg.get("ext", "")
+        self.images_dir = os.path.join(dataset_dir, cfg.get("images_subdir", ""))
         self.image_size = image_size
         self.augment = augment
 
-        df = load_labels(os.path.join(dataset_dir, cfg["labels_csv"]), cfg["image_col"], cfg["label_col"])
-        df["path"] = df["image_id"].map(self._resolve_path)
+        df = load_labels(find_file(dataset_dir, cfg["labels_csv"]), cfg.get("image_col"), cfg.get("label_col"))
+        index = index_images(self.images_dir, ext)
+        df["path"] = df["image_id"].map(index)
         n_missing = int(df["path"].isna().sum())
         if n_missing:
             print(f"  ⚠ {n_missing} labelled images not found under {self.images_dir} -- skipped")
@@ -125,9 +199,13 @@ class CrossSectionalDRDataset(Dataset):
         self.df = df.reset_index(drop=True)
 
         self.module1_cache = None
+        self.cache_keys = {}
         if module1_cache_path:
             self.module1_cache = torch.load(module1_cache_path, weights_only=False)
-            print(f"✓ Loaded Module 1 cache: {len(self.module1_cache)} images ({module1_cache_path})")
+            self.cache_keys = cache_stem_lookup(self.module1_cache)
+            n_hit = int(self.df["image_id"].isin(self.cache_keys).sum())
+            print(f"✓ Loaded Module 1 cache: {len(self.module1_cache)} images, "
+                  f"{n_hit}/{len(self.df)} labelled images covered ({module1_cache_path})")
 
         counts = self.df["grade"].value_counts().reindex(range(NUM_STAGES), fill_value=0)
         print(f"✓ Cross-sectional ({preset}): {len(self.df)} images, per grade {counts.tolist()}")
@@ -137,14 +215,6 @@ class CrossSectionalDRDataset(Dataset):
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         ])
-
-    def _resolve_path(self, image_id):
-        # Labels CSVs sometimes include the extension, sometimes not.
-        for name in (image_id + self.ext, image_id):
-            p = os.path.join(self.images_dir, name)
-            if os.path.isfile(p):
-                return p
-        return None
 
     @property
     def grades(self):
@@ -173,7 +243,8 @@ class CrossSectionalDRDataset(Dataset):
         except Exception:
             return self.__getitem__((idx + 1) % len(self.df))
 
-        entry = self.module1_cache.get(row["image_id"]) if self.module1_cache else None
+        key = self.cache_keys.get(row["image_id"])
+        entry = self.module1_cache[key] if key is not None else None
         if entry is not None:
             mask_img = Image.fromarray((entry["mask"] * 255).astype(np.uint8)).resize(
                 (self.image_size, self.image_size), Image.NEAREST)
@@ -204,7 +275,7 @@ class CrossSectionalDRDataset(Dataset):
         }
 
 
-def get_crosssectional_loaders(dataset_dir, preset="eyepacs", batch_size=16, image_size=128,
+def get_crosssectional_loaders(dataset_dir, preset="eyepacs_resized", batch_size=16, image_size=128,
                                module1_cache_path=None, val_fraction=0.1, max_per_grade=None,
                                balance_grades=True, samples_per_epoch=None, num_workers=0,
                                seed=0, **dataset_kwargs):
@@ -260,7 +331,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", required=True)
-    parser.add_argument("--preset", default="eyepacs", choices=["eyepacs", "aptos", "generic"])
+    parser.add_argument("--preset", default="eyepacs_resized", choices=list(PRESETS) + ["generic"])
     parser.add_argument("--module1-cache", default=None)
     args = parser.parse_args()
 

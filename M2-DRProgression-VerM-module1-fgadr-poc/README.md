@@ -44,23 +44,37 @@ two stages:
 2. **Fine-tune on the longitudinal pairs** with the existing `train_module2_poc.py`, starting from
    the pretrained weights (`--init-generator` / `--init-discriminator`).
 
-Pipeline (EyePACS from https://www.kaggle.com/c/diabetic-retinopathy-detection -- `trainLabels.csv`
-+ `train/*.jpeg`; a pre-resized Kaggle mirror is much faster to load):
+Dataset: resized EyePACS, https://www.kaggle.com/datasets/mohlamin/resized-eyepacs-diabetic-retinopathy-dataset
+(`all_labels.csv` = original EyePACS train + test labels merged, ICDR 0-4). Used for **both**
+Module 1 (extra grading data) and Module 2 (cross-sectional pretraining). The loaders find
+`all_labels.csv` anywhere under the extracted folder, auto-detect its image/grade columns, and
+index images recursively by file name, so the zip's folder layout doesn't matter. Research use
+only under the original EyePACS/Kaggle terms -- don't redistribute the images.
+
+```bash
+# Module 1: EyePACS grading pickle (patient-level split -- both eyes of a patient stay together)
+python module1/dataprep/make_eyepacs_classification_pkl.py --eyepacs-root /content/data/eyepacs \
+    --out /content/drive/MyDrive/Thesis_Datasets/module1_pkl/eyepacs_classification_pkl.pkl
+#   (add --combine-with .../fgadr_classification_pkl.pkl to train on FGADR + EyePACS together)
+# then, in DRG-Net's dr_classification/:  python main.py -c configs/eyepacs_poc.yaml
+```
+
+Module 2 pipeline:
 
 ```bash
 # a) Module 1 over EyePACS -- now also stores per-lesion lesion_stats; --mask-size keeps the cache small
-python module1/apply_to_progression_data.py --images-dir /content/data/eyepacs/train \
+python module1/apply_to_progression_data.py --images-dir /content/data/eyepacs \
     --classifier-checkpoint .../final_weights.pt \
     --seg-checkpoint EX=... --seg-checkpoint HE=... --seg-checkpoint MA=... --seg-checkpoint SE=... \
     --mask-size 256 --out /content/drive/MyDrive/.../module1_outputs_eyepacs.pt
 
 # b) Which biomarkers characterise each stage / shift between adjacent stages
 python stage_biomarker_profiles.py --module1-cache .../module1_outputs_eyepacs.pt \
-    --labels-csv /content/data/eyepacs/trainLabels.csv \
+    --labels-csv /content/data/eyepacs/all_labels.csv \
     --out ./stage_biomarker_profiles.json --fig ./stage_biomarker_profiles.png
 
 # c) Stage-1 pretraining on EyePACS
-python train_module2_nonlong_pretrain.py --dataset-dir /content/data/eyepacs --preset eyepacs \
+python train_module2_nonlong_pretrain.py --dataset-dir /content/data/eyepacs --preset eyepacs_resized \
     --module1-cache .../module1_outputs_eyepacs.pt --profiles ./stage_biomarker_profiles.json \
     --save-dir ./DRForestGAN-v2/stargan/models_nonlong/
 

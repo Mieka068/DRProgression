@@ -33,7 +33,7 @@ not manual annotations.
 Usage:
     python stage_biomarker_profiles.py \
         --module1-cache /content/drive/MyDrive/.../module1_outputs_eyepacs.pt \
-        --labels-csv /content/data/eyepacs/trainLabels.csv --image-col image --label-col level \
+        --labels-csv /content/data/eyepacs/all_labels.csv \
         --out ./stage_biomarker_profiles.json --fig ./stage_biomarker_profiles.png
 """
 import argparse
@@ -232,23 +232,24 @@ def print_summary(profiles):
 def main():
     import torch
 
-    from crosssectional_dataset import load_labels
+    from crosssectional_dataset import cache_stem_lookup, load_labels
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--module1-cache", required=True,
                         help="module1/apply_to_progression_data.py cache over the cross-sectional images")
-    parser.add_argument("--labels-csv", required=True)
-    parser.add_argument("--image-col", default="image", help="EyePACS: image, APTOS: id_code")
-    parser.add_argument("--label-col", default="level", help="EyePACS: level, APTOS: diagnosis")
+    parser.add_argument("--labels-csv", required=True,
+                        help="e.g. all_labels.csv (our resized EyePACS), trainLabels.csv, APTOS train.csv")
+    parser.add_argument("--image-col", default=None, help="Auto-detected if omitted (image / id_code / ...)")
+    parser.add_argument("--label-col", default=None, help="Auto-detected if omitted (level / diagnosis / ...)")
     parser.add_argument("--out", default="./stage_biomarker_profiles.json")
     parser.add_argument("--fig", default=None, help="Optional PNG of per-stage biomarker boxplots")
     args = parser.parse_args()
 
-    cache = torch.load(args.module1_cache, weights_only=False)
+    raw_cache = torch.load(args.module1_cache, weights_only=False)
+    # Re-key by file stem so 'train__10_left'-style cache keys match the CSV's '10_left'.
+    cache = {stem: raw_cache[key] for stem, key in cache_stem_lookup(raw_cache).items()}
     df = load_labels(args.labels_csv, args.image_col, args.label_col)
-    # Cache keys have no extension; tolerate CSVs that include one.
-    labels = {str(i).rsplit(".", 1)[0] if str(i) not in cache else str(i): int(g)
-              for i, g in zip(df["image_id"], df["grade"])}
+    labels = dict(zip(df["image_id"], df["grade"].astype(int)))
     matched = sum(1 for i in labels if i in cache)
     print(f"✓ {matched}/{len(labels)} labelled images found in the Module 1 cache")
 

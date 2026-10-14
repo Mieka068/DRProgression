@@ -31,15 +31,15 @@ addition, not a requirement.
 
 Usage (Colab):
     # 0) Module 1 over EyePACS (per-lesion stats + downsampled masks):
-    python module1/apply_to_progression_data.py --images-dir /content/data/eyepacs/train \
+    python module1/apply_to_progression_data.py --images-dir /content/data/eyepacs \
         --classifier-checkpoint .../final_weights.pt \
         --seg-checkpoint EX=... --seg-checkpoint HE=... --seg-checkpoint MA=... --seg-checkpoint SE=... \
         --mask-size 256 --out /content/drive/MyDrive/.../module1_outputs_eyepacs.pt
     # 1) Stage biomarker profiles:
     python stage_biomarker_profiles.py --module1-cache .../module1_outputs_eyepacs.pt \
-        --labels-csv /content/data/eyepacs/trainLabels.csv --out ./stage_biomarker_profiles.json
+        --labels-csv /content/data/eyepacs/all_labels.csv --out ./stage_biomarker_profiles.json
     # 2) Pretrain:
-    python train_module2_nonlong_pretrain.py --dataset-dir /content/data/eyepacs --preset eyepacs \
+    python train_module2_nonlong_pretrain.py --dataset-dir /content/data/eyepacs --preset eyepacs_resized \
         --module1-cache .../module1_outputs_eyepacs.pt --profiles ./stage_biomarker_profiles.json \
         --save-dir ./DRForestGAN-v2/stargan/models_nonlong/
     # 3) Fine-tune on longitudinal pairs:
@@ -75,7 +75,7 @@ from train_module2_poc import denorm, gradient_penalty  # noqa: E402
 class Config:
     # Data
     dataset_dir = "./eyepacs"
-    preset = "eyepacs"
+    preset = "eyepacs_resized"
     module1_cache_path = None
     profiles_path = None
     image_size = 128
@@ -241,32 +241,35 @@ def save_stage_grid(G, batch, device, c_dim, path, n=4):
 
 
 def make_dry_run_data(root, n_per_grade=6, size=64):
-    """Writes a tiny fake EyePACS-layout dataset + Module 1 cache + profiles for plumbing tests."""
+    """Writes a tiny fake dataset in the resized-EyePACS layout (train/ + test/ subfolders, one
+    merged all_labels.csv, relpath-style Module 1 cache keys) + profiles, for plumbing tests."""
     from PIL import Image
 
     from stage_biomarker_profiles import build_profiles
 
     rng = np.random.RandomState(0)
-    os.makedirs(os.path.join(root, "train"), exist_ok=True)
     rows, cache, labels = [], {}, {}
     for g in range(NUM_STAGES):
         for i in range(n_per_grade):
+            split = "train" if i % 2 == 0 else "test"
+            os.makedirs(os.path.join(root, split), exist_ok=True)
             name = f"{g}{i}_left"
             arr = (rng.rand(size, size, 3) * 255).astype(np.uint8)
-            Image.fromarray(arr).save(os.path.join(root, "train", name + ".jpeg"))
-            rows.append(f"{name},{g}")
+            Image.fromarray(arr).save(os.path.join(root, split, name + ".jpeg"))
+            rows.append(f"{name}.jpeg,{g},{split}")
             labels[name] = g
             m = (rng.rand(32, 32) < 0.02 * (g + 1)).astype(np.uint8)
-            cache[name] = {
+            cache[f"{split}__{name}"] = {
                 "grade": g, "mask": m, "lbs": float(m.mean()), "trained_lesions": ["EX", "MA"],
                 "lesion_stats": {"EX": {"area_frac": 0.001 * g + rng.rand() * 1e-4, "count": g * 3},
                                  "MA": {"area_frac": 0.0005 * g + rng.rand() * 1e-4, "count": g * 5}},
             }
-    with open(os.path.join(root, "trainLabels.csv"), "w") as f:
-        f.write("image,level\n" + "\n".join(rows) + "\n")
+    with open(os.path.join(root, "all_labels.csv"), "w") as f:
+        f.write("image,level,split\n" + "\n".join(rows) + "\n")
     torch.save(cache, os.path.join(root, "module1_cache.pt"))
+    stem_cache = {k.split("__")[-1]: v for k, v in cache.items()}
     with open(os.path.join(root, "profiles.json"), "w") as f:
-        json.dump(build_profiles(cache, labels), f)
+        json.dump(build_profiles(stem_cache, labels), f)
     return root
 
 
@@ -415,12 +418,12 @@ def train(config):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dataset-dir", default=Config.dataset_dir)
-    p.add_argument("--preset", default=Config.preset, choices=["eyepacs", "aptos", "generic"])
+    p.add_argument("--preset", default=Config.preset, choices=["eyepacs_resized", "eyepacs", "aptos", "generic"])
     p.add_argument("--labels-csv", default=None, help="Override the preset's labels CSV (relative to --dataset-dir)")
     p.add_argument("--images-subdir", default=None, help="Override the preset's images folder")
     p.add_argument("--image-col", default=None)
     p.add_argument("--label-col", default=None)
-    p.add_argument("--ext", default=None, help="Image extension, e.g. .jpeg / .png")
+    p.add_argument("--ext", default=None, help="Only index images with this extension, e.g. .jpeg")
     p.add_argument("--module1-cache", default=None)
     p.add_argument("--profiles", default=None, help="stage_biomarker_profiles.py JSON")
     p.add_argument("--image-size", type=int, default=Config.image_size)
@@ -451,7 +454,7 @@ if __name__ == "__main__":
 
     if args.dry_run:
         root = make_dry_run_data(os.path.join(args.save_dir, "dry_run_data"))
-        cfg.dataset_dir, cfg.preset = root, "eyepacs"
+        cfg.dataset_dir, cfg.preset = root, "eyepacs_resized"
         cfg.module1_cache_path = os.path.join(root, "module1_cache.pt")
         cfg.profiles_path = os.path.join(root, "profiles.json")
         cfg.image_size, cfg.batch_size, cfg.num_epochs = 64, 4, 2
