@@ -116,10 +116,11 @@ Order: **01 -> 02 + 03 -> 04_05 -> 09 -> 06 (once without, once with `USE_NONLON
 
 ## Any-image inference to PDR (`generate_progression.py`)
 ```bash
-python generate_progression.py --input ./my_fundus.jpg \   # or a folder
+# --input can be one image or a folder; --start-stage N forces a known grade
+python generate_progression.py --input ./my_fundus.jpg \
     --generator-checkpoint .../final-G.ckpt --classifier-checkpoint .../final_weights.pt \
     --seg-checkpoint EX=... --seg-checkpoint MA=... --seg-checkpoint HE=... --seg-checkpoint SE=... \
-    --end-stage 4 --out-dir ./progression_outputs/      # --start-stage N to force a known grade
+    --end-stage 4 --out-dir ./progression_outputs/
 ```
 Per image: `stage<k>_{input,synth}.png`, `trajectory.png`, `trajectory.json` (Module 1 grade,
 LBS and consistency per stage; Module 3 estimate if `--module3-checkpoint` is given).
