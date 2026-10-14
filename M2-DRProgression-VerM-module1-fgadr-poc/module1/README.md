@@ -19,10 +19,16 @@ Burden Score, and the bridge into Module 2's `fire_dataset.py`/`longdr_dataset.p
 
 - `dataprep/make_fgadr_classification_pkl.py`, `dataprep/make_idrid_classification_pkl.py`
   — build the `{'train','val','test': [(image_path, grade)]}` pickle DRG-Net's
-  `dr_classification/main.py` expects. Adapted from DRG-Net's own
-  `external/{fgadr,idrid}_generate_pkl.py` (same train/val/test split logic — a literal
-  index slice for FGADR, train==val==test-source for IDRiD, exactly as published — only the
-  paths and a pandas-version compatibility fix (`.iloc` instead of positional `row[0]`) changed.
+  `dr_classification/main.py` expects. FGADR: `--split release` (default) reproduces DRG-Net's
+  **released** split (`dr_classification/fgadr_generate_pkl.py` / their shipped
+  `data/fgadr_data_dict.pkl`: 1500 train / 342 test, val == test) and verifies it file-by-file
+  against `data/drgnet_fgadr_classification_split.csv`; `--split external` is the 821/100/921
+  split of their `external/fgadr_generate_pkl.py` side experiment, which this repo used before.
+  IDRiD: official 413/103, val == test, as in DRG-Net's `external/idrid_generate_pkl.py`.
+- `dataprep/make_eyepacs_classification_pkl.py` — EyePACS pickle (Kaggle train / public-test
+  val / private-test test by default). DRG-Net did not release their EyePACS split.
+- `dataprep/prepare_idrid_segmentation.py` — lays IDRiD's "A. Segmentation" set out in DRG-Net's
+  IDRiD folder structure and generates the FOV masks it needs (not shipped with IDRiD).
 - `configs/fgadr_poc.yaml`, `configs/idrid_poc.yaml` — copies of DRG-Net's own
   `dr_classification/configs/{fgadr,idrid}.yaml`, only `base.data_index`/`save_path`/
   `log_path`/`device` changed. **Epoch counts (20 / 60) are untouched from the paper** —
@@ -34,9 +40,13 @@ Burden Score, and the bridge into Module 2's `fire_dataset.py`/`longdr_dataset.p
   (`get_images_fgadr_from_pd` in `dr_segmentation/utils.py`) reads this file directly from
   inside the FGADR directory it's pointed at, so the data-prep notebook copies it into the
   local FGADR folder. Verified all 401 rows resolve to real local files (image + all 4 masks).
+- `configs/eyepacs_poc.yaml` — copy of DRG-Net's `eyepacs_ce.yaml` (25 epochs, plain CE,
+  EyePACS mean/std); use `--classifier-norm eyepacs` when running it through the pipeline.
 - `configs/config_fgadr_seg_poc.py` — copy of DRG-Net's `dr_segmentation/config_fgadr.py`,
-  `IMAGE_DIR` pointed locally, **`EPOCHES` reduced from 1500 → 25** (explicit, documented
-  time-boxing — this is the honest answer to "why not 1500 epochs" for the presentation).
+  `IMAGE_DIR` pointed locally; epochs from `DRG_SEG_EPOCHS` (default **25**, POC time-boxing;
+  **1500** = published, used by notebook 11), resume from `DRG_SEG_RESUME`.
+- `configs/config_idrid_seg.py` — copy of DRG-Net's `dr_segmentation/config.py` (IDRiD
+  segmentation, `train.py`); `DRG_SEG_EPOCHS` default **2500** = published.
 - `compute_lbs.py` — **ours, not part of DRG-Net**: `LBS = lesion_pixels / retinal_area_pixels`
   per the manuscript's formula, using a green-channel-threshold retinal FOV mask.
 - `apply_to_progression_data.py` — loads a trained classification checkpoint + trained (or,
@@ -72,3 +82,23 @@ Burden Score, and the bridge into Module 2's `fire_dataset.py`/`longdr_dataset.p
 - Classification eval reports **only Accuracy and Quadratic Weighted Kappa**, matching what
   DRG-Net's paper reports (Section VI-B) — sensitivity/specificity/F1 are deliberately not
   computed, since there is no published number to compare them against.
+
+## Replicating DRG-Net's own runs (notebook 11)
+
+DRG-Net trains one model per dataset and task; `notebooks/11_module1_drgnet_replication_colab`
+re-runs each with their scripts and configs:
+
+| Task | Dataset | DRG-Net code | Split | Epochs |
+|---|---|---|---|---|
+| Grading | FGADR | `main.py` + `fgadr.yaml` | released 1500 / 342, val == test | 20 |
+| Grading | IDRiD | `main.py` + `idrid.yaml` | official 413 / 103, val == test | 60 |
+| Grading | EyePACS | `main.py` + `eyepacs_ce.yaml` | not released; Kaggle split used | 25 |
+| Segmentation EX/HE/MA/SE | FGADR (401 fully annotated) | `train_fgadr.py` + `config_fgadr.py` | 60/20/20 by row order | 1500 |
+| Segmentation EX/HE/MA/SE | IDRiD (54 / 27) | `train.py` + `config.py` | 80/20 of train; official test | 2500 |
+
+EyePACS has no lesion masks, so DRG-Net never trains segmentation on it.
+
+Expect small differences from the paper: modern library versions (with the compatibility patches
+in notebooks 02/03), Colab resumes restarting DRG-Net's LR schedule, and -- for segmentation --
+the paper's headline numbers (the table above) use **TATL** transfer learning, which is not in the
+released code; these runs reproduce the released `NO_TATL` training.

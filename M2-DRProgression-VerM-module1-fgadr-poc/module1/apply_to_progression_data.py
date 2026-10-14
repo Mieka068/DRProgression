@@ -41,11 +41,41 @@ from torchvision import models, transforms
 
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask
 
-# Defaults match module1/configs/fgadr_poc.yaml's data.mean/data.std. Override with --mean/--std
-# if the classifier checkpoint was instead trained on IDRiD (that config uses 'auto', i.e.
-# dataset-computed statistics not reproduced here -- ImageNet defaults are a reasonable stand-in).
+# Classifier input normalisation must match the config the checkpoint was trained with:
+# fgadr_poc.yaml (default) or eyepacs_poc.yaml (DRG-Net's eyepacs_ce.yaml stats). Select with
+# --classifier-norm; idrid_poc.yaml uses 'auto' (dataset-computed stats DRG-Net prints at
+# train time) -- pass those via --classifier-norm custom --mean ... --std ... if you use it.
 FGADR_MEAN = [0.4577976167201996, 0.2596849203109741, 0.13276457786560059]
 FGADR_STD = [0.28394654393196106, 0.18262696266174316, 0.13211798667907715]
+EYEPACS_MEAN = [0.425753653049469, 0.29737451672554016, 0.21293757855892181]
+EYEPACS_STD = [0.27670302987098694, 0.20240527391433716, 0.1686241775751114]
+CLASSIFIER_NORMS = {"fgadr": (FGADR_MEAN, FGADR_STD), "eyepacs": (EYEPACS_MEAN, EYEPACS_STD)}
+# Module-level so callers that go through process_image() (trajectory_inference.py,
+# generate_progression.py) pick up the same setting -- see set_classifier_norm().
+CLASSIFIER_MEAN, CLASSIFIER_STD = FGADR_MEAN, FGADR_STD
+
+
+def set_classifier_norm(name="fgadr", mean=None, std=None):
+    global CLASSIFIER_MEAN, CLASSIFIER_STD
+    if mean is not None and std is not None:
+        CLASSIFIER_MEAN, CLASSIFIER_STD = list(mean), list(std)
+    else:
+        CLASSIFIER_MEAN, CLASSIFIER_STD = CLASSIFIER_NORMS[name]
+    print(f"Classifier normalisation: {name} mean={CLASSIFIER_MEAN} std={CLASSIFIER_STD}")
+
+
+def add_classifier_norm_args(parser):
+    parser.add_argument("--classifier-norm", choices=list(CLASSIFIER_NORMS) + ["custom"], default="fgadr",
+                        help="Normalisation the classifier checkpoint was trained with "
+                             "(fgadr_poc.yaml = fgadr, eyepacs_poc.yaml = eyepacs)")
+    parser.add_argument("--mean", type=float, nargs=3, default=None, help="With --classifier-norm custom")
+    parser.add_argument("--std", type=float, nargs=3, default=None, help="With --classifier-norm custom")
+
+
+def apply_classifier_norm_args(args):
+    if args.classifier_norm == "custom" and (args.mean is None or args.std is None):
+        raise SystemExit("--classifier-norm custom needs --mean R G B and --std R G B")
+    set_classifier_norm(args.classifier_norm, args.mean, args.std)
 
 ALL_LESIONS = ["EX", "HE", "MA", "SE"]
 
@@ -72,8 +102,10 @@ def load_segmentation_model(checkpoint_path, device="cpu", dry_run=False):
     return model
 
 
-def predict_grade(model, image_path, image_size=512, mean=FGADR_MEAN, std=FGADR_STD, device="cpu",
+def predict_grade(model, image_path, image_size=512, mean=None, std=None, device="cpu",
                    return_probs=False):
+    mean = CLASSIFIER_MEAN if mean is None else mean
+    std = CLASSIFIER_STD if std is None else std
     tfm = transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
@@ -195,7 +227,9 @@ def main():
     parser.add_argument("--save-every", type=int, default=0,
                         help="Write the partial cache to --out every N new images (0 = only at the end)")
     parser.add_argument("--quiet", action="store_true", help="Only print progress every 100 images")
+    add_classifier_norm_args(parser)
     args = parser.parse_args()
+    apply_classifier_norm_args(args)
 
     if not args.dry_run and not args.classifier_checkpoint:
         parser.error("--classifier-checkpoint is required unless --dry-run is set")

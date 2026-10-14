@@ -109,10 +109,12 @@ whole pipeline on synthetic data. Compare `models_poc_from_nonlong/` against a f
 | 07 | `07_module3_poc_colab` | Module 3 (EfficientNet-B4 + Weibull) time-to-progression on Tianjin | 04_05 |
 | 08 | `08_visualize_trajectory_colab` | Cascade figures for Tianjin patients + Module 3 captions; `END_STAGE = 4` goes to PDR | 06, 07 (same runtime) |
 | 09 | `09_eyepacs_module1_and_module2_pretrain_colab` | **new** -- EyePACS: Module 1 grading pickle (+ optional classifier training); Module 1 cache over an EyePACS subset; stage biomarker profiles; Module 2 non-longitudinal pretraining | 02, 03, EyePACS zip on Drive |
+| 11 | `11_module1_drgnet_replication_colab` | **new** -- DRG-Net's own Module 1 runs, one model per dataset as in their repo: grading on FGADR (released split), IDRiD, EyePACS; lesion segmentation on FGADR (1500 ep) and IDRiD (2500 ep); test-set metrics summary | dataset zips on Drive (IDRiD "A. Segmentation" for IDRiD seg) |
 | 10 | `10_generate_progression_to_pdr_colab` | **new** -- any fundus image(s) -> Module 1 grade -> cascade to stage 4 (PDR), saves per-stage images/figure/JSON | 02, 03, 06 (07 optional) |
 
 Order: **01 -> 02 + 03 -> 04_05 -> 09 -> 06 (once without, once with `USE_NONLONG_PRETRAIN`) -> 07 -> 08 -> 10**.
-09 can run any time after 02/03; 07 only needs 04_05.
+09 can run any time after 02/03; 07 only needs 04_05. **11** (DRG-Net replication) is
+independent of the rest and can run any time; it writes to its own Drive folder.
 
 ## Any-image inference to PDR (`generate_progression.py`)
 ```bash

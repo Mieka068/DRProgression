@@ -44,7 +44,11 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "DRForestGAN-v2"))
 sys.path.insert(0, os.path.join(ROOT, "module1"))
 sys.path.insert(0, ROOT)
-from apply_to_progression_data import process_image  # noqa: E402
+from apply_to_progression_data import (  # noqa: E402
+    add_classifier_norm_args,
+    apply_classifier_norm_args,
+    process_image,
+)
 from base_model import Generator  # noqa: E402
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
@@ -198,7 +202,9 @@ if __name__ == "__main__":
     p.add_argument("--style-dim", type=int, default=None)
     p.add_argument("--out-dir", default="./progression_outputs/")
     p.add_argument("--dry-run", action="store_true", help="Random Module 1/2 weights, no checkpoints")
+    add_classifier_norm_args(p)
     args = p.parse_args()
+    apply_classifier_norm_args(args)
 
     if not args.dry_run and not (args.generator_checkpoint and args.classifier_checkpoint):
         p.error("--generator-checkpoint and --classifier-checkpoint are required unless --dry-run")
