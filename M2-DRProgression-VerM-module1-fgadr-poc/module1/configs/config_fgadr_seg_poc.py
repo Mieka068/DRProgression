@@ -9,10 +9,10 @@
 # EPOCHES / RESUME_MODEL come from environment variables so the same file serves both runs:
 #   POC (notebook 03, default):     DRG_SEG_EPOCHS unset -> 25
 #   DRG-Net replication (nb 11):    DRG_SEG_EPOCHS=1500, the paper's published setting
-#   Resume after a Colab cut-off:   DRG_SEG_RESUME=/path/to/model_2.pth.tar -- DRG-Net's own
-#     RESUME_MODEL mechanism (restores model + optimizer + epoch). It only saves on a new best
-#     eval AP (every 20 epochs), so epochs since that checkpoint are re-run, and its StepLR
-#     scheduler restarts from the initial LR -- a small deviation from one uninterrupted run.
+#   Resume after a Colab cut-off:   DRG_SEG_RESUME=/path/to/model_last.pth.tar. Needs
+#     module1/drgnet_resume_patch.py applied first: DRG-Net's train_fgadr.py hard-codes
+#     `resume = False` and only saves the best-AP model; the patch adds model_last.pth.tar
+#     every DRG_SEG_SAVE_EVERY epochs and makes resume continue the epoch count / LR schedule.
 import os
 
 LESION_IDS = {'EX': 0, 'HE': 1, 'MA': 2, 'SE': 3, 'SG': 4}

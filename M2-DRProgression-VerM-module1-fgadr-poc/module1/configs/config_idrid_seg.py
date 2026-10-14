@@ -10,7 +10,8 @@
 # IMAGE_DIR in the folder structure DRG-Net's utils.get_images() reads.
 #
 # EPOCHES: DRG-Net's published value is 2500 (DRG_SEG_EPOCHS unset). Set DRG_SEG_EPOCHS lower
-# for a time-boxed run; DRG_SEG_RESUME as in config_fgadr_seg_poc.py.
+# for a time-boxed run; DRG_SEG_RESUME as in config_fgadr_seg_poc.py (needs
+# module1/drgnet_resume_patch.py).
 import os
 
 LESION_IDS = {'EX': 0, 'HE': 1, 'MA': 2, 'SE': 3, 'SG': 4}

@@ -98,6 +98,12 @@ re-runs each with their scripts and configs:
 
 EyePACS has no lesion masks, so DRG-Net never trains segmentation on it.
 
+Notebook 11 defaults segmentation to **100 epochs** (`SEG_EPOCHS`) instead of 1500 / 2500, so
+report those runs as DRG-Net's protocol at a reduced epoch budget. `drgnet_resume_patch.py` adds
+checkpoint/resume to DRG-Net's training scripts (classification: full state every epoch;
+segmentation: `model_last.pth.tar` every 5 epochs), and notebook 11 writes checkpoints straight
+to Drive, so an interrupted run continues where it stopped when the notebook is re-run.
+
 Expect small differences from the paper: modern library versions (with the compatibility patches
 in notebooks 02/03), Colab resumes restarting DRG-Net's LR schedule, and -- for segmentation --
 the paper's headline numbers (the table above) use **TATL** transfer learning, which is not in the
