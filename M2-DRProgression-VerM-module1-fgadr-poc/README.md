@@ -105,16 +105,26 @@ whole pipeline on synthetic data. Compare `models_poc_from_nonlong/` against a f
 | 03 | `03_module1_segmentation_train_colab` | DRG-Net U-Net lesion segmenters EX/MA/HE/SE (25 ep) + Dice/IoU/ROC figures | 01 |
 | 04_05 | `04_05_combined_module1_caches_colab` | Module 1 over FIRE + LongDR + Tianjin -> `module1_outputs_*.pt` (replaces 04 + 05's caching) | 02, 03 |
 | 04 / 05 | older split versions of 04_05 (04 also had a throwaway 5-epoch Module 2 run) | -- | -- |
-| 06 | `06_module2_poc_with_tianjin_colab` | Module 2 training on FIRE + LongDR + Tianjin (registration, 50 ep) + `evaluate_trajectory.py` + figures. `USE_NONLONG_PRETRAIN = True` fine-tunes from 09 | 04_05 (and 09 if pretraining) |
+| 06 | `06_module2_poc_with_tianjin_colab` | Module 2 training on FIRE + LongDR + Tianjin (registration, 50 ep) + `evaluate_trajectory.py` + figures; fine-tunes from 09's EyePACS pretraining (`USE_NONLONG_PRETRAIN = True`, default) | 04_05, 09 |
 | 07 | `07_module3_poc_colab` | Module 3 (EfficientNet-B4 + Weibull) time-to-progression on Tianjin | 04_05 |
 | 08 | `08_visualize_trajectory_colab` | Cascade figures for Tianjin patients + Module 3 captions; `END_STAGE = 4` goes to PDR | 06, 07 (same runtime) |
 | 09 | `09_eyepacs_module1_and_module2_pretrain_colab` | **new** -- EyePACS: Module 1 grading pickle (+ optional classifier training); Module 1 cache over an EyePACS subset; stage biomarker profiles; Module 2 non-longitudinal pretraining | 02, 03, EyePACS zip on Drive |
 | 11 | `11_module1_drgnet_replication_colab` | **new** -- DRG-Net's own Module 1 runs, one model per dataset as in their repo: grading on FGADR (released split), IDRiD, EyePACS; lesion segmentation on FGADR and IDRiD (100 ep by default; DRG-Net used 1500 / 2500); resumes from Drive checkpoints after a disconnect; test-set metrics summary | dataset zips on Drive (IDRiD "A. Segmentation" for IDRiD seg) |
 | 10 | `10_generate_progression_to_pdr_colab` | **new** -- any fundus image(s) -> Module 1 grade -> cascade to stage 4 (PDR), saves per-stage images/figure/JSON | 02, 03, 06 (07 optional) |
 
-Order: **01 -> 02 + 03 -> 04_05 -> 09 -> 06 (once without, once with `USE_NONLONG_PRETRAIN`) -> 07 -> 08 -> 10**.
-09 can run any time after 02/03; 07 only needs 04_05. **11** (DRG-Net replication) is
-independent of the rest and can run any time; it writes to its own Drive folder.
+**`MODULE1_SOURCE`** (first code cell of 04_05 and 06-10, default `'drgnet'`) picks which Module 1
+models the pipeline uses: `'drgnet'` = notebook 11's DRG-Net replication checkpoints (outputs go to
+`_drgnet`-suffixed folders: `module1_cache_drgnet/`, `models_poc_tianjin_from_nonlong_drgnet/`, ...),
+`'poc'` = notebooks 02/03's (the original folders). Use the same value in every notebook.
+
+Order with the DRG-Net Module 1 (default):
+**11 -> 04_05 -> 09 -> 06 -> 07 -> 08 -> 10** (01-03 not needed; 11 builds its own data files).
+
+Order with the POC Module 1 (`MODULE1_SOURCE = 'poc'`):
+**01 -> 02 + 03 -> 04_05 -> 09 -> 06 -> 07 -> 08 -> 10**.
+
+Notebook 06 runs **once**, with `USE_NONLONG_PRETRAIN = True` (default; needs 09 first). A second run
+with it `False` is an optional ablation that shows whether the EyePACS pretraining helps.
 
 ## Any-image inference to PDR (`generate_progression.py`)
 ```bash

@@ -224,8 +224,9 @@ def main():
         help="If --out already exists, load it and skip images already in it (for long runs "
              "that get cut off by a Colab disconnect).",
     )
-    parser.add_argument("--save-every", type=int, default=0,
-                        help="Write the partial cache to --out every N new images (0 = only at the end)")
+    parser.add_argument("--save-every", "--checkpoint-every", dest="save_every", type=int, default=0,
+                        help="Write the partial cache to --out every N new images (0 = only at the "
+                             "end). --checkpoint-every is the same flag (notebook 04_05's name).")
     parser.add_argument("--quiet", action="store_true", help="Only print progress every 100 images")
     add_classifier_norm_args(parser)
     args = parser.parse_args()
