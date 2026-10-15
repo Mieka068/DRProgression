@@ -70,5 +70,6 @@ def load_resume_state(path, models, optimizers, device):
         o.load_state_dict(state["optimizers"][k])
     _set_rng_state(state["rng"])
     start = state["epoch"] + 1
-    print(f"[resume] restored {path}: {start} epoch(s) already done, continuing at epoch {start + 1}")
+    print(f"[resume] restored {path}: {start} epoch(s) already done -- training continues from "
+          f"epoch {start + 1} if more epochs are requested, otherwise skips to evaluation")
     return start, state["extra"]
