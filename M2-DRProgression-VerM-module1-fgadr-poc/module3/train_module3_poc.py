@@ -47,6 +47,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset import TianjinSurvivalDataset, patient_level_split  # noqa: E402
 from model import EfficientNetWeibullSurvival, weibull_current_status_nll  # noqa: E402
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from resume_utils import load_resume_state, save_resume_state  # noqa: E402
+
 
 class Config:
     tianjin_dir = "../retinal-dr-longitudinal"
@@ -58,6 +61,7 @@ class Config:
     lr = 1e-4
     save_dir = "./module3_runs_poc/"
     seed = 42
+    resume_state_path = None  # optional per-epoch resume file (see resume_utils.py)
 
 
 def evaluate(model, loader, device):
@@ -135,7 +139,9 @@ def train(config: Config):
     print(f"\n[3/4] Training for {config.num_epochs} epochs (POC scale)...")
     start_time = time.time()
     loss_history = []  # per-epoch {epoch, nll_loss} -- for the NLL-vs-epoch figure
-    for epoch in range(config.num_epochs):
+    start_epoch, extra = load_resume_state(config.resume_state_path, {"model": model}, {"opt": optimizer}, device)
+    loss_history = extra.get("loss_history", loss_history)
+    for epoch in range(start_epoch, config.num_epochs):
         epoch_loss = 0.0
         for batch in train_loader:
             image = batch["baseline"].to(device)
@@ -156,6 +162,8 @@ def train(config: Config):
         avg_loss = epoch_loss / len(train_loader) if len(train_loader) else float("nan")
         loss_history.append({"epoch": epoch + 1, "nll_loss": avg_loss})
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] | NLL: {avg_loss:.4f} | Elapsed: {elapsed / 60:.1f}min")
+        save_resume_state(config.resume_state_path, epoch, {"model": model}, {"opt": optimizer},
+                          {"loss_history": loss_history})
 
     print("\n[4/4] Evaluating on held-out patients...")
     metrics = evaluate(model, val_loader, device)
@@ -206,6 +214,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--lr", type=float, default=Config.lr)
+    parser.add_argument("--resume-state", default=None,
+                        help="Per-epoch resume file (put it on Drive); re-running with the same path "
+                             "continues after the last finished epoch")
     args = parser.parse_args()
 
     cfg = Config()
@@ -214,5 +225,6 @@ if __name__ == "__main__":
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
     cfg.lr = args.lr
+    cfg.resume_state_path = args.resume_state
 
     train(cfg)

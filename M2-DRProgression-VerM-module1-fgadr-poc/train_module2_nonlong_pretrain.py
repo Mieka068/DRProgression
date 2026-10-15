@@ -70,6 +70,7 @@ from base_model import Discriminator, Generator  # noqa: E402
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
 from train_module2_poc import denorm, gradient_penalty  # noqa: E402
+from resume_utils import load_resume_state, save_resume_state  # noqa: E402
 
 
 class Config:
@@ -117,6 +118,7 @@ class Config:
     save_dir = "./DRForestGAN-v2/stargan/models_nonlong/"
     sample_dir = "./training_samples_nonlong/"
     eval_batches = 20
+    resume_state_path = None
 
 
 class BiomarkerRegressor(nn.Module):
@@ -314,8 +316,10 @@ def train(config):
 
     print(f"\n[3/4] Training for {config.num_epochs} epochs ({len(train_loader)} batches/epoch)...")
     start = time.time()
-    history = []
-    for epoch in range(config.num_epochs):
+    models, opts = {"G": G, "D": D, "R": R}, {"g_opt": g_opt, "d_opt": d_opt, "r_opt": r_opt}
+    start_epoch, extra = load_resume_state(config.resume_state_path, models, opts, device)
+    history = extra.get("history", [])
+    for epoch in range(start_epoch, config.num_epochs):
         bio_on = use_bio and epoch >= config.bio_warmup_epochs
         sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, bio=0.0, mono=0.0, r=0.0)
         n_g = 0
@@ -390,6 +394,7 @@ def train(config):
             path = os.path.join(config.sample_dir, f"epoch_{epoch + 1}.jpg")
             save_stage_grid(G, val_batch, device, config.c_dim, path)
         torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
+        save_resume_state(config.resume_state_path, epoch, models, opts, {"history": history})
 
     print("\n[4/4] Evaluating on the held-out val split...")
     metrics = evaluate(G, D, R, val_loader, device, config, mu, sd, use_bio)
@@ -437,6 +442,9 @@ if __name__ == "__main__":
         p.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(Config, name))
     p.add_argument("--bio-warmup-epochs", type=int, default=Config.bio_warmup_epochs)
     p.add_argument("--save-dir", default=Config.save_dir)
+    p.add_argument("--resume-state", default=None,
+                   help="Per-epoch resume file (e.g. <save-dir>/resume_state.pt on Drive); re-running "
+                        "with the same path continues after the last finished epoch")
     p.add_argument("--sample-dir", default=Config.sample_dir)
     p.add_argument("--dry-run", action="store_true",
                    help="Generate a tiny synthetic dataset under --save-dir and run 2 short epochs")
@@ -448,6 +456,7 @@ if __name__ == "__main__":
             setattr(cfg, k, v)
     cfg.module1_cache_path = args.module1_cache
     cfg.profiles_path = args.profiles
+    cfg.resume_state_path = args.resume_state
     cfg.dataset_kwargs = {k: v for k, v in {"labels_csv": args.labels_csv, "images_dir": args.images_subdir,
                                             "image_col": args.image_col, "label_col": args.label_col,
                                             "ext": args.ext}.items() if v is not None}

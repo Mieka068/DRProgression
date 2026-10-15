@@ -64,6 +64,7 @@ from torchvision.utils import save_image
 sys.path.insert(0, "./DRForestGAN-v2")
 from base_model import Generator, Discriminator  # noqa: E402
 from combined_dataset import get_combined_loader  # noqa: E402
+from resume_utils import load_resume_state, save_resume_state  # noqa: E402
 
 
 class Config:
@@ -82,6 +83,7 @@ class Config:
     registration_cache_path = None  # optional -- see module1/train_registration.py
     init_generator_path = None  # optional -- see docstring point 7
     init_discriminator_path = None
+    resume_state_path = None  # optional -- per-epoch resume file (see resume_utils.py)
 
     # Model
     g_conv_dim = 64
@@ -264,7 +266,13 @@ def train(config: Config):
     x_real = target_grade = baseline = follow_up = None  # for the post-loop sample save
     loss_history = []  # per-epoch {epoch, d_loss, g_loss, rec_loss} -- for the G/D loss curve figure
 
-    for epoch in range(config.num_epochs):
+    # Resume: restores G/D/optimizers/RNG/loss history from the last finished epoch (this takes
+    # precedence over --init-generator/--init-discriminator, which only seed a fresh run).
+    start_epoch, extra = load_resume_state(
+        config.resume_state_path, {"G": G, "D": D}, {"g_opt": g_optimizer, "d_opt": d_optimizer}, device)
+    loss_history = extra.get("loss_history", loss_history)
+
+    for epoch in range(start_epoch, config.num_epochs):
         epoch_g_loss = epoch_d_loss = epoch_rec_loss = 0
         for i, batch in enumerate(loader):
             baseline = batch["baseline"].to(device)
@@ -328,6 +336,9 @@ def train(config: Config):
             G.train()
             torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
 
+        save_resume_state(config.resume_state_path, epoch, {"G": G, "D": D},
+                          {"g_opt": g_optimizer, "d_opt": d_optimizer}, {"loss_history": loss_history})
+
     print(f"\n[4/4] Computing POC metrics (FID/PSNR/SSIM on {config.eval_batches} batches of the "
           "training loader -- see compute_poc_metrics' docstring on why this is not a true "
           "held-out split)...")
@@ -369,6 +380,7 @@ def train(config: Config):
         "registration_cache_path": config.registration_cache_path,
         "init_generator_path": config.init_generator_path,
         "init_discriminator_path": config.init_discriminator_path,
+        "resumed_from_epoch": start_epoch,
         "metrics": metrics,
         "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
@@ -398,6 +410,9 @@ if __name__ == "__main__":
                               "train_module2_nonlong_pretrain.py's final-G.ckpt")
     parser.add_argument("--init-discriminator", default=None,
                          help="Optional D checkpoint to start from (final-D.ckpt from the pretrain)")
+    parser.add_argument("--resume-state", default=None,
+                         help="Per-epoch resume file (put it on Drive). Re-running with the same "
+                              "path continues after the last finished epoch.")
     parser.add_argument("--style-dim", type=int, default=None,
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
@@ -434,6 +449,7 @@ if __name__ == "__main__":
     cfg.registration_cache_path = args.registration_cache
     cfg.init_generator_path = args.init_generator
     cfg.init_discriminator_path = args.init_discriminator
+    cfg.resume_state_path = args.resume_state
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
