@@ -147,6 +147,12 @@ def load_labels(labels_csv, image_col=None, label_col=None):
     return df.reset_index(drop=True)
 
 
+def sample_per_grade(df, n, seed=0):
+    """Up to n random rows per grade. Explicit concat instead of groupby().apply(), which drops
+    the grouping column in newer pandas (3.x) and so loses 'grade'."""
+    return pd.concat([g.sample(min(len(g), n), random_state=seed) for _, g in df.groupby("grade")])
+
+
 def cache_stem_lookup(cache):
     """Module 1 cache keys are relpath-with-'__' (e.g. 'train__10_left'); map stem -> key."""
     return {k.split("__")[-1]: k for k in cache}
@@ -194,8 +200,7 @@ class CrossSectionalDRDataset(Dataset):
             print(f"  ⚠ {n_missing} labelled images not found under {self.images_dir} -- skipped")
         df = df[df["path"].notna()]
         if max_per_grade:
-            df = (df.groupby("grade", group_keys=False)
-                    .apply(lambda g: g.sample(min(len(g), max_per_grade), random_state=seed)))
+            df = sample_per_grade(df, max_per_grade, seed)
         self.df = df.reset_index(drop=True)
 
         self.module1_cache = None

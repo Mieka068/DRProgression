@@ -276,8 +276,11 @@ def run(config):
                     module3_model, entry["image"], entry["mask"], entry["stage"], thresholds_by_grade, device
                 )
 
-        out_path = os.path.join(config.out_dir, f"patient_{row['patient_id']}.png")
-        render_patient_figure(row["patient_id"], trajectory, module3_estimates, out_path)
+        # One figure per EYE: a patient can have both eyes in the manifest, and a patient-only
+        # filename made the second eye silently overwrite the first.
+        eye = row["eye"] if "eye" in row and isinstance(row["eye"], str) and row["eye"] in ("OD", "OS") else f"row{_}"
+        out_path = os.path.join(config.out_dir, f"patient_{row['patient_id']}_{eye}.png")
+        render_patient_figure(f"{row['patient_id']} ({eye})", trajectory, module3_estimates, out_path)
         print(f"  ✓ Saved {out_path}")
 
     print(f"\n✓ Wrote {len(selected)} figure(s) to {config.out_dir}")

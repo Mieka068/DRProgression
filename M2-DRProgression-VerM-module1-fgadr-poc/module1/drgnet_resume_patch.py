@@ -7,6 +7,9 @@ What DRG-Net does on its own, and what this adds:
 
 dr_classification/train.py -- DRG-Net saves only model weights (best_validation_weights.pt,
   epoch_N.pt every 5 epochs), no optimizer / LR schedule / epoch, so a run cannot be resumed.
+  It also only writes best_validation_weights.pt once validation kappa exceeds 0, then loads it
+  unconditionally -- a run whose kappa never exceeds 0 crashes at the end; the patch starts the
+  best-so-far at -1 so the first epoch is always saved.
   Patch: after every epoch, write <save_path>/resume_state.pt (model, optimizer, epoch,
   best-so-far indicator, RNG states). With DRG_CLS_RESUME=1, train() loads it, replays the
   per-epoch schedulers (sampler re-weighting, loss weights, warmup, LR) for the completed
@@ -54,9 +57,12 @@ CLS_EDITS = [
     avg_loss, avg_acc, avg_kappa = 0, 0, 0
     for epoch in range(1, cfg.train.epochs + 1):
 """, """    model.train()
-    max_indicator = 0
+    # [resume patch] DRG-Net starts at 0 and saves best_validation_weights.pt only when the val
+    # indicator rises ABOVE it -- if kappa never gets above 0 (a weak/short run), the file is never
+    # written and main.py crashes loading it. -1 (kappa's minimum) means epoch 1 is always saved.
+    max_indicator = -1
     avg_loss, avg_acc, avg_kappa = 0, 0, 0
-    start_epoch = 1  # [resume patch]
+    start_epoch = 1
     _resume_path = os.path.join(cfg.base.save_path, 'resume_state.pt')
     if os.environ.get('DRG_CLS_RESUME') == '1' and os.path.isfile(_resume_path):
         import random as _random
@@ -84,8 +90,12 @@ CLS_EDITS = [
         _np.random.set_state(_st['rng_numpy'])
         _random.setstate(_st['rng_python'])
         start_epoch = _st['epoch'] + 1
-        print('[resume] continuing at epoch {} / {} (best indicator so far {:.4f})'.format(
-            start_epoch, cfg.train.epochs, max_indicator))
+        if start_epoch > cfg.train.epochs:
+            print('[resume] already trained {} / {} epochs -- skipping to evaluation'.format(
+                _st['epoch'], cfg.train.epochs))
+        else:
+            print('[resume] continuing at epoch {} / {} (best indicator so far {:.4f})'.format(
+                start_epoch, cfg.train.epochs, max_indicator))
     for epoch in range(start_epoch, cfg.train.epochs + 1):
 """),
     ("""        # record

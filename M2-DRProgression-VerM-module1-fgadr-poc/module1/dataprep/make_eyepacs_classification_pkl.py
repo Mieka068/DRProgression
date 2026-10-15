@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from crosssectional_dataset import find_file, index_images, load_labels  # noqa: E402
+from crosssectional_dataset import find_file, index_images, load_labels, sample_per_grade  # noqa: E402
 
 
 def patient_id(image_id: str) -> str:
@@ -137,8 +137,7 @@ def build(eyepacs_root, out_path, labels_csv="all_labels.csv", image_col=None, l
 
     if max_per_grade:
         tr = df[df["split"] == "train"]
-        tr = tr.groupby("grade", group_keys=False).apply(
-            lambda g: g.sample(min(len(g), max_per_grade), random_state=seed))
+        tr = sample_per_grade(tr, max_per_grade, seed)
         df = pd.concat([tr, df[df["split"] != "train"]])
         print(f"  Capped TRAIN at {max_per_grade}/grade (val/test untouched) -> {len(tr)} train images")
 
