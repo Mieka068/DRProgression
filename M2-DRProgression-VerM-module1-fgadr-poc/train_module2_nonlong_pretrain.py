@@ -70,7 +70,7 @@ from base_model import Discriminator, Generator  # noqa: E402
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
 from train_module2_poc import denorm, gradient_penalty  # noqa: E402
-from resume_utils import load_resume_state, save_resume_state  # noqa: E402
+from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
 class Config:
@@ -119,6 +119,7 @@ class Config:
     sample_dir = "./training_samples_nonlong/"
     eval_batches = 20
     resume_state_path = None
+    seed = 0  # fixes weight init / sampling / target-stage draws so runs are reproducible
 
 
 class BiomarkerRegressor(nn.Module):
@@ -276,6 +277,7 @@ def make_dry_run_data(root, n_per_grade=6, size=64):
 
 
 def train(config):
+    seed_everything(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 70)
     print("Module 2 stage-1 pretraining on cross-sectional data")
@@ -409,7 +411,7 @@ def train(config):
         "module1_cache_path": config.module1_cache_path, "profiles_path": config.profiles_path,
         "num_epochs": config.num_epochs, "image_size": config.image_size,
         "lambdas": {k: getattr(config, k) for k in dir(config) if k.startswith("lambda_")},
-        "bio_margin": config.bio_margin, "p_adjacent": config.p_adjacent,
+        "bio_margin": config.bio_margin, "p_adjacent": config.p_adjacent, "seed": config.seed,
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
     }
@@ -442,6 +444,7 @@ if __name__ == "__main__":
         p.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(Config, name))
     p.add_argument("--bio-warmup-epochs", type=int, default=Config.bio_warmup_epochs)
     p.add_argument("--save-dir", default=Config.save_dir)
+    p.add_argument("--seed", type=int, default=Config.seed)
     p.add_argument("--resume-state", default=None,
                    help="Per-epoch resume file (e.g. <save-dir>/resume_state.pt on Drive); re-running "
                         "with the same path continues after the last finished epoch")

@@ -48,7 +48,7 @@ from dataset import TianjinSurvivalDataset, patient_level_split  # noqa: E402
 from model import EfficientNetWeibullSurvival, weibull_current_status_nll  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from resume_utils import load_resume_state, save_resume_state  # noqa: E402
+from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
 class Config:
@@ -110,6 +110,7 @@ def evaluate(model, loader, device):
 
 
 def train(config: Config):
+    seed_everything(config.seed)  # was only used for the patient split; now also init/shuffling
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 70)
     print("Module 3 POC training (EfficientNet-B4 + Weibull survival head)")

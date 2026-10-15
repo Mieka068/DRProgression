@@ -64,7 +64,7 @@ from torchvision.utils import save_image
 sys.path.insert(0, "./DRForestGAN-v2")
 from base_model import Generator, Discriminator  # noqa: E402
 from combined_dataset import get_combined_loader  # noqa: E402
-from resume_utils import load_resume_state, save_resume_state  # noqa: E402
+from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
 class Config:
@@ -84,6 +84,7 @@ class Config:
     init_generator_path = None  # optional -- see docstring point 7
     init_discriminator_path = None
     resume_state_path = None  # optional -- per-epoch resume file (see resume_utils.py)
+    seed = 0  # fixes weight init / shuffling / augmentation so runs are reproducible
 
     # Model
     g_conv_dim = 64
@@ -213,6 +214,7 @@ def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=
 
 
 def train(config: Config):
+    seed_everything(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 70)
     print("Module 2 POC training (real Module 1 conditioning)")
@@ -381,6 +383,7 @@ def train(config: Config):
         "init_generator_path": config.init_generator_path,
         "init_discriminator_path": config.init_discriminator_path,
         "resumed_from_epoch": start_epoch,
+        "seed": config.seed,
         "metrics": metrics,
         "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
@@ -410,6 +413,7 @@ if __name__ == "__main__":
                               "train_module2_nonlong_pretrain.py's final-G.ckpt")
     parser.add_argument("--init-discriminator", default=None,
                          help="Optional D checkpoint to start from (final-D.ckpt from the pretrain)")
+    parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--resume-state", default=None,
                          help="Per-epoch resume file (put it on Drive). Re-running with the same "
                               "path continues after the last finished epoch.")
@@ -450,6 +454,7 @@ if __name__ == "__main__":
     cfg.init_generator_path = args.init_generator
     cfg.init_discriminator_path = args.init_discriminator
     cfg.resume_state_path = args.resume_state
+    cfg.seed = args.seed
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size

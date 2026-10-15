@@ -15,6 +15,16 @@ import numpy as np
 import torch
 
 
+def seed_everything(seed):
+    """Fixes Python / NumPy / torch RNGs at the start of training so a run is reproducible
+    (same seed + same data -> same weights init, shuffling and augmentation)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _rng_state():
     return {
         "python": random.getstate(),
