@@ -394,7 +394,8 @@ def train(config: Config):
 
         save_resume_state(config.resume_state_path, epoch, {"G": G, "D": D},
                           {"g_opt": g_optimizer, "d_opt": d_optimizer},
-                          {"loss_history": loss_history, "val_history": val_history, "best": best})
+                          {"loss_history": loss_history, "val_history": val_history, "best": best},
+                          num_epochs=config.num_epochs)
 
     final_g_path = os.path.join(config.save_dir, "final-G.ckpt")
     torch.save(G.state_dict(), final_g_path)  # last epoch

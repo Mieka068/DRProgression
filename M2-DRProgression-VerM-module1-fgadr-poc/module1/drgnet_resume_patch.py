@@ -41,6 +41,16 @@ dr_segmentation/train.py + utils.py -- also reused for DDR (same layout as IDRiD
   values; the group transforms treat it identically), cutting mask memory to a third -- needed
   for DDR (532 images) and the FGADR + DDR combined run (853) to fit in Colab's RAM.
 
+Drive mirroring (separate marker, applies to already-patched clones): every overwrite of a file on
+a Colab-mounted Drive leaves the old copy behind, counted against the Drive quota -- rewriting
+~250 MB checkpoints every few epochs straight onto Drive fills it within hours, after which model
+files silently fail to upload. Notebook 11 therefore points DRG-Net's save folders at the VM's
+local disk and sets
+    * DRG_SEG_MIRROR_DIR / DRG_SEG_MIRROR_EVERY (segmentation): every N epochs (a multiple of
+      DRG_SEG_SAVE_EVERY) and at the last epoch, copy the run folder's changed files to Drive;
+    * DRG_CLS_MIRROR_DIR / DRG_CLS_MIRROR_EVERY (classification): same for save_path after the
+      epoch's resume_state.pt (the epoch_N.pt snapshots stay local).
+
 Usage:  python module1/drgnet_resume_patch.py /content/dr-joint-learning
 """
 import os
@@ -177,6 +187,39 @@ UTILS_DATASET_EDITS = [
 ]
 
 
+MIRROR_MARK = "# [mirror patch]"
+
+
+def _mirror_code(indent, src_dir, cond):
+    pad = " " * indent
+    return (
+        f"{pad}_mirror = os.environ.get('{cond[0]}')  {MIRROR_MARK} changed files -> Drive every N epochs + at the end\n"
+        f"{pad}if _mirror and ({cond[1]}):\n"
+        f"{pad}    import shutil as _sh\n"
+        f"{pad}    _dst = {cond[2]}\n"
+        f"{pad}    os.makedirs(_dst, exist_ok=True)\n"
+        f"{pad}    for _f in os.listdir({src_dir}):\n"
+        f"{pad}        _s, _d = os.path.join({src_dir}, _f), os.path.join(_dst, _f)\n"
+        f"{pad}        if (os.path.isfile(_s) and not _f.endswith('.tmp') and not _f.startswith('epoch_')\n"
+        f"{pad}                and (not os.path.isfile(_d) or os.path.getmtime(_s) > os.path.getmtime(_d))):\n"
+        f"{pad}            _sh.copyfile(_s, _d)\n"
+    )
+
+
+SEG_MIRROR_ANCHOR = "            os.replace(_last + '.tmp', _last)\n"
+SEG_MIRROR_EDITS = [(SEG_MIRROR_ANCHOR, SEG_MIRROR_ANCHOR + _mirror_code(
+    12, "dir_checkpoint",
+    ("DRG_SEG_MIRROR_DIR",
+     "(epoch + 1) % int(os.environ.get('DRG_SEG_MIRROR_EVERY', 25)) == 0 or epoch + 1 == start_epoch + num_epochs",
+     "os.path.join(_mirror, os.path.basename(dir_checkpoint))")))]
+CLS_MIRROR_ANCHOR = "        os.replace(_tmp, _resume_path)\n"
+CLS_MIRROR_EDITS = [(CLS_MIRROR_ANCHOR, CLS_MIRROR_ANCHOR + _mirror_code(
+    8, "cfg.base.save_path",
+    ("DRG_CLS_MIRROR_DIR",
+     "epoch % int(os.environ.get('DRG_CLS_MIRROR_EVERY', 5)) == 0 or epoch == cfg.train.epochs",
+     "_mirror")))]
+
+
 def apply(drg_root):
     _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_EDITS)
     _patch(os.path.join(drg_root, "dr_segmentation", "train_fgadr.py"), seg_edits(
@@ -190,6 +233,9 @@ def apply(drg_root):
     _patch(os.path.join(drg_root, "dr_segmentation", "train.py"), SEG_DATASET_EDITS, DATASET_MARK)
     _patch(os.path.join(drg_root, "dr_segmentation", "utils.py"), UTILS_DATASET_EDITS, DATASET_MARK)
     _patch(os.path.join(drg_root, "dr_segmentation", "dataset.py"), DATASET_PY_EDITS, DATASET_MARK)
+    for script in ("train.py", "train_fgadr.py"):
+        _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_MIRROR_EDITS, MIRROR_MARK)
+    _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_MIRROR_EDITS, MIRROR_MARK)
 
 
 if __name__ == "__main__":

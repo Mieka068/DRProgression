@@ -137,6 +137,17 @@ Order with the DRG-Net Module 1 (default):
 Order with the POC Module 1 (`MODULE1_SOURCE = 'poc'`):
 **01 -> 02 + 03 -> 04_05 -> 09 -> 06 -> 07 -> 08 -> 10**.
 
+**Google Drive storage.** Every overwrite of a file on a Colab-mounted Drive leaves the old copy in
+the Trash / version history, and those copies count against the Drive quota. Writing ~250 MB
+checkpoints straight to Drive every epoch fills a 15 GB Drive within hours, after which model files
+silently fail to upload (small logs still save). So all training writes checkpoints, resume states
+and growing caches to the VM disk and copies them to Drive every N epochs and at the end
+(`drive_io.py`, `resume_utils.py`, the mirror part of `module1/drgnet_resume_patch.py`); after each
+run the notebooks check the model files actually reached Drive and stop with a message if not. Each
+notebook prints the free Drive space after mounting, and its last cell (`drive.flush_and_unmount()`)
+waits for uploads to finish -- run it before closing the runtime. Keep ~15 GB free and empty the
+Drive Trash between long runs.
+
 Notebook 06 runs **once**, with `USE_NONLONG_PRETRAIN = True` (default; needs 09 first). A second run
 with it `False` is an optional ablation that shows whether the EyePACS pretraining helps.
 

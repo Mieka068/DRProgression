@@ -118,6 +118,7 @@ class Config:
     save_dir = "./DRForestGAN-v2/stargan/models_nonlong/"
     sample_dir = "./training_samples_nonlong/"
     eval_batches = 20
+    save_every = 10  # numbered {epoch}-G.ckpt snapshot interval
     resume_state_path = None
     seed = 0  # fixes weight init / sampling / target-stage draws so runs are reproducible
 
@@ -395,8 +396,12 @@ def train(config):
         if val_batch is not None:
             path = os.path.join(config.sample_dir, f"epoch_{epoch + 1}.jpg")
             save_stage_grid(G, val_batch, device, config.c_dim, path)
-        torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
-        save_resume_state(config.resume_state_path, epoch, models, opts, {"history": history})
+        # Numbered G snapshots only every save_every epochs: save_dir is on Drive in Colab and the
+        # per-epoch copies (~33 MB each) add up; resume uses resume_state, inference final-G.ckpt.
+        if (epoch + 1) % config.save_every == 0:
+            torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
+        save_resume_state(config.resume_state_path, epoch, models, opts, {"history": history},
+                          num_epochs=config.num_epochs)
 
     print("\n[4/4] Evaluating on the held-out val split...")
     metrics = evaluate(G, D, R, val_loader, device, config, mu, sd, use_bio)

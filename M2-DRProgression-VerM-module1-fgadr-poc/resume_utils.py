@@ -7,12 +7,21 @@ finished, script-specific extras (loss history, ...) and the Python / NumPy / to
 is written atomically to one file (point it at Google Drive in Colab). Re-running the same
 command with the same --resume-state path continues at the next epoch. Because the RNG states
 are restored, data shuffling, augmentation and sampling continue as in an uninterrupted run.
+
+On Google Drive the per-epoch write goes to a local twin on the VM's disk and is copied to Drive
+only every RESUME_DRIVE_EVERY epochs (default 10) and after the last epoch (see drive_io.py: every
+Drive overwrite leaves a copy that counts against the quota). A disconnect therefore loses at most
+RESUME_DRIVE_EVERY - 1 epochs; restarting the runtime without disconnecting loses none.
 """
 import os
 import random
 
 import numpy as np
 import torch
+
+from drive_io import local_twin, push_to_drive, restore_from_drive
+
+DRIVE_EVERY = int(os.environ.get("RESUME_DRIVE_EVERY", 10))
 
 
 def seed_everything(seed):
@@ -42,10 +51,12 @@ def _set_rng_state(state):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def save_resume_state(path, epoch, models, optimizers, extra=None):
-    """epoch: 0-based index of the epoch that just FINISHED. models/optimizers: {name: obj}."""
+def save_resume_state(path, epoch, models, optimizers, extra=None, num_epochs=None):
+    """epoch: 0-based index of the epoch that just FINISHED. models/optimizers: {name: obj}.
+    num_epochs: the run's total, so the last epoch is always copied to Drive."""
     if not path:
         return
+    drive_path, path = path, local_twin(path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     state = {
         "epoch": epoch,
@@ -56,12 +67,17 @@ def save_resume_state(path, epoch, models, optimizers, extra=None):
     }
     torch.save(state, path + ".tmp")
     os.replace(path + ".tmp", path)
+    if path != drive_path and ((epoch + 1) % DRIVE_EVERY == 0 or epoch + 1 == num_epochs):
+        push_to_drive(drive_path)
 
 
 def load_resume_state(path, models, optimizers, device):
     """Restores models/optimizers/RNG in place if `path` exists. Returns (start_epoch, extra):
     start_epoch is the 0-based epoch to run next (0 and {} when there is nothing to resume)."""
-    if not path or not os.path.isfile(path):
+    if not path:
+        return 0, {}
+    path = restore_from_drive(path)  # the local twin (newer) if this runtime has one, else Drive's
+    if not os.path.isfile(path):
         return 0, {}
     state = torch.load(path, map_location=device, weights_only=False)
     for k, m in models.items():

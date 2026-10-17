@@ -41,6 +41,10 @@ from torchvision import models, transforms
 
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask
 
+import sys  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from drive_io import local_twin, push_to_drive, restore_from_drive  # noqa: E402
+
 # Classifier input normalisation must match the config the checkpoint was trained with:
 # fgadr_poc.yaml (default) or eyepacs_poc.yaml (DRG-Net's eyepacs_ce.yaml stats). Select with
 # --classifier-norm; idrid_poc.yaml uses 'auto' (dataset-computed stats DRG-Net prints at
@@ -227,6 +231,11 @@ def main():
     parser.add_argument("--save-every", "--checkpoint-every", dest="save_every", type=int, default=0,
                         help="Write the partial cache to --out every N new images (0 = only at the "
                              "end). --checkpoint-every is the same flag (notebook 04_05's name).")
+    parser.add_argument("--drive-every", type=int, default=2000,
+                        help="When --out is on Google Drive: the partial cache is written every "
+                             "--save-every images to a copy on the VM disk, and copied to Drive only "
+                             "every --drive-every new images and at the end (each Drive overwrite leaves "
+                             "an old copy counted against the quota -- see drive_io.py).")
     parser.add_argument("--quiet", action="store_true", help="Only print progress every 100 images")
     add_classifier_norm_args(parser)
     args = parser.parse_args()
@@ -266,9 +275,13 @@ def main():
         image_files = image_files[: args.limit]
 
     cache = {}
-    if args.resume and os.path.isfile(args.out):
-        cache = torch.load(args.out, weights_only=False)
-        print(f"--resume: {len(cache)} images already cached in {args.out}, skipping them")
+    work = local_twin(args.out)  # == args.out unless --out is on Drive
+    os.makedirs(os.path.dirname(os.path.abspath(work)), exist_ok=True)
+    if args.resume:
+        restore_from_drive(args.out)
+        if os.path.isfile(work):
+            cache = torch.load(work, weights_only=False)
+            print(f"--resume: {len(cache)} images already cached in {args.out}, skipping them")
 
     n_new = 0
     for i, relpath in enumerate(image_files):
@@ -295,11 +308,14 @@ def main():
                     f"lbs={result['lbs']:.5f} (lesions: {result['trained_lesions']})"
                 )
             if args.save_every and n_new % args.save_every == 0:
-                torch.save(cache, args.out)
+                torch.save(cache, work)
+                if work != args.out and n_new % args.drive_every < args.save_every:
+                    push_to_drive(args.out)
         except Exception as e:
             print(f"⚠ {image_id}: failed ({e})")
 
-    torch.save(cache, args.out)
+    torch.save(cache, work)
+    push_to_drive(args.out)
     print(f"✓ wrote {len(cache)} entries to {args.out}")
 
 

@@ -186,7 +186,7 @@ def train(config: Config):
               + (" ★ new best -> best-model.ckpt" if is_best else f" | best so far: epoch {best['epoch']}")
               + f" | Elapsed: {elapsed / 60:.1f}min")
         save_resume_state(config.resume_state_path, epoch, {"model": model}, {"opt": optimizer},
-                          {"loss_history": loss_history, "best": best})
+                          {"loss_history": loss_history, "best": best}, num_epochs=config.num_epochs)
 
     ckpt_path = os.path.join(config.save_dir, "final-model.ckpt")
     torch.save(model.state_dict(), ckpt_path)  # last epoch
