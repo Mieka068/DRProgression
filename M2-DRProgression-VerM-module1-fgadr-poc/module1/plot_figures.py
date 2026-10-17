@@ -21,6 +21,14 @@ Usage:
         --history-csv ./fgadr_classification_history.csv \
         --out ./figures/module1_kappa_vs_epoch_fgadr.png
 
+    # Lesion-segmentation validation AP vs epoch (DRG-Net's ap_during_learning_*.txt logs):
+    python plot_figures.py seg-learning --log EX=./ap_during_learning_EX2.txt ... \
+        --title "FGADR + DDR combined" --out ./figures/module1_seg_learning.png
+
+    # Classification validation kappa/accuracy vs epoch (notebook 11's tee'd main.py log):
+    python plot_figures.py cls-curve --log ./logs/cls_fgadr.log --dataset-name FGADR \
+        --out ./figures/module1_cls_curve_fgadr.png
+
     # Qualitative segmentation grid (image | ground truth | predicted mask):
     python plot_figures.py seg-grid \
         --fgadr-root ./FGADR-Seg-set_Release/Seg-set \
@@ -169,8 +177,69 @@ def plot_training_curve(epochs, kappas, accuracies, out_path, title):
     print(f"✓ Wrote {out_path}")
 
 
+def parse_seg_ap_log(path):
+    """DRG-Net's segmentation AP log: one 'epoch: N ap: X auc: Y' line per evaluation (N is
+    0-based). Appended across resumed sessions, so a repeated epoch keeps its latest value."""
+    line_re = re.compile(r"epoch:\s*(\d+)\s+ap:\s*([\d.eE+-]+)\s+auc:\s*([\d.eE+-]+)")
+    points = {}
+    with open(path) as f:
+        for line in f:
+            m = line_re.search(line)
+            if m:
+                points[int(m.group(1)) + 1] = (float(m.group(2)), float(m.group(3)))
+    return sorted(points.items())
+
+
+def plot_seg_learning(log_paths: dict, out_path: str, title=""):
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for lesion in LESION_ORDER:
+        if lesion not in log_paths or not os.path.isfile(log_paths[lesion]):
+            continue
+        pts = parse_seg_ap_log(log_paths[lesion])
+        if not pts:
+            continue
+        epochs, ap = [e for e, _ in pts], [v[0] for _, v in pts]
+        best = int(np.argmax(ap))
+        line, = ax.plot(epochs, ap, marker="o", label=f"{lesion} (best AP {ap[best]:.3f} @ epoch {epochs[best]})")
+        ax.plot(epochs[best], ap[best], marker="*", markersize=14, color=line.get_color())
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Validation AP")
+    ax.set_title(f"Validation AP vs. epoch{' -- ' + title if title else ''}", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"✓ Wrote {out_path}")
+
+
+def parse_drgnet_cls_log(path):
+    """Validation accuracy/kappa per epoch from DRG-Net's dr_classification/main.py output as
+    notebook 11 tees it ('validation accuracy: A, kappa: K' after every epoch). The log is appended
+    across sessions; '[resume] continuing at epoch N' restarts the count at N, a fresh run at 1."""
+    val_re = re.compile(r"validation accuracy:\s*([\d.]+),\s*kappa:\s*(-?[\d.]+)")
+    resume_re = re.compile(r"\[resume\] continuing at epoch (\d+)")
+    points, epoch = {}, 1
+    with open(path) as f:
+        for line in f:
+            if "LOADING CONFIG FILE" in line:
+                epoch = 1
+            m = resume_re.search(line)
+            if m:
+                epoch = int(m.group(1))
+            m = val_re.search(line)
+            if m:
+                points[epoch] = (float(m.group(1)), float(m.group(2)))
+                epoch += 1
+    if not points:
+        raise ValueError(f"No 'validation accuracy: ..., kappa: ...' lines in {path}")
+    epochs = sorted(points)
+    return epochs, [points[e][1] for e in epochs], [points[e][0] for e in epochs]
+
+
 def plot_segmentation_grid(fgadr_root, filtered_csv, checkpoint, lesion, n_examples, out_path,
-                            image_size=512, device="cuda" if torch.cuda.is_available() else "cpu"):
+                            image_size=512, device="cuda" if torch.cuda.is_available() else "cpu",
+                            title_suffix=""):
     import segmentation_models_pytorch as smp
 
     model = smp.Unet(encoder_name="resnet50", encoder_weights=None, in_channels=3, classes=2)
@@ -223,7 +292,7 @@ def plot_segmentation_grid(fgadr_root, filtered_csv, checkpoint, lesion, n_examp
         for ax in axes[row]:
             ax.axis("off")
 
-    fig.suptitle(f"Module 1 segmentation ({lesion}): qualitative examples")
+    fig.suptitle(f"Module 1 segmentation ({lesion}): qualitative examples{title_suffix}")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -237,6 +306,17 @@ def main():
     p_roc = sub.add_parser("roc")
     p_roc.add_argument("--curve", action="append", default=[], metavar="LESION=PATH", required=True)
     p_roc.add_argument("--out", required=True)
+    p_roc.add_argument("--title", default="Module 1 Segmentation: Per-Lesion ROC")
+
+    p_sl = sub.add_parser("seg-learning")
+    p_sl.add_argument("--log", action="append", default=[], metavar="LESION=PATH", required=True)
+    p_sl.add_argument("--title", default="")
+    p_sl.add_argument("--out", required=True)
+
+    p_cc = sub.add_parser("cls-curve")
+    p_cc.add_argument("--log", required=True, help="notebook 11's logs/cls_<dataset>.log")
+    p_cc.add_argument("--dataset-name", default="FGADR")
+    p_cc.add_argument("--out", required=True)
 
     p_cm = sub.add_parser("confusion")
     p_cm.add_argument("--predictions-csv", required=True)
@@ -257,6 +337,7 @@ def main():
     p_sg.add_argument("--n-examples", type=int, default=3)
     p_sg.add_argument("--image-size", type=int, default=512)
     p_sg.add_argument("--out", required=True)
+    p_sg.add_argument("--title-suffix", default="", help="e.g. ' -- FGADR + DDR combined model'")
 
     args = parser.parse_args()
 
@@ -265,7 +346,13 @@ def main():
         for item in args.curve:
             lesion, path = item.split("=", 1)
             curve_paths[lesion] = path
-        plot_roc_curves(curve_paths, args.out)
+        plot_roc_curves(curve_paths, args.out, title=args.title)
+    elif args.command == "seg-learning":
+        plot_seg_learning(dict(item.split("=", 1) for item in args.log), args.out, args.title)
+    elif args.command == "cls-curve":
+        epochs, kappas, accuracies = parse_drgnet_cls_log(args.log)
+        plot_training_curve(epochs, kappas, accuracies, args.out,
+                            title=f"{args.dataset_name} classification: validation kappa/accuracy vs. epoch")
     elif args.command == "confusion":
         plot_confusion_matrix(args.predictions_csv, args.out, args.dataset_name)
     elif args.command == "training-curve":
@@ -279,7 +366,8 @@ def main():
                              title=f"{args.dataset_name} classification: kappa/accuracy vs. epoch")
     elif args.command == "seg-grid":
         plot_segmentation_grid(args.fgadr_root, args.filtered_csv, args.checkpoint, args.lesion,
-                                args.n_examples, args.out, image_size=args.image_size)
+                                args.n_examples, args.out, image_size=args.image_size,
+                                title_suffix=args.title_suffix)
 
 
 if __name__ == "__main__":
