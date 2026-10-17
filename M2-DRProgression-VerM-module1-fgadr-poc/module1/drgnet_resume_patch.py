@@ -36,6 +36,10 @@ dr_segmentation/train.py + utils.py -- also reused for DDR (same layout as IDRiD
       AP log <prefix>ap_during_learning_*.txt -- 'ddr_' keeps DDR runs apart from IDRiD's;
     * DRG_SEG_TRAIN_RATIO (default 0.8): train/eval cut of the sorted TrainingSet -- DDR's prep
       sorts its official train images before its val images and writes the exact ratio.
+  dataset.py's IDRIDDataset holds every image and mask in RAM, masks as 3-channel RGB of which
+  only channel 0 is ever read. The patch keeps that channel as a 1-channel image instead (same
+  values; the group transforms treat it identically), cutting mask memory to a third -- needed
+  for DDR (532 images) and the FGADR + DDR combined run (853) to fit in Colab's RAM.
 
 Usage:  python module1/drgnet_resume_patch.py /content/dr-joint-learning
 """
@@ -159,6 +163,13 @@ SEG_DATASET_EDITS = [
      "            with open(os.environ.get('DRG_SEG_RUN_PREFIX', 'new_') + 'ap_during_learning_' + lesion + preprocess"
      " + '.txt', 'a') as f:  # [dataset patch]\n"),
 ]
+DATASET_PY_EDITS = [
+    ("                    self.masks.append(self.pil_loader(mask_path))\n",
+     "                    self.masks.append(Image.fromarray(np.array(self.pil_loader(mask_path))[:, :, 0]))"
+     "  # [dataset patch] channel 0 only\n"),
+    ("            mask = np.array(np.array(info[1]))[:, :, 0] / 255.0\n",
+     "            mask = np.array(info[1]) / 255.0  # [dataset patch] masks are stored 1-channel\n"),
+]
 UTILS_DATASET_EDITS = [
     ("train_ratio = 0.8\neval_ratio = 0.2\n",
      "train_ratio = float(os.environ.get('DRG_SEG_TRAIN_RATIO', 0.8))  # [dataset patch]\n"
@@ -178,6 +189,7 @@ def apply(drg_root):
         40, "        logger.flush()\n        logger.flush()\n"))
     _patch(os.path.join(drg_root, "dr_segmentation", "train.py"), SEG_DATASET_EDITS, DATASET_MARK)
     _patch(os.path.join(drg_root, "dr_segmentation", "utils.py"), UTILS_DATASET_EDITS, DATASET_MARK)
+    _patch(os.path.join(drg_root, "dr_segmentation", "dataset.py"), DATASET_PY_EDITS, DATASET_MARK)
 
 
 if __name__ == "__main__":

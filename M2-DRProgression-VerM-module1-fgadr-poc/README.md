@@ -118,13 +118,18 @@ whole pipeline on synthetic data. Compare `models_poc_from_nonlong/` against a f
 | 07 | `07_module3_poc_colab` | Module 3 (EfficientNet-B4 + Weibull) time-to-progression on Tianjin; run copied to Drive for 08 / 10 | 04_05 |
 | 08 | `08_visualize_trajectory_colab` | Cascade figures for Tianjin patients (one per eye) + Module 3 captions; `END_STAGE = 4` goes to PDR; figures saved to Drive | 06, 07 |
 | 09 | `09_eyepacs_module1_and_module2_pretrain_colab` | **new** -- EyePACS: Module 1 grading pickle (+ optional classifier training); Module 1 cache over an EyePACS subset; stage biomarker profiles; Module 2 non-longitudinal pretraining | 02, 03, EyePACS zip on Drive |
-| 11 | `11_module1_drgnet_replication_colab` | **new** -- DRG-Net's own Module 1 runs, one model per dataset as in their repo: grading on FGADR (released split), IDRiD, EyePACS; lesion segmentation on FGADR and IDRiD (300 / 1000 ep by default; DRG-Net used 1500 / 2500), plus DDR (our addition, 250 ep, official train / val / test; `module1/dataprep/prepare_ddr_segmentation.py`); resumes from Drive checkpoints after a disconnect; test-set metrics summary | dataset zips on Drive (IDRiD "A. Segmentation" for IDRiD seg; a zip with DDR in its name for DDR seg) |
+| 11 | `11_module1_drgnet_replication_colab` | **new** -- DRG-Net's own Module 1 runs, one model per dataset as in their repo: grading on FGADR (released split), IDRiD, EyePACS; lesion segmentation on FGADR and IDRiD (300 / 1000 ep by default; DRG-Net used 1500 / 2500), plus DDR (our addition, 250 ep, official train / val / test; `module1/dataprep/prepare_ddr_segmentation.py`) and FGADR + DDR combined (150 ep; `prepare_combined_segmentation.py`) -- the pipeline's lesion models; every model scored on the FGADR / DDR / IDRiD test sets; resumes from Drive checkpoints after a disconnect; test-set metrics summary | dataset zips on Drive (IDRiD "A. Segmentation" for IDRiD seg; a zip with DDR in its name for DDR seg) |
 | 10 | `10_generate_progression_to_pdr_colab` | **new** -- any fundus image(s) -> Module 1 grade -> cascade to stage 4 (PDR), saves per-stage images/figure/JSON | 02, 03, 06 (07 optional) |
 
-**`MODULE1_SOURCE`** (first code cell of 04_05 and 06-10, default `'drgnet'`) picks which Module 1
-models the pipeline uses: `'drgnet'` = notebook 11's DRG-Net replication checkpoints (outputs go to
-`_drgnet`-suffixed folders: `module1_cache_drgnet/`, `models_poc_tianjin_from_nonlong_drgnet/`, ...),
-`'poc'` = notebooks 02/03's (the original folders). Use the same value in every notebook.
+**`MODULE1_SOURCE`** (first code cell of 04_05 and 06-10) picks which Module 1 models the pipeline
+uses. Use the same value in every notebook; each value writes to its own folders, so switching never
+overwrites another setting's caches or models.
+
+| `MODULE1_SOURCE` | Classifier | Lesion segmenters | Folder suffix |
+|---|---|---|---|
+| `'drgnet_combined'` (default) | FGADR (nb 11) | FGADR + DDR combined (nb 11, `comb_models_*`) | `_drgnet_comb` |
+| `'drgnet'` | FGADR (nb 11) | FGADR only (nb 11, `models_FGADR_NO_TATL_*`) | `_drgnet` |
+| `'poc'` | nb 02 | nb 03 | none |
 
 Order with the DRG-Net Module 1 (default):
 **11 -> 04_05 -> 09 -> 06 -> 07 -> 08 -> 10** (01-03 not needed; 11 builds its own data files).
