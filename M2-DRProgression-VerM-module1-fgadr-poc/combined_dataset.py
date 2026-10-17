@@ -17,6 +17,8 @@ scored against a real follow-up grade the way Tianjin's can (see evaluate_trajec
 --self-consistency-dirs option for the metric this file's sources use instead).
 """
 
+import os
+
 import torch
 from torch.utils.data import Dataset, ConcatDataset
 from torchvision import transforms
@@ -112,45 +114,10 @@ class AugmentedPairDataset(Dataset):
         return img1, img2
 
 
-def get_combined_loader(fire_dir='./FIRE_dataset',
-                        longdr_dir='./LongDRScreening_20150209',
-                        tianjin_dir=None,
-                        image_size=128,
-                        batch_size=4,
-                        augment=True,
-                        num_workers=0,
-                        fire_module1_cache_path=None,
-                        longdr_module1_cache_path=None,
-                        tianjin_module1_cache_path=None,
-                        tianjin_min_pair_quality=None,
-                        registration_cache_path=None):
-    """
-    Get a DataLoader combining FIRE + LongDRScreening + (optionally) Tianjin, with augmentation.
-
-    Args:
-        fire_module1_cache_path: Optional module1/apply_to_progression_data.py cache
-            (see FIREDataset docstring) -- real grade/mask conditioning instead of the
-            placeholder empty-mask/Stage-2 default when given.
-        longdr_module1_cache_path: Same, for LongDRScreeningDataset.
-        tianjin_dir: Optional path to the extracted Tianjin (usama10/retinal-dr-longitudinal)
-            dataset. None (the default) skips Tianjin entirely, so existing FIRE+LongDR-only
-            callers are unaffected.
-        tianjin_module1_cache_path: Same fallback contract as the other two, for
-            TianjinLongitudinalDataset -- only used for the lesion mask, since Tianjin's real
-            clinical grade always wins over a Module 1 prediction (see its docstring).
-        tianjin_min_pair_quality: Optional float; drop Tianjin pairs below this
-            corrected_manifest.csv registration-quality threshold. None keeps every pair.
-        registration_cache_path: Optional path to a single cache produced by
-            module1/train_registration.py, shared across all three sources (it's keyed by
-            (source, baseline_path), see that script's docstring) -- substitutes a
-            pre-registered, baseline-aligned follow-up image in place of the raw one wherever
-            an entry exists. None (the default) uses raw follow-up images everywhere.
-
-    Returns:
-        DataLoader yielding batches from all loaded datasets
-    """
-    from torch.utils.data import DataLoader
-
+def _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
+                  longdr_module1_cache_path, tianjin_module1_cache_path, tianjin_min_pair_quality,
+                  registration_cache_path):
+    """The per-source datasets get_combined_loader / get_combined_train_val_loaders concatenate."""
     datasets = []
 
     # Try to load FIRE
@@ -193,7 +160,119 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
 
     if not datasets:
         raise RuntimeError("No datasets loaded!")
-    
+    return datasets
+
+
+def _group_ids(ds):
+    """One id per pair naming the eye/patient it comes from, so a train/val split never puts
+    pairs of the same eye (LongDR: up to 4 per eye) or patient (Tianjin: both eyes) on both
+    sides. Read from each dataset's pair index -- no image loading."""
+    if isinstance(ds, FIREDataset):
+        return [f"fire:{os.path.basename(p[0]).rsplit('_', 1)[0]}" for p in ds.pairs]
+    if isinstance(ds, LongDRScreeningDataset):
+        return [f"longdr:{p['eye']}" for p in ds.pairs]
+    if isinstance(ds, TianjinLongitudinalDataset):
+        return [f"tianjin:{pid}" for pid in ds.manifest["patient_id"]]
+    return [f"{type(ds).__name__}:{i}" for i in range(len(ds))]
+
+
+def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
+                                   longdr_dir='./LongDRScreening_20150209',
+                                   tianjin_dir=None,
+                                   image_size=128,
+                                   batch_size=4,
+                                   augment=True,
+                                   num_workers=0,
+                                   fire_module1_cache_path=None,
+                                   longdr_module1_cache_path=None,
+                                   tianjin_module1_cache_path=None,
+                                   tianjin_min_pair_quality=None,
+                                   registration_cache_path=None,
+                                   val_fraction=0.1,
+                                   seed=0):
+    """
+    Same sources as get_combined_loader, split into train / held-out val by eye/patient
+    (_group_ids), val_fraction of each source's groups going to val. Only train is augmented.
+    The split depends only on `seed` and the data, so a resumed run gets the same split.
+
+    Returns (train_loader, val_loader, info) with info = {num_pairs, n_train_pairs, n_val_pairs,
+    n_val_groups}.
+    """
+    from torch.utils.data import DataLoader, Subset
+
+    datasets = _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
+                             longdr_module1_cache_path, tianjin_module1_cache_path,
+                             tianjin_min_pair_quality, registration_cache_path)
+    combined = ConcatDataset(datasets)
+    rng = np.random.RandomState(seed)
+    train_idx, val_idx, n_val_groups, offset = [], [], 0, 0
+    for ds in datasets:
+        groups = _group_ids(ds)
+        uniq = sorted(set(groups))
+        rng.shuffle(uniq)
+        n_val = int(round(len(uniq) * val_fraction)) if len(uniq) > 1 else 0
+        val_groups = set(uniq[:n_val])
+        n_val_groups += n_val
+        for i, g in enumerate(groups):
+            (val_idx if g in val_groups else train_idx).append(offset + i)
+        offset += len(ds)
+
+    train_set = AugmentedPairDataset(Subset(combined, train_idx), image_size=image_size, augment=augment)
+    val_set = AugmentedPairDataset(Subset(combined, val_idx), image_size=image_size, augment=False)
+    print(f"✓ Split by eye/patient: {len(train_idx)} train pairs / {len(val_idx)} held-out val pairs "
+          f"({n_val_groups} val eyes/patients)")
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                              drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                            drop_last=False)
+    info = {"num_pairs": len(combined), "n_train_pairs": len(train_idx), "n_val_pairs": len(val_idx),
+            "n_val_groups": n_val_groups}
+    return train_loader, val_loader, info
+
+
+def get_combined_loader(fire_dir='./FIRE_dataset',
+                        longdr_dir='./LongDRScreening_20150209',
+                        tianjin_dir=None,
+                        image_size=128,
+                        batch_size=4,
+                        augment=True,
+                        num_workers=0,
+                        fire_module1_cache_path=None,
+                        longdr_module1_cache_path=None,
+                        tianjin_module1_cache_path=None,
+                        tianjin_min_pair_quality=None,
+                        registration_cache_path=None):
+    """
+    Get a DataLoader combining FIRE + LongDRScreening + (optionally) Tianjin, with augmentation.
+
+    Args:
+        fire_module1_cache_path: Optional module1/apply_to_progression_data.py cache
+            (see FIREDataset docstring) -- real grade/mask conditioning instead of the
+            placeholder empty-mask/Stage-2 default when given.
+        longdr_module1_cache_path: Same, for LongDRScreeningDataset.
+        tianjin_dir: Optional path to the extracted Tianjin (usama10/retinal-dr-longitudinal)
+            dataset. None (the default) skips Tianjin entirely, so existing FIRE+LongDR-only
+            callers are unaffected.
+        tianjin_module1_cache_path: Same fallback contract as the other two, for
+            TianjinLongitudinalDataset -- only used for the lesion mask, since Tianjin's real
+            clinical grade always wins over a Module 1 prediction (see its docstring).
+        tianjin_min_pair_quality: Optional float; drop Tianjin pairs below this
+            corrected_manifest.csv registration-quality threshold. None keeps every pair.
+        registration_cache_path: Optional path to a single cache produced by
+            module1/train_registration.py, shared across all three sources (it's keyed by
+            (source, baseline_path), see that script's docstring) -- substitutes a
+            pre-registered, baseline-aligned follow-up image in place of the raw one wherever
+            an entry exists. None (the default) uses raw follow-up images everywhere.
+
+    Returns:
+        DataLoader yielding batches from all loaded datasets
+    """
+    from torch.utils.data import DataLoader
+
+    datasets = _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
+                             longdr_module1_cache_path, tianjin_module1_cache_path,
+                             tianjin_min_pair_quality, registration_cache_path)
+
     # Combine datasets
     combined = ConcatDataset(datasets)
     print(f"✓ Combined: {len(combined)} pairs")

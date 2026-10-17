@@ -86,6 +86,15 @@ python train_module2_poc.py --tianjin-dir ... --tianjin-module1-cache ... \
     --save-dir ./DRForestGAN-v2/stargan/models_poc_from_nonlong/
 ```
 
+**Best-epoch saving (step d and Module 3).** `train_module2_poc.py` holds out 10% of the
+eyes/patients (`--val-fraction`, split by eye/patient so no eye is on both sides), scores the
+Generator on them after every epoch (L1 to the real follow-up) and writes the best epoch to
+`best-G.ckpt`; `final-G.ckpt` is the last epoch. `module3/train_module3_poc.py` does the same on
+its val patients (NLL) -> `best-model.ckpt` / `final-model.ckpt`. Notebooks 06-08 and 10 use the
+`best-` checkpoints. The EyePACS pretraining (step c) keeps its last epoch: its only validation
+signals come from the D/R networks trained alongside G, so they can't pick an epoch fairly, and
+fine-tuning selects the epoch that is actually used.
+
 `stage_biomarker_profiles.json` holds, per stage, each biomarker's distribution and the lesions
 present in >=50% of eyes (`characteristic_lesions`); per transition `k->k+1`, the biomarkers ranked
 by effect size (`ranked_shifts`, Cohen's d + Mann-Whitney p) and the ones that barely move
@@ -109,7 +118,7 @@ whole pipeline on synthetic data. Compare `models_poc_from_nonlong/` against a f
 | 07 | `07_module3_poc_colab` | Module 3 (EfficientNet-B4 + Weibull) time-to-progression on Tianjin; run copied to Drive for 08 / 10 | 04_05 |
 | 08 | `08_visualize_trajectory_colab` | Cascade figures for Tianjin patients (one per eye) + Module 3 captions; `END_STAGE = 4` goes to PDR; figures saved to Drive | 06, 07 |
 | 09 | `09_eyepacs_module1_and_module2_pretrain_colab` | **new** -- EyePACS: Module 1 grading pickle (+ optional classifier training); Module 1 cache over an EyePACS subset; stage biomarker profiles; Module 2 non-longitudinal pretraining | 02, 03, EyePACS zip on Drive |
-| 11 | `11_module1_drgnet_replication_colab` | **new** -- DRG-Net's own Module 1 runs, one model per dataset as in their repo: grading on FGADR (released split), IDRiD, EyePACS; lesion segmentation on FGADR and IDRiD (100 ep by default; DRG-Net used 1500 / 2500); resumes from Drive checkpoints after a disconnect; test-set metrics summary | dataset zips on Drive (IDRiD "A. Segmentation" for IDRiD seg) |
+| 11 | `11_module1_drgnet_replication_colab` | **new** -- DRG-Net's own Module 1 runs, one model per dataset as in their repo: grading on FGADR (released split), IDRiD, EyePACS; lesion segmentation on FGADR and IDRiD (100 / 1000 ep by default; DRG-Net used 1500 / 2500); resumes from Drive checkpoints after a disconnect; test-set metrics summary | dataset zips on Drive (IDRiD "A. Segmentation" for IDRiD seg) |
 | 10 | `10_generate_progression_to_pdr_colab` | **new** -- any fundus image(s) -> Module 1 grade -> cascade to stage 4 (PDR), saves per-stage images/figure/JSON | 02, 03, 06 (07 optional) |
 
 **`MODULE1_SOURCE`** (first code cell of 04_05 and 06-10, default `'drgnet'`) picks which Module 1
@@ -130,7 +139,7 @@ with it `False` is an optional ablation that shows whether the EyePACS pretraini
 ```bash
 # --input can be one image or a folder; --start-stage N forces a known grade
 python generate_progression.py --input ./my_fundus.jpg \
-    --generator-checkpoint .../final-G.ckpt --classifier-checkpoint .../final_weights.pt \
+    --generator-checkpoint .../best-G.ckpt --classifier-checkpoint .../final_weights.pt \
     --seg-checkpoint EX=... --seg-checkpoint MA=... --seg-checkpoint HE=... --seg-checkpoint SE=... \
     --end-stage 4 --out-dir ./progression_outputs/
 ```

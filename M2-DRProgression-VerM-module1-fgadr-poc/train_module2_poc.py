@@ -34,6 +34,14 @@ change:
      which were pretrained on a large cross-sectional graded set (EyePACS) to learn stage
      appearance + per-stage biomarkers. This script is then the longitudinal fine-tuning stage.
      Architecture args (image_size, conv dims, repeat nums, style_dim) must match the pretrain.
+  8. Best-epoch saving: val_fraction (default 0.1) of the eyes/patients of each source are held
+     out (combined_dataset.get_combined_train_val_loaders -- split by eye/patient, never seen in
+     training). After every epoch G is scored on them by mean L1 between its synthesized
+     follow-up and the real (registered) follow-up -- the same quantity the reconstruction loss
+     trains on, measured on unseen pairs. The lowest-scoring epoch's weights are written to
+     best-G.ckpt (use this one downstream); final-G.ckpt stays the last epoch. The end-of-run
+     PSNR/SSIM/FID/KID are computed for best-G on the held-out pairs. --val-fraction 0 restores
+     the old behaviour (all pairs train, no best-G.ckpt, metrics on training pairs).
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -63,7 +71,7 @@ from torchvision.utils import save_image
 
 sys.path.insert(0, "./DRForestGAN-v2")
 from base_model import Generator, Discriminator  # noqa: E402
-from combined_dataset import get_combined_loader  # noqa: E402
+from combined_dataset import get_combined_loader, get_combined_train_val_loaders  # noqa: E402
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
@@ -85,6 +93,7 @@ class Config:
     init_discriminator_path = None
     resume_state_path = None  # optional -- per-epoch resume file (see resume_utils.py)
     seed = 0  # fixes weight init / shuffling / augmentation so runs are reproducible
+    val_fraction = 0.1  # eyes/patients held out for best-epoch selection (docstring point 8)
 
     # Model
     g_conv_dim = 64
@@ -140,6 +149,29 @@ def denorm(x):
     return ((x + 1) / 2).clamp_(0, 1)
 
 
+@torch.no_grad()
+def validation_l1(G, loader, device):
+    """Mean per-pixel L1 between G's synthesized follow-up and the real follow-up over every
+    held-out pair -- the best-epoch selection score (lower is better), on the same [-1, 1]
+    scale as the training reconstruction loss so the two curves compare directly. Also returns
+    PSNR from the same pass (images in [0, 1])."""
+    G.eval()
+    l1_sum = mse_sum = 0.0
+    n_px = 0
+    for batch in loader:
+        x_real = torch.cat([batch["baseline"].to(device), batch["mask"].to(device)], dim=1)
+        fake = G(x_real, batch["target_grade"].to(device))
+        real = batch["follow_up"].to(device)
+        l1_sum += float((fake - real).abs().sum())
+        mse_sum += float(((denorm(fake) - denorm(real)) ** 2).sum())
+        n_px += real.numel()
+    G.train()
+    if not n_px:
+        return None, None
+    mse = mse_sum / n_px
+    return l1_sum / n_px, float(10 * torch.log10(torch.tensor(1.0 / max(mse, 1e-10))))
+
+
 def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50, n_bootstrap=10):
     """
     FID/PSNR/SSIM between synthesized follow-ups and real follow-ups, over a handful of
@@ -148,11 +180,9 @@ def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=
     torch-fidelity (pip install torchmetrics torch-fidelity on Colab -- FID specifically
     needs the latter, PSNR/SSIM don't).
 
-    Note on what "held-out" means here: `loader` is the SAME shuffled loader used for
-    training, not a separate validation split (get_combined_loader/combined_dataset.py don't
-    do a train/val split) -- this evaluates on a random slice of in-sample data, not a true
-    held-out set. Framed honestly rather than silently as "held-out" (see
-    IMPLEMENTATION_PLAN_3.md Task L).
+    Note on what "held-out" means here: train() passes the held-out val loader (eyes/patients
+    never trained on, see docstring point 8). Only with --val-fraction 0 is it the training
+    loader, i.e. a random slice of in-sample data, not a true held-out set.
 
     FID/KID: see image_quality_metrics.py's own docstring for why feature=2048 is used
     (matching DRForecastGAN's assumed convention) despite being a biased small-N estimator,
@@ -229,7 +259,7 @@ def train(config: Config):
     os.makedirs(config.sample_dir, exist_ok=True)
 
     print("\n[1/4] Loading combined dataset (with real Module 1 conditioning where cached)...")
-    loader, num_pairs = get_combined_loader(
+    data_kwargs = dict(
         fire_dir=config.fire_dir,
         longdr_dir=config.longdr_dir,
         tianjin_dir=config.tianjin_dir,
@@ -243,6 +273,16 @@ def train(config: Config):
         registration_cache_path=config.registration_cache_path,
         num_workers=config.num_workers,
     )
+    val_loader, split_info = None, None
+    if config.val_fraction > 0:
+        loader, val_loader, split_info = get_combined_train_val_loaders(
+            **data_kwargs, val_fraction=config.val_fraction, seed=config.seed)
+        num_pairs = split_info["num_pairs"]
+        if not split_info["n_val_pairs"]:
+            print("⚠ No held-out pairs (too few eyes/patients) -- best-epoch selection off")
+            val_loader = None
+    else:
+        loader, num_pairs = get_combined_loader(**data_kwargs)
     print(f"✓ Real pairs: {num_pairs}, effective samples: {len(loader.dataset)}, batches/epoch: {len(loader)}")
 
     print("\n[2/4] Initializing models...")
@@ -273,6 +313,10 @@ def train(config: Config):
     start_epoch, extra = load_resume_state(
         config.resume_state_path, {"G": G, "D": D}, {"g_opt": g_optimizer, "d_opt": d_optimizer}, device)
     loss_history = extra.get("loss_history", loss_history)
+    # Best-epoch tracking (docstring point 8). The best weights live in the resume state too, so
+    # a disconnect after the best epoch doesn't lose them (save_dir is on the runtime disk).
+    val_history = extra.get("val_history", [])
+    best = extra.get("best", {"epoch": None, "val_l1": float("inf"), "G": None})
 
     for epoch in range(start_epoch, config.num_epochs):
         epoch_g_loss = epoch_d_loss = epoch_rec_loss = 0
@@ -324,6 +368,16 @@ def train(config: Config):
             f"G_loss: {mean_g_loss:.4f} | Rec_loss: {mean_rec_loss:.4f} | "
             f"Elapsed: {elapsed / 60:.1f}min"
         )
+        if val_loader is not None:
+            val_l1, val_psnr = validation_l1(G, val_loader, device)
+            val_history.append({"epoch": epoch + 1, "val_l1": val_l1, "val_psnr": val_psnr})
+            is_best = val_l1 < best["val_l1"]
+            if is_best:
+                best = {"epoch": epoch + 1, "val_l1": val_l1,
+                        "G": {k: v.detach().cpu().clone() for k, v in G.state_dict().items()}}
+                torch.save(best["G"], os.path.join(config.save_dir, "best-G.ckpt"))
+            print(f"  val L1 {val_l1:.4f} | val PSNR {val_psnr:.2f} dB"
+                  + (" | ★ new best -> best-G.ckpt" if is_best else f" | best so far: epoch {best['epoch']}"))
 
         if (epoch + 1) % config.save_step == 0 or epoch == config.num_epochs - 1:
             G.eval()
@@ -339,14 +393,26 @@ def train(config: Config):
             torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
 
         save_resume_state(config.resume_state_path, epoch, {"G": G, "D": D},
-                          {"g_opt": g_optimizer, "d_opt": d_optimizer}, {"loss_history": loss_history})
+                          {"g_opt": g_optimizer, "d_opt": d_optimizer},
+                          {"loss_history": loss_history, "val_history": val_history, "best": best})
 
-    print(f"\n[4/4] Computing POC metrics (FID/PSNR/SSIM on {config.eval_batches} batches of the "
-          "training loader -- see compute_poc_metrics' docstring on why this is not a true "
-          "held-out split)...")
+    final_g_path = os.path.join(config.save_dir, "final-G.ckpt")
+    torch.save(G.state_dict(), final_g_path)  # last epoch
+    best_g_path = None
+    if best["G"] is not None:
+        best_g_path = os.path.join(config.save_dir, "best-G.ckpt")
+        torch.save(best["G"], best_g_path)  # rewritten here too in case this runtime is a resumed one
+        G.load_state_dict(best["G"])
+        print(f"\n✓ Best epoch: {best['epoch']} (val L1 {best['val_l1']:.4f}) -> {best_g_path}; "
+              f"final-G.ckpt = last epoch ({config.num_epochs})")
+    metrics_loader = val_loader if val_loader is not None else loader
+
+    print(f"\n[4/4] Computing POC metrics (FID/PSNR/SSIM on up to {config.eval_batches} batches of the "
+          + ("held-out val pairs, best-G" if val_loader is not None else
+             "training loader -- not held out, see compute_poc_metrics' docstring") + ")...")
     try:
         metrics = compute_poc_metrics(
-            G, loader, device, config.eval_batches, config.image_size,
+            G, metrics_loader, device, config.eval_batches, config.image_size,
             min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
         )
         if metrics["fid"] is not None:
@@ -363,9 +429,6 @@ def train(config: Config):
         print("⚠ torchmetrics/torch-fidelity not installed -- skipping FID/PSNR/SSIM "
               "(pip install torchmetrics torch-fidelity)")
         metrics = None
-
-    final_g_path = os.path.join(config.save_dir, "final-G.ckpt")
-    torch.save(G.state_dict(), final_g_path)
 
     results = {
         "num_epochs": config.num_epochs,
@@ -384,7 +447,15 @@ def train(config: Config):
         "init_discriminator_path": config.init_discriminator_path,
         "resumed_from_epoch": start_epoch,
         "seed": config.seed,
+        "val_fraction": config.val_fraction,
+        "split": split_info,
+        "best_epoch": best["epoch"],
+        "best_val_l1": best["val_l1"] if best["epoch"] else None,
+        "best_checkpoint": best_g_path,
+        "metrics_model": "best-G" if best_g_path else "final-G",
+        "metrics_on": "held-out val pairs" if val_loader is not None else "training pairs (not held out)",
         "metrics": metrics,
+        "val_history": val_history,
         "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
     }
@@ -392,7 +463,9 @@ def train(config: Config):
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"✓ Wrote {results_path}")
-    print(f"✓ Final Generator saved to {final_g_path}")
+    print(f"✓ Final (last-epoch) Generator saved to {final_g_path}")
+    if best_g_path:
+        print(f"✓ Best-epoch Generator saved to {best_g_path} <- use this one downstream")
 
 
 if __name__ == "__main__":
@@ -414,6 +487,9 @@ if __name__ == "__main__":
     parser.add_argument("--init-discriminator", default=None,
                          help="Optional D checkpoint to start from (final-D.ckpt from the pretrain)")
     parser.add_argument("--seed", type=int, default=Config.seed)
+    parser.add_argument("--val-fraction", type=float, default=Config.val_fraction,
+                         help="Fraction of eyes/patients held out for best-epoch selection "
+                              "(best-G.ckpt); 0 = train on everything, no best-G.ckpt")
     parser.add_argument("--resume-state", default=None,
                          help="Per-epoch resume file (put it on Drive). Re-running with the same "
                               "path continues after the last finished epoch.")
@@ -455,6 +531,7 @@ if __name__ == "__main__":
     cfg.init_discriminator_path = args.init_discriminator
     cfg.resume_state_path = args.resume_state
     cfg.seed = args.seed
+    cfg.val_fraction = args.val_fraction
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size

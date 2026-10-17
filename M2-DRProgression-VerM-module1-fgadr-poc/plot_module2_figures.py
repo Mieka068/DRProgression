@@ -111,6 +111,11 @@ def plot_loss_curves(poc_results_json: str, out_path: str):
     ax.plot(epochs, d_loss, label="D loss")
     ax.plot(epochs, g_loss, label="G loss (adv + rec)")
     ax.plot(epochs, rec_loss, label="G reconstruction (L1) loss")
+    val = {h["epoch"]: h["val_l1"] for h in results.get("val_history") or []}
+    if val:
+        ax.plot(list(val), list(val.values()), marker="s", ms=3, label="held-out val L1 (best-epoch score)")
+    if results.get("best_epoch"):
+        ax.axvline(results["best_epoch"], color="grey", ls="--", label=f"best epoch ({results['best_epoch']})")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title(f"Module 2 training loss (n_epochs={results.get('num_epochs')}, "

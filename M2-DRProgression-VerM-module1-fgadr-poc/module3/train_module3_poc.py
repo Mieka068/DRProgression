@@ -27,6 +27,13 @@ achieve with richer temporal data, not a target this number should match.
 POC scale: ImageNet-pretrained EfficientNet-B4 backbone (fine-tuned, not trained from scratch),
 reduced epochs, patient-level train/val split (see dataset.py::patient_level_split).
 
+Best-epoch saving: after every epoch the model's mean NLL on the held-out val patients is
+computed (the training loss, on unseen patients -- a proper scoring rule, steadier than AUROC on
+a small val set). The lowest-NLL epoch is written to best-model.ckpt (use this one downstream);
+final-model.ckpt stays the last epoch. The reported metrics are best-model's. Caveat: the val
+patients both pick the epoch and give the reported metrics, so those metrics are slightly
+optimistic -- there is no separate test split at this data size.
+
 Usage (Colab, after notebook 05 has built module1_outputs_tianjin.pt):
     python train_module3_poc.py \
         --tianjin-dir /content/data/retinal-dr-longitudinal \
@@ -75,6 +82,7 @@ def evaluate(model, loader, device):
 
     model.eval()
     all_probs, all_events = [], []
+    nll_sum, nll_n = 0.0, 0
     with torch.no_grad():
         for batch in loader:
             image = batch["baseline"].to(device)
@@ -84,6 +92,8 @@ def evaluate(model, loader, device):
             event = batch["event"]
 
             shape, scale = model(image, lbs_idx, baseline_grade)
+            nll_sum += float(weibull_current_status_nll(shape, scale, t, event.to(device))) * image.size(0)
+            nll_n += image.size(0)
             s_t = model.survival_function(shape, scale, t)
             prob_progression = (1 - s_t).cpu()
 
@@ -106,6 +116,7 @@ def evaluate(model, loader, device):
         "actual_progression_rate": actual_rate,
         "auroc": auroc,
         "brier_score": brier,
+        "nll": nll_sum / nll_n if nll_n else float("nan"),
     }
 
 
@@ -142,6 +153,9 @@ def train(config: Config):
     loss_history = []  # per-epoch {epoch, nll_loss} -- for the NLL-vs-epoch figure
     start_epoch, extra = load_resume_state(config.resume_state_path, {"model": model}, {"opt": optimizer}, device)
     loss_history = extra.get("loss_history", loss_history)
+    # Best-epoch tracking; best weights are kept in the resume state so a disconnect after the
+    # best epoch doesn't lose them (save_dir is on the runtime disk).
+    best = extra.get("best", {"epoch": None, "val_nll": float("inf"), "model": None})
     for epoch in range(start_epoch, config.num_epochs):
         epoch_loss = 0.0
         for batch in train_loader:
@@ -161,12 +175,30 @@ def train(config: Config):
 
         elapsed = time.time() - start_time
         avg_loss = epoch_loss / len(train_loader) if len(train_loader) else float("nan")
-        loss_history.append({"epoch": epoch + 1, "nll_loss": avg_loss})
-        print(f"Epoch [{epoch + 1}/{config.num_epochs}] | NLL: {avg_loss:.4f} | Elapsed: {elapsed / 60:.1f}min")
+        val_nll = evaluate(model, val_loader, device)["nll"] if len(val_set) else float("nan")
+        loss_history.append({"epoch": epoch + 1, "nll_loss": avg_loss, "val_nll": val_nll})
+        is_best = val_nll < best["val_nll"]  # False for nan (empty val set)
+        if is_best:
+            best = {"epoch": epoch + 1, "val_nll": val_nll,
+                    "model": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}}
+            torch.save(best["model"], os.path.join(config.save_dir, "best-model.ckpt"))
+        print(f"Epoch [{epoch + 1}/{config.num_epochs}] | NLL: {avg_loss:.4f} | val NLL: {val_nll:.4f}"
+              + (" ★ new best -> best-model.ckpt" if is_best else f" | best so far: epoch {best['epoch']}")
+              + f" | Elapsed: {elapsed / 60:.1f}min")
         save_resume_state(config.resume_state_path, epoch, {"model": model}, {"opt": optimizer},
-                          {"loss_history": loss_history})
+                          {"loss_history": loss_history, "best": best})
 
-    print("\n[4/4] Evaluating on held-out patients...")
+    ckpt_path = os.path.join(config.save_dir, "final-model.ckpt")
+    torch.save(model.state_dict(), ckpt_path)  # last epoch
+    best_path = None
+    if best["model"] is not None:
+        best_path = os.path.join(config.save_dir, "best-model.ckpt")
+        torch.save(best["model"], best_path)
+        model.load_state_dict(best["model"])
+        print(f"\n✓ Best epoch: {best['epoch']} (val NLL {best['val_nll']:.4f}) -> {best_path}; "
+              f"final-model.ckpt = last epoch ({config.num_epochs})")
+
+    print(f"\n[4/4] Evaluating {'best-model' if best_path else 'final-model'} on held-out patients...")
     metrics = evaluate(model, val_loader, device)
     print(
         f"✓ n={metrics['n']} | mean predicted P(progression by 2yr)="
@@ -175,13 +207,15 @@ def train(config: Config):
         f"Brier={metrics['brier_score']:.4f}"
     )
 
-    ckpt_path = os.path.join(config.save_dir, "final-model.ckpt")
-    torch.save(model.state_dict(), ckpt_path)
     results = {
         "num_epochs": config.num_epochs,
         "n_train": len(train_set),
         "n_val": len(val_set),
         "tianjin_module1_cache_path": config.tianjin_module1_cache_path,
+        "best_epoch": best["epoch"],
+        "best_val_nll": best["val_nll"] if best["epoch"] else None,
+        "best_checkpoint": best_path,
+        "metrics_model": "best-model" if best_path else "final-model",
         "metrics": metrics,
         "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
@@ -200,7 +234,9 @@ def train(config: Config):
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"✓ Wrote {results_path}")
-    print(f"✓ Final model saved to {ckpt_path}")
+    print(f"✓ Final (last-epoch) model saved to {ckpt_path}")
+    if best_path:
+        print(f"✓ Best-epoch model saved to {best_path} <- use this one downstream")
 
 
 if __name__ == "__main__":

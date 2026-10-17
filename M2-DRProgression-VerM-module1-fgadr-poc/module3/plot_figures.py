@@ -147,10 +147,17 @@ def plot_nll_vs_epoch(poc_results_json, out_path):
     nll = [h["nll_loss"] for h in history]
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(epochs, nll, marker="o")
+    ax.plot(epochs, nll, marker="o", label="train")
+    val = [h.get("val_nll") for h in history]
+    if any(v is not None for v in val):
+        ax.plot(epochs, val, marker="s", label="held-out val")
+    if results.get("best_epoch"):
+        ax.axvline(results["best_epoch"], color="grey", ls="--", label=f"best epoch ({results['best_epoch']})")
+    if ax.get_legend_handles_labels()[0][1:]:
+        ax.legend()
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Current-status Weibull NLL")
-    ax.set_title("Module 3 training loss vs. epoch")
+    ax.set_title("Module 3 loss vs. epoch")
     ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
