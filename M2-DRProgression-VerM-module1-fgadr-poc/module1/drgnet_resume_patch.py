@@ -29,6 +29,14 @@ dr_segmentation/train_fgadr.py (FGADR) and train.py (IDRiD) -- DRG-Net saves mod
     * eval interval from DRG_SEG_EVAL_EVERY (default = DRG-Net's 20 for FGADR, 40 for IDRiD).
   The training step, loss, data, and augmentation are untouched.
 
+dr_segmentation/train.py + utils.py -- also reused for DDR (same layout as IDRiD, see
+  module1/dataprep/prepare_ddr_segmentation.py). Separate patch marker, so it also applies to a
+  clone that already has the resume patch. Env-driven, defaults = DRG-Net's behaviour:
+    * DRG_SEG_RUN_PREFIX (default 'new_'): checkpoints in results/<prefix>models_<lesion>/ and the
+      AP log <prefix>ap_during_learning_*.txt -- 'ddr_' keeps DDR runs apart from IDRiD's;
+    * DRG_SEG_TRAIN_RATIO (default 0.8): train/eval cut of the sorted TrainingSet -- DDR's prep
+      sorts its official train images before its val images and writes the exact ratio.
+
 Usage:  python module1/drgnet_resume_patch.py /content/dr-joint-learning
 """
 import os
@@ -37,9 +45,9 @@ import sys
 MARK = "# [resume patch]"
 
 
-def _patch(path, edits):
+def _patch(path, edits, mark=MARK):
     src = open(path).read()
-    if MARK in src:
+    if mark in src:
         print(f"= {os.path.relpath(path)} already patched")
         return
     for old, new in edits:
@@ -142,6 +150,22 @@ def seg_edits(eval_every, save_anchor):
     ]
 
 
+DATASET_MARK = "# [dataset patch]"
+SEG_DATASET_EDITS = [
+    ("    dir_checkpoint = 'results/new_models_' + lesion.lower()\n",
+     "    dir_checkpoint = 'results/' + os.environ.get('DRG_SEG_RUN_PREFIX', 'new_') + 'models_' + lesion.lower()"
+     "  # [dataset patch]\n"),
+    ('            with open("new_ap_during_learning_" + lesion + preprocess + ".txt", \'a\') as f:\n',
+     "            with open(os.environ.get('DRG_SEG_RUN_PREFIX', 'new_') + 'ap_during_learning_' + lesion + preprocess"
+     " + '.txt', 'a') as f:  # [dataset patch]\n"),
+]
+UTILS_DATASET_EDITS = [
+    ("train_ratio = 0.8\neval_ratio = 0.2\n",
+     "train_ratio = float(os.environ.get('DRG_SEG_TRAIN_RATIO', 0.8))  # [dataset patch]\n"
+     "eval_ratio = 1 - train_ratio\n"),
+]
+
+
 def apply(drg_root):
     _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_EDITS)
     _patch(os.path.join(drg_root, "dr_segmentation", "train_fgadr.py"), seg_edits(
@@ -152,6 +176,8 @@ def apply(drg_root):
     ])
     _patch(os.path.join(drg_root, "dr_segmentation", "train.py"), seg_edits(
         40, "        logger.flush()\n        logger.flush()\n"))
+    _patch(os.path.join(drg_root, "dr_segmentation", "train.py"), SEG_DATASET_EDITS, DATASET_MARK)
+    _patch(os.path.join(drg_root, "dr_segmentation", "utils.py"), UTILS_DATASET_EDITS, DATASET_MARK)
 
 
 if __name__ == "__main__":

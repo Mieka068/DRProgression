@@ -3,7 +3,7 @@
 # Copy of DRG-Net's dr_segmentation/config.py (pinned commit
 # 0da1bbe885f438390a0e94ec486283d9b21d5547) -- the config of their IDRiD segmentation run
 # (dr_segmentation/train.py and evaluate_model.py both `import config`). Only IMAGE_DIR,
-# EPOCHES and RESUME_MODEL changed.
+# EPOCHES and RESUME_MODEL changed (IMAGE_DIR also overridable, for DDR).
 #
 # Colab usage: copy over dr_segmentation/config.py, after
 # module1/dataprep/prepare_idrid_segmentation.py has laid IDRiD's segmentation set out at
@@ -17,7 +17,9 @@ import os
 LESION_IDS = {'EX': 0, 'HE': 1, 'MA': 2, 'SE': 3, 'SG': 4}
 
 # Modify the general parameters.
-IMAGE_DIR = '/content/data/IDRiD_seg_drgnet/'
+# DRG_SEG_IMAGE_DIR: the same config serves DDR (notebook 11 points it at the DDR layout from
+# module1/dataprep/prepare_ddr_segmentation.py); unset = IDRiD.
+IMAGE_DIR = os.environ.get('DRG_SEG_IMAGE_DIR', '/content/data/IDRiD_seg_drgnet/')
 NET_NAME = 'unet'
 IMAGE_SIZE = 512
 
