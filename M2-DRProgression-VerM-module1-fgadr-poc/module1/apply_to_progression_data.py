@@ -144,6 +144,17 @@ def main():
     parser.add_argument("--out", required=True, help="Output cache path, e.g. module1_outputs_fire.pt")
     parser.add_argument("--limit", type=int, default=None, help="Only process first N images (debug)")
     parser.add_argument("--dry-run", action="store_true", help="Random-init weights, no checkpoints needed")
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=50,
+        help="Save the cache to --out every N images (0 disables). Protects a long run against "
+             "a lost Colab session or Ctrl-C -- without this, torch.save only happened once at "
+             "the very end, so any interruption lost the entire run's work.",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="If --out already exists, load it first and skip image_ids already present in it "
+             "instead of reprocessing them from scratch.",
+    )
     args = parser.parse_args()
 
     if not args.dry_run and not args.classifier_checkpoint:
@@ -175,9 +186,19 @@ def main():
         image_files = image_files[: args.limit]
 
     cache = {}
+    if args.resume and os.path.isfile(args.out):
+        # weights_only=False: this cache is our own trusted output (dict of numpy arrays +
+        # python scalars), not an external checkpoint -- PyTorch >=2.6 defaults to
+        # weights_only=True, which rejects the numpy globals in it.
+        cache = torch.load(args.out, weights_only=False)
+        print(f"↻ resuming: {len(cache)} entries already in {args.out}, skipping those image_ids")
+
+    processed_since_save = 0
     for relpath in image_files:
-        image_path = os.path.join(args.images_dir, relpath)
         image_id = os.path.splitext(relpath)[0].replace(os.sep, "__")
+        if args.resume and image_id in cache:
+            continue
+        image_path = os.path.join(args.images_dir, relpath)
         try:
             result = process_image(image_path, classifier, seg_models, device=device)
             cache[image_id] = {
@@ -192,6 +213,13 @@ def main():
             )
         except Exception as e:
             print(f"⚠ {image_id}: failed ({e})")
+            continue
+
+        processed_since_save += 1
+        if args.checkpoint_every and processed_since_save >= args.checkpoint_every:
+            torch.save(cache, args.out)
+            processed_since_save = 0
+            print(f"  ↳ checkpointed {len(cache)} entries to {args.out}")
 
     torch.save(cache, args.out)
     print(f"✓ wrote {len(cache)} entries to {args.out}")

@@ -71,9 +71,12 @@ def plot_per_step_quality(trajectory_eval_json: str, out_path: str):
     if fid_vals:
         ranges = [r for s, r, v in zip(step_nums, fid_ranges, fid) if v is not None]
         if all(r is not None for r in ranges):
+            # FID is a biased small-N estimator (see docstring above), so the bootstrap range
+            # can land on the other side of the point estimate -- clip to 0 rather than error
+            # out, matplotlib's errorbar rejects negative yerr.
             fid_yerr = [
-                [v - r[0] for v, r in zip(fid_vals, ranges)],
-                [r[1] - v for v, r in zip(fid_vals, ranges)],
+                [max(0.0, v - r[0]) for v, r in zip(fid_vals, ranges)],
+                [max(0.0, r[1] - v) for v, r in zip(fid_vals, ranges)],
             ]
         ax2.errorbar(fid_steps, fid_vals, yerr=fid_yerr, marker="^", color="tab:red",
                      label="FID (95% bootstrap range)" if fid_yerr else "FID", capsize=3)
