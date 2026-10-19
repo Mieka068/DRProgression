@@ -44,11 +44,13 @@ def _rng_state():
 
 
 def _set_rng_state(state):
+    # torch needs the RNG states as CPU ByteTensors; load_resume_state's map_location=<cuda device>
+    # moves every tensor in the file to the GPU, so bring them back first.
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(state["torch"].cpu())
     if state.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
 
 
 def save_resume_state(path, epoch, models, optimizers, extra=None, num_epochs=None):
