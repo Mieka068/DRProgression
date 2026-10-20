@@ -423,7 +423,7 @@ def module2_finetune():
             linespacing=1.25)
     path(ax, [(23, 44), (34, 44)], color="black")
     label(ax, 23.5, 46, "concat, 4+c_dim ch", size=7, family=F, style="normal")
-    box(ax, 2, 22, 19, 7, None, "c  target stage, one-hot\n(= follow-up grade)", "white", "black", ssize=7.4,
+    box(ax, 2, 22, 19, 7, None, "c  stage, one-hot\n(currently the baseline grade)", "white", "black", ssize=7.4,
         family=F, r=1.2)
     path(ax, [(21, 25.5), (29, 25.5), (29, 40), (34, 40)], color="black")
     ax.add_patch(FancyArrowPatch((12, 22), (36, 36), connectionstyle="arc3,rad=0.45", arrowstyle="-|>",
