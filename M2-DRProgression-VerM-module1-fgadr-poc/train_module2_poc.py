@@ -16,8 +16,11 @@ change:
      the 50 epochs train_fire.py/train_combined.py use, so a full run finishes and produces
      samples/metrics in a single session.
   3. Optimizer settings are changed FROM train_combined.py's existing (lr=1e-4, β1=0.5,
-     β2=0.999) TO lr=2e-4, β1=0.0, β2=0.9, matching DRForecastGAN's reported Adam
-     hyperparameters.
+     β2=0.999) TO β1=0.0, β2=0.9 (DRForecastGAN's reported Adam betas). Stability (CODE_FIXES
+     section 3): lr 1e-4 for both G and D (critic lr <= generator lr; 2e-4 before), n_critic = 5
+     (DRForecastGAN's released main.py default and the WGAN-GP standard -- G is updated once per 5
+     D steps; it was 1), batch size 8 (was 4). --g-lr/--d-lr 2e-4 --n-critic 1 --batch-size 4 =
+     the earlier settings. With n_critic 5 an epoch has ~5x fewer G steps (logged as g_steps).
   4. At the end of training, computes FID/PSNR/SSIM (torchmetrics + torch-fidelity) between
      synthesized and real follow-up images on a held-out slice of the loader -- small/short-run
      numbers, not a claim of matching DRForecastGAN's published benchmark
@@ -96,7 +99,7 @@ class Config:
     longdr_dir = "./LongDRScreening_20150209"
     tianjin_dir = None  # optional -- e.g. "./retinal-dr-longitudinal"; None skips Tianjin
     image_size = 128
-    batch_size = 4
+    batch_size = 8  # was 4 (docstring point 3)
     augment = True
     num_workers = 0
     fire_module1_cache_path = None
@@ -122,13 +125,13 @@ class Config:
 
     # Training -- POC-scale (5 epochs). See module docstring point 2.
     num_epochs = 5
-    # Adam settings matching DRForecastGAN's reported hyperparameters, overriding
-    # train_combined.py's own defaults (1e-4, 0.5, 0.999) -- see docstring point 3.
-    g_lr = 0.0002
-    d_lr = 0.0002
+    # Adam betas matching DRForecastGAN's reported hyperparameters; lr 1e-4 (critic <= generator)
+    # and n_critic 5 for stability -- see docstring point 3.
+    g_lr = 0.0001
+    d_lr = 0.0001
     beta1 = 0.0
     beta2 = 0.9
-    n_critic = 1
+    n_critic = 5
 
     lambda_rec = 10.0
     lambda_adv = 1.0
@@ -338,9 +341,11 @@ def train(config: Config):
     # a disconnect after the best epoch doesn't lose them (save_dir is on the runtime disk).
     val_history = extra.get("val_history", [])
     best = extra.get("best", {"epoch": None, "val_l1": float("inf"), "G": None})
+    g_steps = loss_history[-1].get("g_steps", 0) if loss_history else 0
 
     for epoch in range(start_epoch, config.num_epochs):
         epoch_g_loss = epoch_d_loss = epoch_rec_loss = epoch_cls_loss = 0
+        n_g = 0  # G steps this epoch (1 per n_critic batches)
         for i, batch in enumerate(loader):
             baseline = batch["baseline"].to(device)
             follow_up = batch["follow_up"].to(device)
@@ -384,19 +389,22 @@ def train(config: Config):
 
                 epoch_g_loss += g_loss.item()
                 epoch_rec_loss += g_loss_rec.item()
+                n_g += 1
+                g_steps += 1
             epoch_d_loss += d_loss.item()
 
         elapsed = time.time() - start_time
+        # G losses are means over the epoch's G steps, D loss over its batches (n_critic > 1).
         mean_d_loss = epoch_d_loss / len(loader)
-        mean_g_loss = epoch_g_loss / len(loader)
-        mean_rec_loss = epoch_rec_loss / len(loader)
+        mean_g_loss = epoch_g_loss / max(n_g, 1)
+        mean_rec_loss = epoch_rec_loss / max(n_g, 1)
         loss_history.append({
             "epoch": epoch + 1, "d_loss": mean_d_loss, "g_loss": mean_g_loss, "rec_loss": mean_rec_loss,
-            "g_cls_loss": epoch_cls_loss / len(loader),
+            "g_cls_loss": epoch_cls_loss / max(n_g, 1), "g_steps": g_steps,
         })
         print(
             f"Epoch [{epoch + 1}/{config.num_epochs}] | D_loss: {mean_d_loss:.4f} | "
-            f"G_loss: {mean_g_loss:.4f} | Rec_loss: {mean_rec_loss:.4f} | "
+            f"G_loss: {mean_g_loss:.4f} | Rec_loss: {mean_rec_loss:.4f} | G steps: {g_steps} | "
             f"Elapsed: {elapsed / 60:.1f}min"
         )
         if val_loader is not None:
@@ -470,6 +478,8 @@ def train(config: Config):
         "d_lr": config.d_lr,
         "beta1": config.beta1,
         "beta2": config.beta2,
+        "n_critic": config.n_critic,
+        "batch_size": config.batch_size,
         "lambda_cls": config.lambda_cls,
         "fire_module1_cache_path": config.fire_module1_cache_path,
         "longdr_module1_cache_path": config.longdr_module1_cache_path,
@@ -531,6 +541,11 @@ if __name__ == "__main__":
     parser.add_argument("--progress-fraction", type=float, default=Config.progress_fraction,
                          help="Oversample progressing pairs to this share of training samples "
                               "(0 = uniform shuffle, the earlier behaviour)")
+    parser.add_argument("--g-lr", type=float, default=Config.g_lr)
+    parser.add_argument("--d-lr", type=float, default=Config.d_lr,
+                         help="Critic learning rate; keep <= --g-lr")
+    parser.add_argument("--n-critic", type=int, default=Config.n_critic,
+                         help="D steps per G step (5 = WGAN-GP standard; 1 = earlier behaviour)")
     parser.add_argument("--lambda-cls", type=float, default=Config.lambda_cls,
                          help="Stage classification loss weight (D on real follow-ups with clinical "
                               "grades, G on its outputs vs target_grade); 0 = off (earlier behaviour)")
@@ -579,6 +594,9 @@ if __name__ == "__main__":
     cfg.condition_on = args.condition_on
     cfg.progress_fraction = args.progress_fraction
     cfg.lambda_cls = args.lambda_cls
+    cfg.g_lr, cfg.d_lr, cfg.n_critic = args.g_lr, args.d_lr, args.n_critic
+    if cfg.d_lr > cfg.g_lr:
+        print(f"⚠ --d-lr {cfg.d_lr} > --g-lr {cfg.g_lr}: the critic usually needs lr <= the generator's")
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size

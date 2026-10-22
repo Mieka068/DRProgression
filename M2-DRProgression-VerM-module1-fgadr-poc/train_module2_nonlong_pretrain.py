@@ -95,14 +95,16 @@ class Config:
     g_repeat_num = 6
     d_repeat_num = 6
 
-    # Training. Adam settings match train_module2_poc.py (DRForecastGAN's reported values).
+    # Training. Adam betas match train_module2_poc.py (DRForecastGAN's reported values). Stability
+    # (CODE_FIXES section 3): lr 1e-4 for G and D (critic <= generator; was 2e-4) and n_critic 5
+    # (WGAN-GP standard / DRForecastGAN's main.py; was 1) -- --g-lr/--d-lr 2e-4 --n-critic 1 = earlier.
     num_epochs = 20
-    g_lr = 0.0002
-    d_lr = 0.0002
+    g_lr = 0.0001
+    d_lr = 0.0001
     r_lr = 0.0002
     beta1 = 0.0
     beta2 = 0.9
-    n_critic = 1
+    n_critic = 5
 
     lambda_adv = 1.0
     lambda_gp = 10.0
@@ -322,6 +324,7 @@ def train(config):
     models, opts = {"G": G, "D": D, "R": R}, {"g_opt": g_opt, "d_opt": d_opt, "r_opt": r_opt}
     start_epoch, extra = load_resume_state(config.resume_state_path, models, opts, device)
     history = extra.get("history", [])
+    g_steps = history[-1].get("g_steps", 0) if history else 0  # G updates so far (1 per n_critic batches)
     for epoch in range(start_epoch, config.num_epochs):
         bio_on = use_bio and epoch >= config.bio_warmup_epochs
         sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, bio=0.0, mono=0.0, r=0.0)
@@ -384,13 +387,15 @@ def train(config):
                 n_g += 1
 
         nb = max(len(train_loader), 1)
-        rec_ = {"epoch": epoch + 1, "d_loss": sums["d"] / nb, "r_loss": sums["r"] / nb,
+        g_steps += n_g
+        rec_ = {"epoch": epoch + 1, "d_loss": sums["d"] / nb, "r_loss": sums["r"] / nb, "g_steps": g_steps,
                 **{f"g_{k}": sums[k] / max(n_g, 1) for k in ("g", "cls", "cyc", "bio", "mono")},
                 "biomarker_losses_on": bio_on}
         history.append(rec_)
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] D {rec_['d_loss']:.3f} | G {rec_['g_g']:.3f} "
               f"(cls {rec_['g_cls']:.3f}, cyc {rec_['g_cyc']:.3f}, bio {rec_['g_bio']:.3f}, "
-              f"mono {rec_['g_mono']:.3f}) | R {rec_['r_loss']:.3f} | {(time.time() - start) / 60:.1f}min")
+              f"mono {rec_['g_mono']:.3f}) | R {rec_['r_loss']:.3f} | G steps {g_steps} | "
+              f"{(time.time() - start) / 60:.1f}min")
 
         val_batch = next(iter(val_loader), None)
         if val_batch is not None:
@@ -417,6 +422,7 @@ def train(config):
         "num_epochs": config.num_epochs, "image_size": config.image_size,
         "lambdas": {k: getattr(config, k) for k in dir(config) if k.startswith("lambda_")},
         "bio_margin": config.bio_margin, "p_adjacent": config.p_adjacent, "seed": config.seed,
+        "g_lr": config.g_lr, "d_lr": config.d_lr, "n_critic": config.n_critic, "batch_size": config.batch_size,
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
     }
@@ -445,6 +451,9 @@ if __name__ == "__main__":
     p.add_argument("--max-per-grade", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=Config.num_workers)
     p.add_argument("--eval-batches", type=int, default=Config.eval_batches)
+    p.add_argument("--g-lr", type=float, default=Config.g_lr)
+    p.add_argument("--d-lr", type=float, default=Config.d_lr, help="Critic learning rate; keep <= --g-lr")
+    p.add_argument("--n-critic", type=int, default=Config.n_critic, help="D steps per G step (1 = earlier)")
     for name in ("lambda_cls", "lambda_cyc", "lambda_id", "lambda_bio", "lambda_mono", "bio_margin", "p_adjacent"):
         p.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(Config, name))
     p.add_argument("--bio-warmup-epochs", type=int, default=Config.bio_warmup_epochs)
