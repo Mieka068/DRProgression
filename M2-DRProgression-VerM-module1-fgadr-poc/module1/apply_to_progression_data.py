@@ -83,6 +83,112 @@ def apply_classifier_norm_args(args):
 
 ALL_LESIONS = ["EX", "HE", "MA", "SE"]
 
+# Lesion segmentation at the scale the U-Nets were trained on (CODE_FIXES item 1.1). DRG-Net trains
+# its U-Nets on random 512x512 crops of ~1280 px FGADR images and evaluates by tiling
+# (dr_segmentation/train.py::eval_model, pinned commit 0da1bbe); resizing a whole fundus image to
+# 512x512 instead shrinks every lesion 2-3x below what the models saw in training. 'tiled' (default)
+# resizes the retina to SEG_RETINA_SIZE px across, runs the U-Net on overlapping SEG_TILE x SEG_TILE
+# patches (stride SEG_STRIDE, soft outputs averaged where patches overlap), stitches, and only then
+# thresholds. 'resize' is the earlier whole-image 512x512 behaviour, kept for before/after runs.
+# Module-level like the classifier normalisation, so process_image() callers
+# (trajectory_inference.py, generate_progression.py, evaluate_segmentation_dice_iou.py) share it.
+SEG_MODE = "tiled"
+SEG_RETINA_SIZE = 1280
+SEG_TILE = 512
+SEG_STRIDE = 384
+SEG_TILE_BATCH = 4
+# Crop to the retina's bounding box (square-padded) before resizing/tiling, for both the grader and
+# the segmenters (item 1.2), so black borders / off-centre fields of view don't change the lesion
+# scale; masks are mapped back to the original image coordinates (LBS is computed there).
+RETINA_CROP = True
+
+
+def set_seg_inference(mode="tiled", retina_size=1280, tile=512, stride=384, retina_crop=True, tile_batch=4):
+    global SEG_MODE, SEG_RETINA_SIZE, SEG_TILE, SEG_STRIDE, RETINA_CROP, SEG_TILE_BATCH
+    if mode not in ("tiled", "resize"):
+        raise ValueError(f"seg mode must be 'tiled' or 'resize', not {mode!r}")
+    if mode == "tiled" and not 0 < stride <= tile <= retina_size:
+        raise ValueError(f"need 0 < stride ({stride}) <= tile ({tile}) <= retina size ({retina_size})")
+    SEG_MODE, SEG_RETINA_SIZE, SEG_TILE, SEG_STRIDE = mode, retina_size, tile, stride
+    RETINA_CROP, SEG_TILE_BATCH = retina_crop, tile_batch
+    print(f"Lesion segmentation: {mode}" + (f" (retina {retina_size} px, {tile} px tiles, stride {stride})"
+                                           if mode == "tiled" else " (whole image -> 512x512)")
+          + f" | retina crop: {'on' if retina_crop else 'off'}")
+
+
+def add_seg_inference_args(parser):
+    parser.add_argument("--seg-mode", choices=["tiled", "resize"], default=SEG_MODE,
+                        help="tiled (default): segment at the training scale with overlapping tiles; "
+                             "resize: earlier behaviour, whole image resized to 512x512")
+    parser.add_argument("--seg-retina-size", type=int, default=SEG_RETINA_SIZE,
+                        help="Retina diameter (px) the image is resized to before tiling (FGADR ~1280)")
+    parser.add_argument("--seg-tile", type=int, default=SEG_TILE)
+    parser.add_argument("--seg-stride", type=int, default=SEG_STRIDE)
+    parser.add_argument("--seg-tile-batch", type=int, default=SEG_TILE_BATCH,
+                        help="Tiles per U-Net forward pass (lower if the GPU runs out of memory)")
+    parser.add_argument("--no-retina-crop", action="store_true",
+                        help="Don't crop to the retina before grading/segmenting (earlier behaviour)")
+
+
+def apply_seg_inference_args(args):
+    set_seg_inference(args.seg_mode, args.seg_retina_size, args.seg_tile, args.seg_stride,
+                      retina_crop=not args.no_retina_crop, tile_batch=args.seg_tile_batch)
+
+
+def retina_box(rgb: np.ndarray, threshold: int = 10):
+    """
+    Square (left, top, right, bottom) box around the retina's field of view, centred on it and as
+    wide as its larger side -- it may reach past the image edge (PIL's crop pads with black there).
+    Rows/columns with only a few above-threshold pixels (JPEG noise, text overlays in the black
+    border) are ignored. None if no clear field of view is found (the whole image is used then).
+    """
+    fov = estimate_retinal_fov_mask(rgb, threshold)
+    rows, cols = fov.sum(axis=1), fov.sum(axis=0)
+    if fov.sum() < 0.05 * fov.size:
+        return None
+    ys = np.nonzero(rows > 0.02 * rows.max())[0]
+    xs = np.nonzero(cols > 0.02 * cols.max())[0]
+    y0, y1, x0, x1 = ys[0], ys[-1] + 1, xs[0], xs[-1] + 1
+    side = int(max(y1 - y0, x1 - x0))
+    left = int(round((x0 + x1) / 2 - side / 2))
+    top = int(round((y0 + y1) / 2 - side / 2))
+    return left, top, left + side, top + side
+
+
+def _load_rgb(image):
+    return image.convert("RGB") if isinstance(image, Image.Image) else Image.open(image).convert("RGB")
+
+
+def _crop(img: Image.Image, box):
+    return img if box is None else img.crop(box)
+
+
+def _uncrop(arr: np.ndarray, box, orig_size):
+    """Place a crop-sized map back into the original (W, H) image frame (zeros outside the crop)."""
+    if box is None:
+        return arr
+    w, h = orig_size
+    left, top, right, bottom = box
+    out = np.zeros((h, w), dtype=arr.dtype)
+    sx0, sy0 = max(0, -left), max(0, -top)
+    dx0, dy0 = max(0, left), max(0, top)
+    dx1, dy1 = min(w, right), min(h, bottom)
+    if dx1 > dx0 and dy1 > dy0:
+        out[dy0:dy1, dx0:dx1] = arr[sy0:sy0 + (dy1 - dy0), sx0:sx0 + (dx1 - dx0)]
+    return out
+
+
+def _tile_starts(size, tile, stride):
+    starts = list(range(0, size - tile + 1, stride))
+    if starts[-1] + tile < size:
+        starts.append(size - tile)
+    return starts
+
+
+def _resize_soft(soft: np.ndarray, size):
+    """Bilinear resize of a float probability map to (W, H)."""
+    return np.array(Image.fromarray(soft.astype(np.float32), mode="F").resize(size, Image.BILINEAR))
+
 
 def load_classifier(checkpoint_path, num_classes=5, device="cpu", dry_run=False):
     model = models.resnet50(weights=None)
@@ -107,7 +213,9 @@ def load_segmentation_model(checkpoint_path, device="cpu", dry_run=False):
 
 
 def predict_grade(model, image_path, image_size=512, mean=None, std=None, device="cpu",
-                   return_probs=False):
+                   return_probs=False, retina_crop=None, box="auto"):
+    """image_path: a path or PIL image. retina_crop None = the module-level RETINA_CROP; box is a
+    precomputed retina_box() (process_image computes it once per image), "auto" = compute it here."""
     mean = CLASSIFIER_MEAN if mean is None else mean
     std = CLASSIFIER_STD if std is None else std
     tfm = transforms.Compose(
@@ -117,7 +225,9 @@ def predict_grade(model, image_path, image_size=512, mean=None, std=None, device
             transforms.Normalize(mean=mean, std=std),
         ]
     )
-    img = Image.open(image_path).convert("RGB")
+    img = _load_rgb(image_path)
+    if RETINA_CROP if retina_crop is None else retina_crop:
+        img = _crop(img, retina_box(np.array(img)) if box == "auto" else box)
     x = tfm(img).unsqueeze(0).to(device)
     with torch.no_grad():
         logits = model(x)
@@ -128,17 +238,49 @@ def predict_grade(model, image_path, image_size=512, mean=None, std=None, device
     return grade
 
 
-def predict_lesion_mask(model, image_path, image_size=512, device="cpu"):
-    tfm = transforms.Compose([transforms.Resize((image_size, image_size)), transforms.ToTensor()])
-    img = Image.open(image_path).convert("RGB")
+def predict_lesion_soft(model, image_path, device="cpu", mode=None, image_size=512, retina_crop=None,
+                        box="auto"):
+    """
+    Lesion probability map (float32, HxW of the ORIGINAL image) from one U-Net, before
+    thresholding -- the soft output DRG-Net's eval_model scores AP/AUC on.
+    mode 'tiled' / 'resize' and the retina crop default to the module-level settings above
+    (SEG_MODE, RETINA_CROP); image_size is only used by 'resize'. image_path: a path or PIL image.
+    """
+    mode = SEG_MODE if mode is None else mode
+    img = _load_rgb(image_path)
     orig_size = img.size  # (W, H)
-    x = tfm(img).unsqueeze(0).to(device)
+    if not (RETINA_CROP if retina_crop is None else retina_crop):
+        box = None
+    elif box == "auto":
+        box = retina_box(np.array(img))
+    img = _crop(img, box)
+    crop_size = img.size
+    to_tensor = transforms.ToTensor()
     with torch.no_grad():
-        logits = model(x)
-        probs = torch.softmax(logits, dim=1)
-        mask = (probs[0, 1] > 0.5).cpu().numpy().astype(np.uint8)
-    mask_img = Image.fromarray(mask * 255).resize(orig_size, Image.NEAREST)
-    return (np.array(mask_img) > 0).astype(np.uint8)
+        if mode == "resize":
+            x = to_tensor(img.resize((image_size, image_size), Image.BILINEAR)).unsqueeze(0).to(device)
+            soft = torch.softmax(model(x), dim=1)[0, 1].cpu().numpy()
+        else:
+            size, tile = SEG_RETINA_SIZE, SEG_TILE
+            x = to_tensor(img.resize((size, size), Image.BILINEAR))
+            acc = torch.zeros(size, size)
+            cnt = torch.zeros(size, size)
+            starts = [(y, xx) for y in _tile_starts(size, tile, SEG_STRIDE) for xx in _tile_starts(size, tile, SEG_STRIDE)]
+            for b in range(0, len(starts), SEG_TILE_BATCH):
+                chunk = starts[b:b + SEG_TILE_BATCH]
+                batch = torch.stack([x[:, y:y + tile, xx:xx + tile] for y, xx in chunk]).to(device)
+                probs = torch.softmax(model(batch), dim=1)[:, 1].cpu()
+                for (y, xx), pr in zip(chunk, probs):
+                    acc[y:y + tile, xx:xx + tile] += pr
+                    cnt[y:y + tile, xx:xx + tile] += 1
+            soft = (acc / cnt).numpy()
+    soft = _resize_soft(soft, crop_size)
+    return _uncrop(soft, box, orig_size)
+
+
+def predict_lesion_mask(model, image_path, image_size=512, device="cpu", box="auto"):
+    """Binary (0/1 uint8) lesion mask at the original image size: predict_lesion_soft > 0.5."""
+    return (predict_lesion_soft(model, image_path, device=device, image_size=image_size, box=box) > 0.5).astype(np.uint8)
 
 
 def lesion_stats(lesion_mask: np.ndarray, fov_mask: np.ndarray) -> dict:
@@ -157,8 +299,10 @@ def lesion_stats(lesion_mask: np.ndarray, fov_mask: np.ndarray) -> dict:
 
 
 def process_image(image_path, classifier, seg_models: dict, device="cpu"):
-    grade, grade_probs = predict_grade(classifier, image_path, device=device, return_probs=True)
-    rgb = np.array(Image.open(image_path).convert("RGB"))
+    img = _load_rgb(image_path)
+    rgb = np.array(img)
+    box = retina_box(rgb) if RETINA_CROP else None  # one retina crop shared by grader + segmenters
+    grade, grade_probs = predict_grade(classifier, img, device=device, return_probs=True, box=box)
     fov_mask = estimate_retinal_fov_mask(rgb)
 
     combined_mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
@@ -167,7 +311,7 @@ def process_image(image_path, classifier, seg_models: dict, device="cpu"):
     for lesion_name, model in seg_models.items():
         if model is None:
             continue
-        m = predict_lesion_mask(model, image_path, device=device)
+        m = predict_lesion_mask(model, img, device=device, box=box)
         combined_mask = np.logical_or(combined_mask, m).astype(np.uint8)
         trained_lesions.append(lesion_name)
         per_lesion[lesion_name] = lesion_stats(m, fov_mask)
@@ -238,8 +382,10 @@ def main():
                              "an old copy counted against the quota -- see drive_io.py).")
     parser.add_argument("--quiet", action="store_true", help="Only print progress every 100 images")
     add_classifier_norm_args(parser)
+    add_seg_inference_args(parser)
     args = parser.parse_args()
     apply_classifier_norm_args(args)
+    apply_seg_inference_args(args)
 
     if not args.dry_run and not args.classifier_checkpoint:
         parser.error("--classifier-checkpoint is required unless --dry-run is set")

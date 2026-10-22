@@ -49,8 +49,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from PIL import Image  # noqa: E402
-from torchvision import transforms  # noqa: E402
 
+from apply_to_progression_data import (  # noqa: E402
+    add_seg_inference_args,
+    apply_seg_inference_args,
+    predict_lesion_mask,
+)
 from evaluate_segmentation_dice_iou import LESION_TO_FOLDER, get_test_split  # noqa: E402
 
 LESION_ORDER = ["EX", "HE", "MA", "SE"]
@@ -249,7 +253,6 @@ def plot_segmentation_grid(fgadr_root, filtered_csv, checkpoint, lesion, n_examp
     model.eval().to(device)
 
     test_names = get_test_split(filtered_csv)
-    tfm = transforms.Compose([transforms.Resize((image_size, image_size)), transforms.ToTensor()])
     mask_folder = os.path.join(fgadr_root, LESION_TO_FOLDER[lesion])
     image_dir = os.path.join(fgadr_root, "Original_Images")
 
@@ -275,12 +278,8 @@ def plot_segmentation_grid(fgadr_root, filtered_csv, checkpoint, lesion, n_examp
         axes = axes[None, :]
     for row, (image_path, mask_path) in enumerate(examples):
         img = Image.open(image_path).convert("RGB")
-        orig_size = img.size
-        x = tfm(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            probs = torch.softmax(model(x), dim=1)
-            pred = (probs[0, 1] > 0.5).cpu().numpy().astype(np.uint8)
-        pred_full = np.array(Image.fromarray(pred * 255).resize(orig_size, Image.NEAREST)) > 0
+        # Same inference as the pipeline / evaluate_segmentation_dice_iou.py (tiled by default).
+        pred_full = predict_lesion_mask(model, img, image_size=image_size, device=device) > 0
         gt_full = np.array(Image.open(mask_path).convert("L")) > 127
 
         axes[row, 0].imshow(img)
@@ -338,6 +337,7 @@ def main():
     p_sg.add_argument("--image-size", type=int, default=512)
     p_sg.add_argument("--out", required=True)
     p_sg.add_argument("--title-suffix", default="", help="e.g. ' -- FGADR + DDR combined model'")
+    add_seg_inference_args(p_sg)
 
     args = parser.parse_args()
 
@@ -365,6 +365,7 @@ def main():
         plot_training_curve(epochs, kappas, accuracies, args.out,
                              title=f"{args.dataset_name} classification: kappa/accuracy vs. epoch")
     elif args.command == "seg-grid":
+        apply_seg_inference_args(args)
         plot_segmentation_grid(args.fgadr_root, args.filtered_csv, args.checkpoint, args.lesion,
                                 args.n_examples, args.out, image_size=args.image_size,
                                 title_suffix=args.title_suffix)

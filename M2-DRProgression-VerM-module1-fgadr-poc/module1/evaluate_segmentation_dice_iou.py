@@ -9,6 +9,12 @@ soft/probability output, before thresholding), so these numbers are directly com
 paper's. Dice/IoU is reported alongside for its own sake but is not in the paper, so it should
 not be presented as a comparison to DRG-Net's published numbers.
 
+Inference uses the SAME routine as the pipeline (apply_to_progression_data.predict_lesion_soft):
+by default the retina is cropped, resized to ~1280 px across and segmented in overlapping
+512x512 tiles (CODE_FIXES item 1.1 -- DRG-Net trains on 512 crops of ~1280 px images and
+evaluates by tiling), so these test metrics describe what the pipeline's masks actually look
+like. --seg-mode resize --no-retina-crop is the earlier whole-image behaviour (--image-size N x N).
+
 Usage (after training, from anywhere with this repo + the checkpoint available):
     python evaluate_segmentation_dice_iou.py \
         --fgadr-root ./FGADR-Seg-set_Release/Seg-set \
@@ -25,7 +31,8 @@ import pandas as pd
 import torch
 from PIL import Image
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
-from torchvision import transforms
+
+from apply_to_progression_data import add_seg_inference_args, apply_seg_inference_args, predict_lesion_soft
 
 LESION_TO_FOLDER = {
     "EX": "HardExudate_Masks",
@@ -67,7 +74,8 @@ def main():
     parser.add_argument("--filtered-csv", default="./module1/data/DR_Seg_Grading_Label_Filtered.csv")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--lesion", required=True, choices=list(LESION_TO_FOLDER.keys()))
-    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--image-size", type=int, default=512,
+                        help="Whole-image size for --seg-mode resize only (tiled ignores it)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--curve-out", default=None,
                          help="If given, writes {auc, ap, fpr, tpr} (pooled ROC curve, "
@@ -79,7 +87,9 @@ def main():
                          help="Random pixel subsample per image before pooling for the ROC "
                               "curve -- bounds memory on a large test set without meaningfully "
                               "changing the curve's shape.")
+    add_seg_inference_args(parser)
     args = parser.parse_args()
+    apply_seg_inference_args(args)
     rng = np.random.default_rng(0)
 
     import segmentation_models_pytorch as smp
@@ -91,7 +101,6 @@ def main():
     model.eval().to(args.device)
 
     test_names = get_test_split(args.filtered_csv)
-    tfm = transforms.Compose([transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor()])
 
     mask_folder = os.path.join(args.fgadr_root, LESION_TO_FOLDER[args.lesion])
     image_dir = os.path.join(args.fgadr_root, "Original_Images")
@@ -104,17 +113,9 @@ def main():
         if not (os.path.isfile(image_path) and os.path.isfile(mask_path)):
             continue  # this lesion type absent for this image -- skip, same as training
 
-        img = Image.open(image_path).convert("RGB")
-        orig_size = img.size
-        x = tfm(img).unsqueeze(0).to(args.device)
-        with torch.no_grad():
-            probs = torch.softmax(model(x), dim=1)
-            soft_pred = probs[0, 1].cpu().numpy()
-        # Resize the raw soft prediction (not yet thresholded) back to the mask's original
-        # size for the AP/AUC computation, same soft output DRG-Net's own eval_model scores.
-        soft_pred_full = np.array(
-            Image.fromarray(soft_pred.astype(np.float32), mode="F").resize(orig_size, Image.BILINEAR)
-        )
+        # Raw soft prediction (not yet thresholded) at the mask's original size for the AP/AUC
+        # computation, same soft output DRG-Net's own eval_model scores.
+        soft_pred_full = predict_lesion_soft(model, image_path, device=args.device, image_size=args.image_size)
         pred_full = (soft_pred_full > 0.5).astype(np.uint8)
 
         gt = (np.array(Image.open(mask_path).convert("L")) > 127).astype(np.uint8)
@@ -156,6 +157,7 @@ def main():
             fpr, tpr = fpr[keep_idx], tpr[keep_idx]
         curve_data = {
             "lesion": args.lesion,
+            "seg_mode": args.seg_mode,
             "auc": float(np.mean(aucs)),
             "ap": float(np.mean(aps)),
             "n_pixels_pooled": int(y_true.size),

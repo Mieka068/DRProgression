@@ -46,7 +46,9 @@ sys.path.insert(0, os.path.join(ROOT, "module1"))
 sys.path.insert(0, ROOT)
 from apply_to_progression_data import (  # noqa: E402
     add_classifier_norm_args,
+    add_seg_inference_args,
     apply_classifier_norm_args,
+    apply_seg_inference_args,
     process_image,
 )
 from base_model import Generator  # noqa: E402
@@ -203,8 +205,10 @@ if __name__ == "__main__":
     p.add_argument("--out-dir", default="./progression_outputs/")
     p.add_argument("--dry-run", action="store_true", help="Random Module 1/2 weights, no checkpoints")
     add_classifier_norm_args(p)
+    add_seg_inference_args(p)
     args = p.parse_args()
     apply_classifier_norm_args(args)
+    apply_seg_inference_args(args)
 
     if not args.dry_run and not (args.generator_checkpoint and args.classifier_checkpoint):
         p.error("--generator-checkpoint and --classifier-checkpoint are required unless --dry-run")
