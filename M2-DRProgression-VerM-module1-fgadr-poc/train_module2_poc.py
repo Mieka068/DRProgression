@@ -50,6 +50,12 @@ change:
  10. Progressing pairs (Tianjin eyes whose follow-up grade is worse) are oversampled to
      ~progress_fraction (default 0.3) of the training samples (combined_dataset.py, item 2.4);
      --progress-fraction 0 = the earlier uniform shuffle. Needs --val-fraction > 0.
+ 11. Stage classification loss (item 2.3, as in train_module2_nonlong_pretrain.py): D's class head
+     (2nd output) learns to grade the REAL follow-up with its grade -- only on samples whose grade
+     is a real clinical one (grade_is_real: Tianjin), and only when conditioning on the follow-up
+     grade -- and G is trained so D grades its output as target_grade:
+       D: + lambda_cls * CE(cls_real, follow-up grade)    G: + lambda_cls * CE(cls_fake, target grade)
+     --lambda-cls 0 = the earlier adversarial + reconstruction losses only.
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -74,6 +80,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torchvision.utils import save_image
 
@@ -125,6 +132,7 @@ class Config:
 
     lambda_rec = 10.0
     lambda_adv = 1.0
+    lambda_cls = 1.0  # stage classification loss (docstring point 11); 0 = off
 
     save_dir = "./DRForestGAN-v2/stargan/models_poc/"
     sample_dir = "./training_samples_poc/"
@@ -332,16 +340,19 @@ def train(config: Config):
     best = extra.get("best", {"epoch": None, "val_l1": float("inf"), "G": None})
 
     for epoch in range(start_epoch, config.num_epochs):
-        epoch_g_loss = epoch_d_loss = epoch_rec_loss = 0
+        epoch_g_loss = epoch_d_loss = epoch_rec_loss = epoch_cls_loss = 0
         for i, batch in enumerate(loader):
             baseline = batch["baseline"].to(device)
             follow_up = batch["follow_up"].to(device)
             mask = batch["mask"].to(device)
             target_grade = batch["target_grade"].to(device)
+            target_idx = target_grade.argmax(dim=1)
+            # D's class head only learns from real clinical follow-up grades (docstring point 11).
+            cls_real_ok = batch["grade_is_real"].to(device).bool() & (config.condition_on == "followup")
 
             x_real = torch.cat([baseline, mask], dim=1)
 
-            out_real, _ = D(follow_up)
+            out_real, cls_real = D(follow_up)
             d_loss_real = -torch.mean(out_real)
             with torch.no_grad():
                 fake = G(x_real, target_grade)
@@ -349,6 +360,8 @@ def train(config: Config):
             d_loss_fake = torch.mean(out_fake)
             gp = gradient_penalty(D, follow_up, fake, device)
             d_loss = d_loss_real + d_loss_fake + 10 * gp
+            if config.lambda_cls > 0 and cls_real_ok.any():
+                d_loss = d_loss + config.lambda_cls * F.cross_entropy(cls_real[cls_real_ok], target_idx[cls_real_ok])
 
             d_optimizer.zero_grad()
             d_loss.backward()
@@ -356,10 +369,14 @@ def train(config: Config):
 
             if i % config.n_critic == 0:
                 fake = G(x_real, target_grade)
-                out_fake, _ = D(fake)
+                out_fake, cls_fake = D(fake)
                 g_loss_adv = -torch.mean(out_fake)
                 g_loss_rec = l1_loss(fake, follow_up)
                 g_loss = config.lambda_adv * g_loss_adv + config.lambda_rec * g_loss_rec
+                if config.lambda_cls > 0:
+                    g_loss_cls = F.cross_entropy(cls_fake, target_idx)
+                    g_loss = g_loss + config.lambda_cls * g_loss_cls
+                    epoch_cls_loss += g_loss_cls.item()
 
                 g_optimizer.zero_grad()
                 g_loss.backward()
@@ -375,6 +392,7 @@ def train(config: Config):
         mean_rec_loss = epoch_rec_loss / len(loader)
         loss_history.append({
             "epoch": epoch + 1, "d_loss": mean_d_loss, "g_loss": mean_g_loss, "rec_loss": mean_rec_loss,
+            "g_cls_loss": epoch_cls_loss / len(loader),
         })
         print(
             f"Epoch [{epoch + 1}/{config.num_epochs}] | D_loss: {mean_d_loss:.4f} | "
@@ -452,6 +470,7 @@ def train(config: Config):
         "d_lr": config.d_lr,
         "beta1": config.beta1,
         "beta2": config.beta2,
+        "lambda_cls": config.lambda_cls,
         "fire_module1_cache_path": config.fire_module1_cache_path,
         "longdr_module1_cache_path": config.longdr_module1_cache_path,
         "tianjin_dir": config.tianjin_dir,
@@ -512,6 +531,9 @@ if __name__ == "__main__":
     parser.add_argument("--progress-fraction", type=float, default=Config.progress_fraction,
                          help="Oversample progressing pairs to this share of training samples "
                               "(0 = uniform shuffle, the earlier behaviour)")
+    parser.add_argument("--lambda-cls", type=float, default=Config.lambda_cls,
+                         help="Stage classification loss weight (D on real follow-ups with clinical "
+                              "grades, G on its outputs vs target_grade); 0 = off (earlier behaviour)")
     parser.add_argument("--resume-state", default=None,
                          help="Per-epoch resume file (put it on Drive). Re-running with the same "
                               "path continues after the last finished epoch.")
@@ -556,6 +578,7 @@ if __name__ == "__main__":
     cfg.val_fraction = args.val_fraction
     cfg.condition_on = args.condition_on
     cfg.progress_fraction = args.progress_fraction
+    cfg.lambda_cls = args.lambda_cls
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
