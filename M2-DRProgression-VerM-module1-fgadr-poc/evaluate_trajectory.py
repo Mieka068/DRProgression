@@ -59,7 +59,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mod
 from dataset import TianjinSurvivalDataset  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module1"))
-from apply_to_progression_data import ALL_LESIONS, load_classifier, load_segmentation_model  # noqa: E402
+from apply_to_progression_data import (  # noqa: E402
+    ALL_LESIONS,
+    add_classifier_norm_args,
+    add_seg_inference_args,
+    apply_classifier_norm_args,
+    apply_seg_inference_args,
+    load_classifier,
+    load_segmentation_model,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tianjin_dataset import _module1_image_id_candidates  # noqa: E402
@@ -403,7 +411,11 @@ if __name__ == "__main__":
     parser.add_argument("--self-consistency-max-pairs", type=int, default=200,
                          help="Cap on pairs evaluated per self-consistency source (0 = no cap).")
     parser.add_argument("--out", default="./trajectory_eval_results.json")
+    add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
+    add_seg_inference_args(parser)
     args = parser.parse_args()
+    apply_classifier_norm_args(args)
+    apply_seg_inference_args(args)
 
     if not args.dry_run and not args.generator_checkpoint:
         parser.error("--generator-checkpoint is required unless --dry-run is set")

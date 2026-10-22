@@ -56,7 +56,15 @@ from dataset import IMAGENET_MEAN, IMAGENET_STD, TianjinSurvivalDataset  # noqa:
 from model import EfficientNetWeibullSurvival  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module1"))
-from apply_to_progression_data import ALL_LESIONS, load_classifier, load_segmentation_model  # noqa: E402
+from apply_to_progression_data import (  # noqa: E402
+    ALL_LESIONS,
+    add_classifier_norm_args,
+    add_seg_inference_args,
+    apply_classifier_norm_args,
+    apply_seg_inference_args,
+    load_classifier,
+    load_segmentation_model,
+)
 from compute_lbs import classify_lbs_stratum, compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -312,7 +320,11 @@ if __name__ == "__main__":
                         help="Cascade every patient up to this stage (e.g. 4 = PDR). Omit to stop at "
                              "each patient's real follow-up grade (the original behaviour).")
     parser.add_argument("--out-dir", default="./trajectory_figures/")
+    add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
+    add_seg_inference_args(parser)
     args = parser.parse_args()
+    apply_classifier_norm_args(args)
+    apply_seg_inference_args(args)
 
     if not args.dry_run and not args.generator_checkpoint:
         parser.error("--generator-checkpoint is required unless --dry-run is set")

@@ -13,7 +13,10 @@ options (--split):
   official (default) -- the Kaggle competition's own partition, the usual EyePACS protocol:
       train = the 35,126 original training images; val = Public test (~10,906);
       test = Private test (~42,670). Read from a split/Usage-style column in all_labels.csv if
-      there is one, else from the image's folder (train/ vs test/). If test images can't be told
+      there is one, else from the image's folder (train/ vs test/). In all_labels.csv the `Usage`
+      column is public/private for the Kaggle test images and BLANK for the 35,126 original
+      training images, so a blank entry in a column whose other values are only test-set tokens
+      means train (it used to be treated as unknown and dropped -> "train: 0 images"). If test images can't be told
       apart into Public/Private, val is instead a patient-level 10% of train (not the test set,
       so model selection doesn't see test images) -- printed when it happens.
   random -- patient-level, grade-stratified random split (--val-frac/--test-frac).
@@ -62,11 +65,22 @@ def official_split_column(csv_path, image_ids):
     for col in raw.columns:
         if col == img_col:
             continue
-        vals = raw[col].dropna().astype(str).str.strip().str.lower()
-        if len(vals) and vals.isin(SPLIT_TOKENS).all() and vals.nunique() >= 2:
-            mapping = dict(zip(raw[img_col].map(image_stem), raw[col].astype(str).str.strip().str.lower()))
-            print(f"  Official split from column '{col}': {sorted(vals.unique())}")
-            return {i: SPLIT_TOKENS.get(mapping.get(i, ""), None) for i in image_ids}
+        cleaned = raw[col].astype(str).str.strip().str.lower().where(raw[col].notna(), "")
+        vals = cleaned[cleaned != ""]
+        if not (len(vals) and vals.isin(SPLIT_TOKENS).all()):
+            continue
+        tokens = {SPLIT_TOKENS[v] for v in vals.unique()}
+        # Kaggle's Usage column: public/private for test images, blank for the original training
+        # images -> a blank means train whenever no non-blank value already means train.
+        blank_is_train = (cleaned == "").any() and "train" not in tokens
+        if len(tokens) + blank_is_train < 2:
+            continue
+        lookup = dict(SPLIT_TOKENS, **({"": "train"} if blank_is_train else {}))
+        mapping = dict(zip(raw[img_col].map(image_stem), cleaned))
+        print(f"  Official split from column '{col}': {sorted(vals.unique())}"
+              + (f" + {int((cleaned == '').sum())} blank (= original training images -> train)"
+                 if blank_is_train else ""))
+        return {i: lookup.get(mapping[i]) if i in mapping else None for i in image_ids}
     return None
 
 
@@ -141,15 +155,22 @@ def build(eyepacs_root, out_path, labels_csv="all_labels.csv", image_col=None, l
         df = pd.concat([tr, df[df["split"] != "train"]])
         print(f"  Capped TRAIN at {max_per_grade}/grade (val/test untouched) -> {len(tr)} train images")
 
-    leaks = set(df.loc[df["split"] == "train", "patient"]) & set(df.loc[df["split"] == "test", "patient"])
-    if leaks:
-        print(f"  ⚠ {len(leaks)} patients appear in both train and test")
+    # Both eyes of a patient must share a split. Kaggle's partition already does this; if a
+    # patient is split anyway, move all their images to the split holding most of them.
+    n_splits = df.groupby("patient")["split"].nunique()
+    leaks = n_splits.index[n_splits > 1]
+    if len(leaks):
+        majority = df[df["patient"].isin(leaks)].groupby("patient")["split"].agg(lambda x: x.value_counts().index[0])
+        df.loc[df["patient"].isin(leaks), "split"] = df.loc[df["patient"].isin(leaks), "patient"].map(majority)
+        print(f"  ⚠ {len(leaks)} patients had images in more than one split -- moved to their majority split")
 
     data_dict = {s: list(zip(df.loc[df["split"] == s, "path"], df.loc[df["split"] == s, "grade"].astype(int)))
                  for s in ("train", "val", "test")}
     for s in ("train", "val", "test"):
         counts = np.bincount([g for _, g in data_dict[s]], minlength=5)
         print(f"✓ {s:5s}: {len(data_dict[s])} images, per grade {counts.tolist()}")
+    if not data_dict["train"]:
+        raise SystemExit("No training images -- check the split column / folders printed above.")
 
     if combine_with:
         with open(combine_with, "rb") as f:
