@@ -312,6 +312,10 @@ def process_image(image_path, classifier, seg_models: dict, device="cpu"):
         if model is None:
             continue
         m = predict_lesion_mask(model, img, device=device, box=box)
+        if RETINA_CROP:
+            # The square retina crop includes the black corners outside the field of view; lesions
+            # can't be there, so they don't count toward the mask / LBS.
+            m = (m & fov_mask).astype(np.uint8)
         combined_mask = np.logical_or(combined_mask, m).astype(np.uint8)
         trained_lesions.append(lesion_name)
         per_lesion[lesion_name] = lesion_stats(m, fov_mask)
