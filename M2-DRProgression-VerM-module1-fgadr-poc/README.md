@@ -106,6 +106,45 @@ losses off). `python train_module2_nonlong_pretrain.py --dry-run --save-dir /tmp
 whole pipeline on synthetic data. Compare `models_poc_from_nonlong/` against a from-scratch
 `train_module2_poc.py` run with `evaluate_trajectory.py` to show whether pretraining helps.
 
+# Branch `AllModuleEdits-PreFinals` -- pre-finals fixes (`CODE_FIXES_AllModuleEdits-PreFinals.md`)
+Branched from `mod-2-NonLongIntegration`. Every notebook clones this branch and writes to NEW Drive
+folders (`RUN_SUFFIX = '_prefinals'` in the first code cell: `module1_cache_*_prefinals/`,
+`module2_runs/*_prefinals`, `module3_runs/*_prefinals`, `module1_runs/drgnet_replication_prefinals/`),
+so the earlier checkpoints, caches and results stay available for before/after comparison. Each
+change that alters results keeps the earlier behaviour behind a flag:
+
+| Item | Change (default now) | Earlier behaviour |
+|---|---|---|
+| 1.1 / 1.2 | Lesion segmentation on overlapping 512 px tiles of a ~1280 px retina crop (pipeline, `evaluate_segmentation_dice_iou.py`, seg-grid figure); grader also sees the retina crop; masks clipped to the field of view | `--seg-mode resize --no-retina-crop` |
+| 1.3 / 1.4 | FGADR + DDR segmenters to 200 epochs (per-lesion `SEG_EPOCHS`, resumes from 100); soft Dice term for MA (`SEG_DICE_WEIGHT`, `DRG_SEG_DICE_WEIGHT`) | `SEG_EPOCHS` 100, `SEG_DICE_WEIGHT = {}` |
+| 1.5 | Grader learning-curve cell fixed (bash syntax error) | -- |
+| 1.7 | EyePACS pickle: blank `Usage` = training image (was dropped -> 0 train images); EyePACS grader trained (nb 11, progressively balanced) and used as `CLASSIFIER_RUN = 'eyepacs'` (falls back to FGADR's until it exists) | `CLASSIFIER_RUN = 'fgadr'` |
+| 2.1 / 2.2 | Fine-tuning conditions on the FOLLOW-UP grade (Tianjin clinical; FIRE/LongDR Module 1's grade of the follow-up image) | `--condition-on baseline` |
+| 2.3 | Stage classification loss in fine-tuning (D on clinically graded real follow-ups, G on its outputs) | `--lambda-cls 0` |
+| 2.4 | Progressing pairs oversampled to 30 % of training samples | `--progress-fraction 0` |
+| 2.5 | Pretraining evaluation was all grade-0 images (val ordered by grade + capped batches) -> 0 % stage-head accuracy; val shuffled, balanced accuracy + confusion reported | -- |
+| 3.1-3.3 | `n_critic` 5, lr 1e-4 for G and D, fine-tuning batch 8 | `--n-critic 1 --g-lr 2e-4 --d-lr 2e-4 --batch-size 4` |
+| 3.4 / 3.6 / 4.1 / 4.2 | Spectral-norm D; G InstanceNorm without running stats, Upsample + conv instead of ConvTranspose, U-Net skips | `--model-arch legacy` |
+| 3.5 | Fine-tuning starts from a fresh D | `--init-discriminator-mode full` |
+| 3.7 | `<save_dir>/batch_log.csv`: per-batch D loss, GP, gradient norms, G losses | -- |
+| 4.3 | One `MODULE2_IMAGE_SIZE` (notebooks 06/08/09/10), checked against each checkpoint's run and the registration cache (still 128) | -- |
+| 5.1 / 5.2 | Tianjin pair quality >= 0.5; registration validated on FIRE's ground-truth control points (identity / net / SIFT+RANSAC), `--method sift` option | `TIANJIN_MIN_PAIR_QUALITY = None` |
+| 5.3 | Best epoch = lowest val L1 - 0.1 x Module 1 agreement with the target stage; early stopping (patience 25) | `--selection-alpha 0`, `--early-stop-patience 0` |
+| 5.4-5.7 | Pretrained G evaluated as "epoch 0"; FID range by subsampling without replacement (+ no negative error bars); samples sorted numerically; ablation runs get their own folders | `range_method="bootstrap"` |
+| 6.1-6.3 | Module 3: patient-level 70/15/15 split, metrics on TEST patients; first 6 EfficientNet-B4 blocks frozen; augmentation + AdamW weight decay 1e-2 | `--test-fraction 0 --val-fraction 0.2 --freeze-blocks 0 --no-augment --weight-decay 0` |
+| 7.1 | Laterality: disc found inside the field of view, pair constraint, validated on EyePACS (nb 11) -- **check the OD/OS convention it reports** (`--disc-left-is`) | `--legacy-estimator --no-pair-constraint` |
+| 7.2 / 7.3 | `MIN_BASELINE_GRADE` (0 = keep Stage 0, 1 = >= mild NPDR); `tools/dataset_image_sizes.py` | -- |
+
+**Checkpoints:** items 3.4/3.6/4.1/4.2 change the Generator/Discriminator `state_dict`s, so
+checkpoints from `mod-2-NonLongIntegration` (including the EyePACS pretraining) do NOT load into the
+default models -- the scripts stop with an error naming `--model-arch legacy`, which loads them. The
+whole Module 2 chain (09 pretraining -> 06 fine-tuning) must be retrained on this branch.
+
+**Re-run order:** 11 (tiled re-evaluation, 200-epoch segmenters, EyePACS grader + laterality
+validation) -> 04_05 (rebuild all Module 1 caches) -> 09 (EyePACS cache, profiles, pretraining) -> 06
+(fine-tuning, trajectory evaluation, epoch-0 eval; then optionally the `USE_NONLONG_PRETRAIN = False`
+ablation) -> 07 -> 08 -> 10.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|
