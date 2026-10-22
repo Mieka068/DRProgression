@@ -47,6 +47,9 @@ change:
      to produce" -- what the stage input means at inference (trajectory_inference.py) and what
      DRForecastGAN's solver.py conditions on. --condition-on baseline is the earlier behaviour
      ("the eye's current stage", which the Generator never had to practise as an instruction).
+ 10. Progressing pairs (Tianjin eyes whose follow-up grade is worse) are oversampled to
+     ~progress_fraction (default 0.3) of the training samples (combined_dataset.py, item 2.4);
+     --progress-fraction 0 = the earlier uniform shuffle. Needs --val-fraction > 0.
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -100,6 +103,7 @@ class Config:
     seed = 0  # fixes weight init / shuffling / augmentation so runs are reproducible
     val_fraction = 0.1  # eyes/patients held out for best-epoch selection (docstring point 8)
     condition_on = "followup"  # target_grade = follow-up grade; "baseline" = earlier (docstring point 9)
+    progress_fraction = 0.3  # share of training samples drawn from progressing pairs; 0 = uniform (point 10)
 
     # Model
     g_conv_dim = 64
@@ -284,7 +288,8 @@ def train(config: Config):
     val_loader, split_info = None, None
     if config.val_fraction > 0:
         loader, val_loader, split_info = get_combined_train_val_loaders(
-            **data_kwargs, val_fraction=config.val_fraction, seed=config.seed)
+            **data_kwargs, val_fraction=config.val_fraction, seed=config.seed,
+            progress_fraction=config.progress_fraction)
         num_pairs = split_info["num_pairs"]
         if not split_info["n_val_pairs"]:
             print("⚠ No held-out pairs (too few eyes/patients) -- best-epoch selection off")
@@ -458,6 +463,7 @@ def train(config: Config):
         "seed": config.seed,
         "val_fraction": config.val_fraction,
         "condition_on": config.condition_on,
+        "progress_fraction": config.progress_fraction,
         "split": split_info,
         "best_epoch": best["epoch"],
         "best_val_l1": best["val_l1"] if best["epoch"] else None,
@@ -503,6 +509,9 @@ if __name__ == "__main__":
     parser.add_argument("--condition-on", choices=["followup", "baseline"], default=Config.condition_on,
                          help="Stage the Generator is conditioned on: the follow-up visit's grade "
                               "(default -- what it must produce) or the baseline's (earlier behaviour)")
+    parser.add_argument("--progress-fraction", type=float, default=Config.progress_fraction,
+                         help="Oversample progressing pairs to this share of training samples "
+                              "(0 = uniform shuffle, the earlier behaviour)")
     parser.add_argument("--resume-state", default=None,
                          help="Per-epoch resume file (put it on Drive). Re-running with the same "
                               "path continues after the last finished epoch.")
@@ -546,6 +555,7 @@ if __name__ == "__main__":
     cfg.seed = args.seed
     cfg.val_fraction = args.val_fraction
     cfg.condition_on = args.condition_on
+    cfg.progress_fraction = args.progress_fraction
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size

@@ -192,6 +192,31 @@ def _group_ids(ds):
     return [f"{type(ds).__name__}:{i}" for i in range(len(ds))]
 
 
+def _progressed_flags(ds):
+    """Per pair: did the eye progress between the visits? Tianjin: its clinical follow-up grade >
+    baseline grade (tianjin_dataset.py's `progressed`); FIRE/LongDR: False (no real grades)."""
+    if isinstance(ds, TianjinLongitudinalDataset) and "progressed" in ds.manifest:
+        return ds.manifest["progressed"].astype(bool).tolist()
+    return [False] * len(ds)
+
+
+def progression_weights(flags, progress_fraction):
+    """
+    Per-pair sampling weights so progressing pairs make up ~progress_fraction of the draws:
+    rest pairs weigh 1, progressing pairs w_prog = p * n_rest / ((1 - p) * n_prog). None when
+    there is nothing to reweight (p <= 0, or no progressing / no other pairs).
+    """
+    flags = np.asarray(flags, dtype=bool)
+    n_prog, n_rest = int(flags.sum()), int((~flags).sum())
+    p = progress_fraction
+    if not p or p <= 0 or n_prog == 0 or n_rest == 0:
+        return None
+    if p >= 1:
+        raise ValueError(f"progress_fraction must be < 1, got {p}")
+    w_prog = p * n_rest / ((1 - p) * n_prog)
+    return np.where(flags, w_prog, 1.0)
+
+
 def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
                                    longdr_dir='./LongDRScreening_20150209',
                                    tianjin_dir=None,
@@ -207,16 +232,22 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
                                    val_fraction=0.1,
                                    seed=0,
                                    condition_on='followup',
-                                   tianjin_min_baseline_grade=0):
+                                   tianjin_min_baseline_grade=0,
+                                   progress_fraction=0.3):
     """
     Same sources as get_combined_loader, split into train / held-out val by eye/patient
     (_group_ids), val_fraction of each source's groups going to val. Only train is augmented.
     The split depends only on `seed` and the data, so a resumed run gets the same split.
 
+    progress_fraction (CODE_FIXES item 2.4): the training loader draws pairs with a
+    WeightedRandomSampler (with replacement) so that ~this fraction of samples are pairs whose eye
+    progressed (Tianjin, _progressed_flags) -- they are rare, and they are the ones that show the
+    Generator a stage change. 0 / None = the earlier uniform shuffle. Val stays unweighted.
+
     Returns (train_loader, val_loader, info) with info = {num_pairs, n_train_pairs, n_val_pairs,
-    n_val_groups}.
+    n_val_groups, n_train_progressed, progress_fraction}.
     """
-    from torch.utils.data import DataLoader, Subset
+    from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
     datasets = _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
                              longdr_module1_cache_path, tianjin_module1_cache_path,
@@ -225,7 +256,9 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
     combined = ConcatDataset(datasets)
     rng = np.random.RandomState(seed)
     train_idx, val_idx, n_val_groups, offset = [], [], 0, 0
+    progressed = []
     for ds in datasets:
+        progressed += _progressed_flags(ds)
         groups = _group_ids(ds)
         uniq = sorted(set(groups))
         rng.shuffle(uniq)
@@ -240,12 +273,27 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
     val_set = AugmentedPairDataset(Subset(combined, val_idx), image_size=image_size, augment=False)
     print(f"✓ Split by eye/patient: {len(train_idx)} train pairs / {len(val_idx)} held-out val pairs "
           f"({n_val_groups} val eyes/patients)")
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                              drop_last=True)
+    train_prog = [progressed[i] for i in train_idx]
+    weights = progression_weights(train_prog, progress_fraction)
+    if weights is None:
+        sampler = None
+        if progress_fraction:
+            print(f"  progress_fraction={progress_fraction}: {sum(train_prog)} progressing train pairs -- "
+                  "nothing to reweight, uniform shuffle")
+    else:
+        # AugmentedPairDataset is augment-x longer than the subset (idx % n), so repeat the weights.
+        n = len(train_idx)
+        aug_weights = torch.as_tensor(np.resize(weights, len(train_set)), dtype=torch.double)
+        sampler = WeightedRandomSampler(aug_weights, num_samples=len(train_set), replacement=True)
+        print(f"✓ Oversampling progressing pairs: {sum(train_prog)}/{n} train pairs progressed, weight "
+              f"{weights.max():.2f} each -> ~{progress_fraction:.0%} of training samples")
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=sampler is None, sampler=sampler,
+                              num_workers=num_workers, drop_last=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                             drop_last=False)
     info = {"num_pairs": len(combined), "n_train_pairs": len(train_idx), "n_val_pairs": len(val_idx),
-            "n_val_groups": n_val_groups}
+            "n_val_groups": n_val_groups, "n_train_progressed": int(sum(train_prog)),
+            "progress_fraction": progress_fraction if sampler is not None else None}
     return train_loader, val_loader, info
 
 
