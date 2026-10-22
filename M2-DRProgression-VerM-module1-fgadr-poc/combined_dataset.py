@@ -15,6 +15,14 @@ is real image-pair volume and photographic diversity for the adversarial/reconst
 losses, not genuine stage-transition supervision. Because of this, FIRE/LongDR pairs cannot be
 scored against a real follow-up grade the way Tianjin's can (see evaluate_trajectory.py's
 --self-consistency-dirs option for the metric this file's sources use instead).
+
+Conditioning (CODE_FIXES items 2.1/2.2): by default (condition_on='followup') every source's
+target_grade is the FOLLOW-UP visit's grade -- the stage the Generator is asked to produce, which is
+what the stage input means at inference (trajectory_inference.py): Tianjin's clinical follow-up
+grade, Module 1's predicted grade of the FIRE/LongDR follow-up image (the Stage-2 placeholder only
+where that is missing). Each sample also carries source_grade (the baseline's) and progressed
+(Tianjin: follow-up > baseline; FIRE/LongDR: False). condition_on='baseline' restores the earlier
+"current stage" conditioning.
 """
 
 import os
@@ -70,6 +78,8 @@ class AugmentedPairDataset(Dataset):
         # Tianjin sample. Default them here so every sample this dataset yields has the same
         # shape regardless of source.
         sample.setdefault('grade_is_real', False)
+        sample.setdefault('source_grade', sample['target_grade'].clone())
+        sample.setdefault('progressed', False)
         sample.setdefault('patient_id', sample.get('eye_id', 'n/a'))
         sample.setdefault('pair_quality', -1.0)
         sample.setdefault('grade_is_eye_specific', False)
@@ -116,15 +126,18 @@ class AugmentedPairDataset(Dataset):
 
 def _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
                   longdr_module1_cache_path, tianjin_module1_cache_path, tianjin_min_pair_quality,
-                  registration_cache_path):
-    """The per-source datasets get_combined_loader / get_combined_train_val_loaders concatenate."""
+                  registration_cache_path, condition_on='followup', tianjin_min_baseline_grade=0):
+    """The per-source datasets get_combined_loader / get_combined_train_val_loaders concatenate.
+    condition_on: 'followup' (default) = target_grade is the follow-up visit's grade (Tianjin: real
+    clinical grade; FIRE/LongDR: Module 1's prediction), 'baseline' = the earlier behaviour."""
     datasets = []
 
     # Try to load FIRE
     try:
         fire = FIREDataset(fire_dir, image_size=image_size, category='A',
                             module1_cache_path=fire_module1_cache_path,
-                            registration_cache_path=registration_cache_path)
+                            registration_cache_path=registration_cache_path,
+                            condition_on=condition_on)
         if len(fire) > 0:
             datasets.append(fire)
             print(f"✓ FIRE: {len(fire)} pairs")
@@ -135,7 +148,8 @@ def _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_ca
     try:
         longdr = LongDRScreeningDataset(longdr_dir, image_size=image_size, use_normalized=True,
                                          module1_cache_path=longdr_module1_cache_path,
-                                         registration_cache_path=registration_cache_path)
+                                         registration_cache_path=registration_cache_path,
+                                         condition_on=condition_on)
         if len(longdr) > 0:
             datasets.append(longdr)
             print(f"✓ LongDRScreening: {len(longdr)} pairs")
@@ -151,6 +165,8 @@ def _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_ca
                 min_pair_quality=tianjin_min_pair_quality,
                 module1_cache_path=tianjin_module1_cache_path,
                 registration_cache_path=registration_cache_path,
+                condition_on=condition_on,
+                min_baseline_grade=tianjin_min_baseline_grade,
             )
             if len(tianjin) > 0:
                 datasets.append(tianjin)
@@ -189,7 +205,9 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
                                    tianjin_min_pair_quality=None,
                                    registration_cache_path=None,
                                    val_fraction=0.1,
-                                   seed=0):
+                                   seed=0,
+                                   condition_on='followup',
+                                   tianjin_min_baseline_grade=0):
     """
     Same sources as get_combined_loader, split into train / held-out val by eye/patient
     (_group_ids), val_fraction of each source's groups going to val. Only train is augmented.
@@ -202,7 +220,8 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
 
     datasets = _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
                              longdr_module1_cache_path, tianjin_module1_cache_path,
-                             tianjin_min_pair_quality, registration_cache_path)
+                             tianjin_min_pair_quality, registration_cache_path, condition_on,
+                             tianjin_min_baseline_grade)
     combined = ConcatDataset(datasets)
     rng = np.random.RandomState(seed)
     train_idx, val_idx, n_val_groups, offset = [], [], 0, 0
@@ -241,7 +260,9 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
                         longdr_module1_cache_path=None,
                         tianjin_module1_cache_path=None,
                         tianjin_min_pair_quality=None,
-                        registration_cache_path=None):
+                        registration_cache_path=None,
+                        condition_on='followup',
+                        tianjin_min_baseline_grade=0):
     """
     Get a DataLoader combining FIRE + LongDRScreening + (optionally) Tianjin, with augmentation.
 
@@ -271,7 +292,8 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
 
     datasets = _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
                              longdr_module1_cache_path, tianjin_module1_cache_path,
-                             tianjin_min_pair_quality, registration_cache_path)
+                             tianjin_min_pair_quality, registration_cache_path, condition_on,
+                             tianjin_min_baseline_grade)
 
     # Combine datasets
     combined = ConcatDataset(datasets)

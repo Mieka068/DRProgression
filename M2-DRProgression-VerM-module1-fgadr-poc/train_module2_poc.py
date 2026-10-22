@@ -42,6 +42,11 @@ change:
      best-G.ckpt (use this one downstream); final-G.ckpt stays the last epoch. The end-of-run
      PSNR/SSIM/FID/KID are computed for best-G on the held-out pairs. --val-fraction 0 restores
      the old behaviour (all pairs train, no best-G.ckpt, metrics on training pairs).
+  9. Stage conditioning (CODE_FIXES items 2.1/2.2): target_grade = the FOLLOW-UP visit's grade
+     (Tianjin: clinical; FIRE/LongDR: Module 1's prediction on the follow-up image), i.e. "the stage
+     to produce" -- what the stage input means at inference (trajectory_inference.py) and what
+     DRForecastGAN's solver.py conditions on. --condition-on baseline is the earlier behaviour
+     ("the eye's current stage", which the Generator never had to practise as an instruction).
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -94,6 +99,7 @@ class Config:
     resume_state_path = None  # optional -- per-epoch resume file (see resume_utils.py)
     seed = 0  # fixes weight init / shuffling / augmentation so runs are reproducible
     val_fraction = 0.1  # eyes/patients held out for best-epoch selection (docstring point 8)
+    condition_on = "followup"  # target_grade = follow-up grade; "baseline" = earlier (docstring point 9)
 
     # Model
     g_conv_dim = 64
@@ -254,6 +260,7 @@ def train(config: Config):
     print(f"longdr_module1_cache_path: {config.longdr_module1_cache_path}")
     print(f"tianjin_dir: {config.tianjin_dir}")
     print(f"tianjin_module1_cache_path: {config.tianjin_module1_cache_path}")
+    print(f"condition_on: {config.condition_on} grade")
 
     os.makedirs(config.save_dir, exist_ok=True)
     os.makedirs(config.sample_dir, exist_ok=True)
@@ -272,6 +279,7 @@ def train(config: Config):
         tianjin_min_pair_quality=config.tianjin_min_pair_quality,
         registration_cache_path=config.registration_cache_path,
         num_workers=config.num_workers,
+        condition_on=config.condition_on,
     )
     val_loader, split_info = None, None
     if config.val_fraction > 0:
@@ -449,6 +457,7 @@ def train(config: Config):
         "resumed_from_epoch": start_epoch,
         "seed": config.seed,
         "val_fraction": config.val_fraction,
+        "condition_on": config.condition_on,
         "split": split_info,
         "best_epoch": best["epoch"],
         "best_val_l1": best["val_l1"] if best["epoch"] else None,
@@ -491,6 +500,9 @@ if __name__ == "__main__":
     parser.add_argument("--val-fraction", type=float, default=Config.val_fraction,
                          help="Fraction of eyes/patients held out for best-epoch selection "
                               "(best-G.ckpt); 0 = train on everything, no best-G.ckpt")
+    parser.add_argument("--condition-on", choices=["followup", "baseline"], default=Config.condition_on,
+                         help="Stage the Generator is conditioned on: the follow-up visit's grade "
+                              "(default -- what it must produce) or the baseline's (earlier behaviour)")
     parser.add_argument("--resume-state", default=None,
                          help="Per-epoch resume file (put it on Drive). Re-running with the same "
                               "path continues after the last finished epoch.")
@@ -533,6 +545,7 @@ if __name__ == "__main__":
     cfg.resume_state_path = args.resume_state
     cfg.seed = args.seed
     cfg.val_fraction = args.val_fraction
+    cfg.condition_on = args.condition_on
     cfg.style_dim = args.style_dim
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size

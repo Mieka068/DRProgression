@@ -12,6 +12,13 @@ import numpy as np
 from pathlib import Path
 
 
+def module1_grade_onehot(module1_output, num_stages=5, placeholder=2):
+    """One-hot of a Module 1 cache entry's predicted grade; the Stage-2 placeholder if None."""
+    onehot = torch.zeros(num_stages)
+    onehot[int(module1_output['grade']) if module1_output is not None else placeholder] = 1.0
+    return onehot
+
+
 class FIREDataset(Dataset):
     """
     Loads FIRE image pairs for longitudinal training.
@@ -27,7 +34,7 @@ class FIREDataset(Dataset):
     SOURCE_NAME = "FIRE"
 
     def __init__(self, fire_dir, image_size=128, category='A', module1_cache_path=None,
-                 registration_cache_path=None):
+                 registration_cache_path=None, condition_on='followup'):
         """
         Args:
             fire_dir: Path to FIRE_dataset folder
@@ -45,7 +52,15 @@ class FIREDataset(Dataset):
                 baseline-aligned follow-up image is used instead of the raw one. Falls back to
                 the raw follow-up image for any pair not in the cache (or if no cache_path is
                 given at all).
+            condition_on: 'followup' (default, CODE_FIXES item 2.2) -- target_grade = Module 1's
+                predicted grade of the FOLLOW-UP image (the stage the Generator must produce; the
+                cache holds both visits), falling back to the baseline's and then to the Stage-2
+                placeholder if missing; 'baseline' -- the earlier behaviour, Module 1's grade of
+                the baseline image. Either way it is a predicted grade, so grade_is_real=False.
         """
+        if condition_on not in ('followup', 'baseline'):
+            raise ValueError(f"condition_on must be 'followup' or 'baseline', not {condition_on!r}")
+        self.condition_on = condition_on
         self.fire_dir = fire_dir
         self.image_size = image_size
         self.category = category
@@ -149,6 +164,7 @@ class FIREDataset(Dataset):
         # otherwise -- FIRE has no ground-truth grade/mask of its own either way.
         image_id = Path(img1_path).stem
         module1_output = self.module1_cache.get(image_id) if self.module1_cache else None
+        followup_output = self.module1_cache.get(Path(img2_path).stem) if self.module1_cache else None
 
         if module1_output is not None:
             mask_np = module1_output['mask']
@@ -156,24 +172,22 @@ class FIREDataset(Dataset):
                 (self.image_size, self.image_size), Image.NEAREST
             )
             mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
-
-            target_grade = torch.zeros(5)
-            target_grade[int(module1_output['grade'])] = 1.0
         else:
             # FIRE doesn't have lesion masks, so use empty mask
             # In real training, you'd run Module 1 to generate masks
             mask = torch.zeros(1, self.image_size, self.image_size)
 
-            # FIRE doesn't have severity labels, so use random grade for conditioning
-            # In real training, Module 1 would assign labels
-            target_grade = torch.zeros(5)  # 5 stages
-            target_grade[2] = 1.0  # Default to Stage 2 (Moderate)
+        # FIRE has no severity labels: Module 1's predicted grades, else the Stage-2 placeholder.
+        source_grade = module1_grade_onehot(module1_output)
+        target_grade = module1_grade_onehot(
+            followup_output if self.condition_on == 'followup' and followup_output is not None else module1_output)
 
         return {
             'baseline': img1,
             'follow_up': img2,
             'mask': mask,
             'target_grade': target_grade,
+            'source_grade': source_grade,
             # Matches LongDRScreeningDataset's return keys so ConcatDataset batches that mix
             # samples from both datasets collate correctly (default_collate requires every
             # sample dict in a batch to have the same keys) -- see combined_dataset.py.

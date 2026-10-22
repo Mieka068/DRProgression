@@ -17,6 +17,8 @@ import numpy as np
 from pathlib import Path
 import re
 
+from fire_dataset import module1_grade_onehot
+
 
 class LongDRScreeningDataset(Dataset):
     """
@@ -31,7 +33,7 @@ class LongDRScreeningDataset(Dataset):
     SOURCE_NAME = "LongDRScreening"
 
     def __init__(self, dataset_dir, image_size=128, use_normalized=True, module1_cache_path=None,
-                 registration_cache_path=None):
+                 registration_cache_path=None, condition_on='followup'):
         """
         Args:
             dataset_dir: Path to LongDRScreening_20150209 folder
@@ -44,7 +46,12 @@ class LongDRScreeningDataset(Dataset):
             registration_cache_path: Optional path to a cache produced by
                 module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
                 Same fallback behavior as FIREDataset -- see its docstring.
+            condition_on: 'followup' (default) / 'baseline' -- which visit's Module 1 grade is
+                target_grade, as in FIREDataset (see its docstring).
         """
+        if condition_on not in ('followup', 'baseline'):
+            raise ValueError(f"condition_on must be 'followup' or 'baseline', not {condition_on!r}")
+        self.condition_on = condition_on
         self.dataset_dir = dataset_dir
         self.image_size = image_size
 
@@ -145,6 +152,8 @@ class LongDRScreeningDataset(Dataset):
         # identical pattern.
         image_id = f"{pair['eye']}__{Path(pair['baseline']).stem}"
         module1_output = self.module1_cache.get(image_id) if self.module1_cache else None
+        followup_id = f"{pair['eye']}__{Path(pair['follow_up']).stem}"
+        followup_output = self.module1_cache.get(followup_id) if self.module1_cache else None
 
         if module1_output is not None:
             mask_np = module1_output['mask']
@@ -152,24 +161,23 @@ class LongDRScreeningDataset(Dataset):
                 (self.image_size, self.image_size), Image.NEAREST
             )
             mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
-
-            target_grade = torch.zeros(5)
-            target_grade[int(module1_output['grade'])] = 1.0
         else:
             # RODREP doesn't have lesion masks
             # In real training, run Module 1 to generate masks
             mask = torch.zeros(1, self.image_size, self.image_size)
 
-            # RODREP doesn't have severity stage labels
-            # Default to Stage 2 for conditioning
-            target_grade = torch.zeros(5)
-            target_grade[2] = 1.0
+        # RODREP has no severity stage labels: Module 1's predicted grades, else the Stage-2
+        # placeholder (see FIREDataset).
+        source_grade = module1_grade_onehot(module1_output)
+        target_grade = module1_grade_onehot(
+            followup_output if self.condition_on == 'followup' and followup_output is not None else module1_output)
 
         return {
             'baseline': img1,
             'follow_up': img2,
             'mask': mask,
             'target_grade': target_grade,
+            'source_grade': source_grade,
             'source': 'LongDRScreening',
             'eye_id': pair['eye']
         }
