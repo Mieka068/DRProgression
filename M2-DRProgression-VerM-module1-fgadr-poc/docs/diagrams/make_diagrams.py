@@ -423,14 +423,14 @@ def module2_finetune():
             linespacing=1.25)
     path(ax, [(23, 44), (34, 44)], color="black")
     label(ax, 23.5, 46, "concat, 4+c_dim ch", size=7, family=F, style="normal")
-    box(ax, 2, 22, 19, 7, None, "c  stage, one-hot\n(currently the baseline grade)", "white", "black", ssize=7.4,
+    box(ax, 2, 22, 19, 7, None, "c  stage, one-hot\n= FOLLOW-UP grade (target)", "white", "black", ssize=7.4,
         family=F, r=1.2)
     path(ax, [(21, 25.5), (29, 25.5), (29, 40), (34, 40)], color="black")
     ax.add_patch(FancyArrowPatch((12, 22), (36, 36), connectionstyle="arc3,rad=0.45", arrowstyle="-|>",
                                  mutation_scale=10, color="black", lw=1.2, zorder=4))
     label(ax, 22, 19.3, "s = c (AdaIN style vector)", size=7, family=F, style="normal")
     trapezoid(ax, 34, 42, 13, 9, 20, G_FILL, G_EDGE, "Generator", family=F)
-    label(ax, 34, 54.3, "initialised from stage 1\n(final-G.ckpt / final-D.ckpt)", size=6.9, family=F,
+    label(ax, 34, 54.3, "G initialised from stage 1 (final-G.ckpt);\nD fresh (spectral norm)", size=6.9, family=F,
           color=G_EDGE)
     arrow(ax, (47, 42), (54, 42), color=G_EDGE)
     box(ax, 54, 35, 19, 14, None, None, "white", G_EDGE, ls=(0, (3, 2)), r=1.2)
@@ -440,8 +440,10 @@ def module2_finetune():
     path(ax, [(73, 45), (85, 45), (85, 38)], color=G_EDGE)
     trapezoid(ax, 81, 30, 12, 18, 9, D_FILL, D_EDGE, "Discriminator", size=8, family=F)
     arrow(ax, (93, 30), (99, 30), color=D_EDGE)
-    box(ax, 99, 23, 20, 14, None, "d_loss = fake − real + 10·GP\ng_loss = adv + λ_rec·L1(G(x), Reg(Y))\n"
-        "λ_rec = 10, λ_adv = 1", "white", LOSS_EDGE, lw=1.3, ssize=6.6, family=F, r=1.5)
+    box(ax, 99, 21, 20, 18, None, "d_loss = fake − real + 10·GP\n  + CE(D_cls(Y), c)  [clinical c]\n"
+        "g_loss = adv + λ_rec·L1(G(x), Reg(Y))\n  + CE(D_cls(G(x)), c)\n"
+        "λ_rec = 10, λ_adv = λ_cls = 1\nn_critic 5, lr 1e-4, batch 8", "white", LOSS_EDGE, lw=1.3, ssize=6.3,
+        family=F, r=1.5)
     # registration
     box(ax, 2, 3, 17, 12, None, None, "white", "black", ls=(0, (2, 2)), lw=1.3, r=1.2)
     fundus(ax, 6.5, 9, 6, seed=8, lesions=9)
@@ -459,10 +461,11 @@ def module2_finetune():
     ax.add_patch(Circle((96.3, 6), 2.3, fc="white", ec="black", lw=1.1, zorder=4))
     ax.text(96.3, 6, "L1\nrec", ha="center", va="center", fontsize=6.8, zorder=5, family=F)
     # best epoch
-    box(ax, 99, 40, 20, 14, None, "after every epoch:\nL1(G(x), Reg(Y)) on 10 %\nheld-out eyes / patients\n"
-        "lowest → best-G.ckpt\n(50 epochs)", "#fff6d6", OUT_EDGE, ssize=6.8, family=F, r=1.5)
-    label(ax, 27, 1.0, "pairs: FIRE + LongDR + Tianjin; registration net trained once, self-supervised "
-          "(photometric loss)", size=6.6, family=F)
+    box(ax, 99, 40, 20, 15, None, "after every epoch, 10 % held-out\neyes / patients: L1(G(x), Reg(Y))\n"
+        "− 0.1 · Module 1 agreement\nwith c → lowest = best-G.ckpt\n(100 epochs, early stop)", "#fff6d6",
+        OUT_EDGE, ssize=6.5, family=F, r=1.5)
+    label(ax, 27, 1.0, "pairs: FIRE + LongDR + Tianjin (progressing pairs oversampled to 30 %); registration "
+          "trained once, self-supervised", size=6.6, family=F)
     save(fig, "module2_finetune_step")
 
 
@@ -538,8 +541,8 @@ def module3():
     ax.text(63.5, 11.5, "Training (Tianjin, baseline → fixed 2-year follow-up):\n"
             "event e = 1 if follow-up grade > baseline grade, observed only at t = 2 years\n"
             "current-status Weibull NLL = −[ e·log(1 − S(2)) + (1 − e)·log S(2) ]\n"
-            "Adam lr 1e-4, 30 epochs, patient-level train / val split\n"
-            "best epoch = lowest val NLL → best-model.ckpt; reported: AUROC + Brier at 2 y",
+            "AdamW lr 1e-4 (wd 1e-2), first 6 blocks frozen, augmented, 30 epochs\n"
+            "patient-level train / val / test 70/15/15; best epoch = lowest val NLL; reported on test",
             fontsize=7.1, va="center", family=F, linespacing=1.4)
     save(fig, "module3_model")
 
