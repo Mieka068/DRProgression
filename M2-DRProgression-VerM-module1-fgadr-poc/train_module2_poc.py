@@ -142,6 +142,7 @@ class Config:
     resume_state_path = None  # optional -- per-epoch resume file (see resume_utils.py)
     seed = 0  # fixes weight init / shuffling / augmentation so runs are reproducible
     val_fraction = 0.1  # eyes/patients held out for best-epoch selection (docstring point 8)
+    tianjin_min_baseline_grade = 0  # 1 = only Tianjin eyes starting at >= mild NPDR (item 7.2)
     condition_on = "followup"  # target_grade = follow-up grade; "baseline" = earlier (docstring point 9)
     selection_classifier_path = None  # Module 1 grader for the best-epoch score (docstring point 13)
     selection_alpha = 0.1
@@ -374,6 +375,7 @@ def train(config: Config):
         registration_cache_path=config.registration_cache_path,
         num_workers=config.num_workers,
         condition_on=config.condition_on,
+        tianjin_min_baseline_grade=config.tianjin_min_baseline_grade,
     )
     val_loader, split_info = None, None
     if config.val_fraction > 0:
@@ -624,6 +626,7 @@ def train(config: Config):
         "seed": config.seed,
         "val_fraction": config.val_fraction,
         "condition_on": config.condition_on,
+        "tianjin_min_baseline_grade": config.tianjin_min_baseline_grade,
         "progress_fraction": config.progress_fraction,
         "split": split_info,
         "best_epoch": best["epoch"],
@@ -678,6 +681,8 @@ if __name__ == "__main__":
     parser.add_argument("--val-fraction", type=float, default=Config.val_fraction,
                          help="Fraction of eyes/patients held out for best-epoch selection "
                               "(best-G.ckpt); 0 = train on everything, no best-G.ckpt")
+    parser.add_argument("--tianjin-min-baseline-grade", type=int, default=Config.tianjin_min_baseline_grade,
+                         help="1 = drop Tianjin eyes whose baseline is Stage 0 (manuscript scope); 0 = keep all")
     parser.add_argument("--condition-on", choices=["followup", "baseline"], default=Config.condition_on,
                          help="Stage the Generator is conditioned on: the follow-up visit's grade "
                               "(default -- what it must produce) or the baseline's (earlier behaviour)")
@@ -749,6 +754,7 @@ if __name__ == "__main__":
     cfg.seed = args.seed
     cfg.val_fraction = args.val_fraction
     cfg.condition_on = args.condition_on
+    cfg.tianjin_min_baseline_grade = args.tianjin_min_baseline_grade
     cfg.progress_fraction = args.progress_fraction
     cfg.selection_classifier_path = args.selection_classifier_checkpoint
     cfg.selection_alpha = args.selection_alpha
