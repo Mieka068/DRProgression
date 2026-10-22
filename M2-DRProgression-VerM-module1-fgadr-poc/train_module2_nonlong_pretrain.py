@@ -188,6 +188,13 @@ def evaluate(G, D, R, loader, device, config, mu, sd, use_bio):
     """
     On the held-out (stratified) val split:
       real_cls_acc         D's grading accuracy on real val images (is the stage head useful?)
+      real_cls_balanced_acc  mean per-grade recall of that (chance = 1 / c_dim = 0.2), with
+                           real_cls_per_grade / real_cls_confusion and the per-grade counts seen --
+                           the val split has EyePACS' natural ~73 %-grade-0 mix, so plain accuracy
+                           mostly measures grade 0. (Item 2.5: the 0.0 accuracy came from the
+                           evaluated batches being ALL grade 0 -- val was ordered by grade and the
+                           evaluation stops after eval_batches; crosssectional_dataset now
+                           shuffles it.)
       fake_cls_agreement   per target stage, fraction of G's outputs D grades as that stage
       bio_mean_abs_z       per target stage, mean |z| of R's biomarkers vs that stage's profile
       lbs_monotonic_rate   fraction of val images whose predicted LBS is non-decreasing
@@ -197,6 +204,7 @@ def evaluate(G, D, R, loader, device, config, mu, sd, use_bio):
     """
     G.eval(); D.eval(); R.eval()
     n_real = n_correct = 0
+    confusion = np.zeros((config.c_dim, config.c_dim), dtype=int)  # rows: true grade, cols: D's grade
     agree = np.zeros(config.c_dim); seen = np.zeros(config.c_dim)
     absz = np.zeros(config.c_dim); absz_n = np.zeros(config.c_dim)
     mono_hits = mono_n = 0
@@ -209,6 +217,8 @@ def evaluate(G, D, R, loader, device, config, mu, sd, use_bio):
         src = batch["grade"].to(device)
         _, cls_real = D(x)
         n_correct += int((cls_real.argmax(1) == src).sum()); n_real += x.size(0)
+        for t, q in zip(src.tolist(), cls_real.argmax(1).tolist()):
+            confusion[t, q] += 1
         lbs_per_stage = []
         for k in range(config.c_dim):
             trg = torch.full_like(src, k)
@@ -226,9 +236,17 @@ def evaluate(G, D, R, loader, device, config, mu, sd, use_bio):
             L = torch.stack(lbs_per_stage, 1)
             mono_hits += int((L[:, 1:] >= L[:, :-1] - 1e-3).all(1).sum()); mono_n += L.size(0)
     G.train(); D.train(); R.train()
+    per_grade_n = confusion.sum(1)
+    recall = {str(k): (confusion[k, k] / per_grade_n[k] if per_grade_n[k] else None) for k in range(config.c_dim)}
+    seen_recalls = [v for v in recall.values() if v is not None]
     return {
         "n_val_images": n_real,
+        "val_images_per_grade": per_grade_n.tolist(),
         "real_cls_acc": n_correct / max(n_real, 1),
+        "real_cls_balanced_acc": float(np.mean(seen_recalls)) if seen_recalls else None,
+        "real_cls_per_grade": recall,
+        "real_cls_confusion": confusion.tolist(),
+        "chance_acc": 1.0 / config.c_dim,
         "fake_cls_agreement": {str(k): agree[k] / seen[k] if seen[k] else None for k in range(config.c_dim)},
         "bio_mean_abs_z": ({str(k): absz[k] / absz_n[k] if absz_n[k] else None for k in range(config.c_dim)}
                            if use_bio else None),

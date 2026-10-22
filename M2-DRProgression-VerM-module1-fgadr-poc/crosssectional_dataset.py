@@ -308,6 +308,10 @@ def get_crosssectional_loaders(dataset_dir, preset="eyepacs_resized", batch_size
         n_val = int(round(len(idx) * val_fraction))
         val_idx.extend(idx[:n_val].tolist())
         train_idx.extend(idx[n_val:].tolist())
+    # val_idx is built grade by grade; shuffle it (seeded) so that a capped evaluation (the first
+    # eval_batches batches, train_module2_nonlong_pretrain.evaluate) sees every grade -- unshuffled,
+    # those batches were all grade 0 (CODE_FIXES item 2.5).
+    rng.shuffle(val_idx)
 
     train_subset = Subset(train_ds, train_idx)
     val_subset = Subset(val_ds, val_idx)
