@@ -181,7 +181,7 @@ class Config:
     # IMPLEMENTATION_PLAN_3.md Task L).
     eval_batches = 5
     min_n_for_fid = 50  # below this, FID (feature=2048)/KID are unreliable -- report None instead
-    fid_n_bootstrap = 10  # number of with-replacement resamples for the FID stability range
+    fid_n_bootstrap = 10  # resamples (80 % subsamples, without replacement) for the FID range
 
 
 def gradient_penalty(D, real, fake, device, return_norm=False):
@@ -334,6 +334,7 @@ def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=
         "n_samples_used": n_samples,
         "fid": fid_kid["fid"],
         "fid_bootstrap_range": fid_kid["fid_bootstrap_range"],
+        "fid_range_method": fid_kid["fid_range_method"],
         "kid_mean": fid_kid["kid_mean"],
         "kid_std": fid_kid["kid_std"],
     }
@@ -585,7 +586,7 @@ def train(config: Config):
         )
         if metrics["fid"] is not None:
             fid_range = metrics["fid_bootstrap_range"]
-            fid_range_str = f" (bootstrap 95% range: [{fid_range[0]:.3f}, {fid_range[1]:.3f}])" if fid_range else ""
+            fid_range_str = f" (resampled 95% range: [{fid_range[0]:.3f}, {fid_range[1]:.3f}])" if fid_range else ""
             fid_str = f"{metrics['fid']:.3f}{fid_range_str}"
         else:
             fid_str = f"None ({metrics.get('fid_note', '')})"
@@ -729,7 +730,7 @@ if __name__ == "__main__":
                               "5 is an unexamined POC default, not a real ceiling -- raise it "
                               "if more data is available.")
     parser.add_argument("--fid-n-bootstrap", type=int, default=Config.fid_n_bootstrap,
-                         help="With-replacement resamples for the FID stability range.")
+                         help="Resamples (subsamples without replacement) for the FID range.")
     args = parser.parse_args()
 
     cfg = Config()

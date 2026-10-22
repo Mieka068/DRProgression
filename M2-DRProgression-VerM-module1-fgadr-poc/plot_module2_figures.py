@@ -38,7 +38,7 @@ def _step_sort_key(key):
 
 def plot_per_step_quality(trajectory_eval_json: str, out_path: str):
     """
-    PSNR/SSIM on the left axis, FID on the right -- FID shown with its bootstrap 95% range as
+    PSNR/SSIM on the left axis, FID on the right -- FID shown with its resampled 95% range as
     error bars (see image_quality_metrics.py: FID is a biased small-N estimator, so a wide
     range here is an honest finding, not noise to hide). Each FID point is annotated with the
     KID mean +/- std, a sample-size-robust complement DRForecastGAN doesn't report but which
@@ -71,12 +71,16 @@ def plot_per_step_quality(trajectory_eval_json: str, out_path: str):
     if fid_vals:
         ranges = [r for s, r, v in zip(step_nums, fid_ranges, fid) if v is not None]
         if all(r is not None for r in ranges):
+            # A resampled range need not contain the point estimate (with-replacement bootstrap
+            # inflates FID); matplotlib rejects negative error-bar lengths, so clip them to 0.
             fid_yerr = [
-                [v - r[0] for v, r in zip(fid_vals, ranges)],
-                [r[1] - v for v, r in zip(fid_vals, ranges)],
+                [max(0.0, v - r[0]) for v, r in zip(fid_vals, ranges)],
+                [max(0.0, r[1] - v) for v, r in zip(fid_vals, ranges)],
             ]
+            if any(not r[0] <= v <= r[1] for v, r in zip(fid_vals, ranges)):
+                print("  ⚠ an FID range does not contain its point estimate -- error bar clipped at the point")
         ax2.errorbar(fid_steps, fid_vals, yerr=fid_yerr, marker="^", color="tab:red",
-                     label="FID (95% bootstrap range)" if fid_yerr else "FID", capsize=3)
+                     label="FID (resampled 95% range)" if fid_yerr else "FID", capsize=3)
         for s, v, km, ks in zip(step_nums, fid, kid_means, kid_stds):
             if v is not None and km is not None:
                 ax2.annotate(f"KID={km:.4f}±{ks:.4f}", (s, v), textcoords="offset points",

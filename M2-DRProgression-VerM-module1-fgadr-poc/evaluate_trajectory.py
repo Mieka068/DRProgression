@@ -197,6 +197,7 @@ def evaluate_self_consistency(source_name, dataset_dir, G, classifier, seg_model
         )
         entry["fid"] = fid_kid["fid"]
         entry["fid_bootstrap_range"] = fid_kid["fid_bootstrap_range"]
+        entry["fid_range_method"] = fid_kid["fid_range_method"]
         entry["kid_mean"] = fid_kid["kid_mean"]
         entry["kid_std"] = fid_kid["kid_std"]
         if fid_kid["note"]:
@@ -315,6 +316,7 @@ def evaluate(config):
         )
         entry["fid"] = fid_kid["fid"]
         entry["fid_bootstrap_range"] = fid_kid["fid_bootstrap_range"]
+        entry["fid_range_method"] = fid_kid["fid_range_method"]
         entry["kid_mean"] = fid_kid["kid_mean"]
         entry["kid_std"] = fid_kid["kid_std"]
         if fid_kid["note"]:
@@ -395,7 +397,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--min-n-for-fid", type=int, default=5)
     parser.add_argument("--fid-n-bootstrap", type=int, default=10,
-                         help="With-replacement resamples for each step's FID stability range.")
+                         help="Resamples (subsamples without replacement) for each step's FID range.")
     parser.add_argument(
         "--self-consistency-dirs",
         action="append",
