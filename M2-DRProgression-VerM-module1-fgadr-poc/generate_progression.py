@@ -51,7 +51,7 @@ from apply_to_progression_data import (  # noqa: E402
     apply_seg_inference_args,
     process_image,
 )
-from base_model import Generator  # noqa: E402
+from base_model import Generator, add_arch_arg, arch_kwargs, load_checkpoint  # noqa: E402
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
 from visualize_trajectory import (  # noqa: E402
@@ -159,9 +159,10 @@ def main(config):
         raise ValueError(f"--end-stage must be < --c-dim ({config.c_dim})")
 
     G = Generator(conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num,
-                  style_dim=config.style_dim or config.c_dim).to(device)
+                  style_dim=config.style_dim or config.c_dim,
+                  **arch_kwargs(config.model_arch)[0]).to(device)
     if not config.dry_run:
-        G.load_state_dict(torch.load(config.generator_checkpoint, map_location=device))
+        load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
     G.eval()
     classifier, seg_models = load_module1_models(config, device)
 
@@ -205,6 +206,7 @@ if __name__ == "__main__":
     p.add_argument("--out-dir", default="./progression_outputs/")
     p.add_argument("--dry-run", action="store_true", help="Random Module 1/2 weights, no checkpoints")
     add_classifier_norm_args(p)
+    add_arch_arg(p)  # must match the Generator checkpoint's run
     add_seg_inference_args(p)
     args = p.parse_args()
     apply_classifier_norm_args(args)

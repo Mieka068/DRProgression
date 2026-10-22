@@ -36,7 +36,9 @@ change:
      instead of random init -- e.g. train_module2_nonlong_pretrain.py's final-G/final-D.ckpt,
      which were pretrained on a large cross-sectional graded set (EyePACS) to learn stage
      appearance + per-stage biomarkers. This script is then the longitudinal fine-tuning stage.
-     Architecture args (image_size, conv dims, repeat nums, style_dim) must match the pretrain.
+     Architecture args (image_size, conv dims, repeat nums, style_dim, --model-arch) must match the
+     pretrain; a pretrain from before the AllModuleEdits-PreFinals architecture changes fails to
+     load (loudly) unless --model-arch legacy is passed -- see base_model.py.
      The Discriminator is NOT loaded by default (--init-discriminator-mode fresh, CODE_FIXES 3.5):
      the pretrained critic was tuned to EyePACS images and its stage head ended at 0 % accuracy on
      real val images, so it starts fine-tuning from random init; 'reset-cls-head' loads it but
@@ -98,7 +100,7 @@ import torch.optim as optim
 from torchvision.utils import save_image
 
 sys.path.insert(0, "./DRForestGAN-v2")
-from base_model import Generator, Discriminator  # noqa: E402
+from base_model import Discriminator, Generator, add_arch_arg, arch_kwargs, load_checkpoint  # noqa: E402
 from combined_dataset import get_combined_loader, get_combined_train_val_loaders  # noqa: E402
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
@@ -131,6 +133,7 @@ class Config:
     d_conv_dim = 64
     c_dim = 5
     style_dim = None  # AdaIN style vector size; None -> defaults to c_dim (see base_model.py)
+    model_arch = "prefinals"  # base_model.MODEL_ARCHS; "legacy" = before items 3.4/3.6/4.1/4.2
     g_repeat_num = 6
     d_repeat_num = 6
 
@@ -342,20 +345,22 @@ def train(config: Config):
     print(f"✓ Real pairs: {num_pairs}, effective samples: {len(loader.dataset)}, batches/epoch: {len(loader)}")
 
     print("\n[2/4] Initializing models...")
+    g_kwargs, d_kwargs = arch_kwargs(config.model_arch)
     G = Generator(conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num,
-                  style_dim=config.style_dim).to(device)
+                  style_dim=config.style_dim, **g_kwargs).to(device)
     D = Discriminator(
-        image_size=config.image_size, conv_dim=config.d_conv_dim, c_dim=config.c_dim, repeat_num=config.d_repeat_num
-    ).to(device)
+        image_size=config.image_size, conv_dim=config.d_conv_dim, c_dim=config.c_dim, repeat_num=config.d_repeat_num,
+        **d_kwargs).to(device)
+    print(f"  Model architecture: {config.model_arch} (G {g_kwargs}, D {d_kwargs})")
 
     if config.init_generator_path:
-        G.load_state_dict(torch.load(config.init_generator_path, map_location=device))
+        load_checkpoint(G, config.init_generator_path, device, config.model_arch)
         print(f"✓ Initialized Generator from {config.init_generator_path}")
     if config.init_discriminator_path and config.init_discriminator_mode == "fresh":
         print(f"  Discriminator: random init (--init-discriminator-mode fresh) -- "
               f"{config.init_discriminator_path} not loaded")
     elif config.init_discriminator_path:
-        D.load_state_dict(torch.load(config.init_discriminator_path, map_location=device))
+        load_checkpoint(D, config.init_discriminator_path, device, config.model_arch)
         if config.init_discriminator_mode == "reset-cls-head":
             D.conv2.reset_parameters()
         print(f"✓ Initialized Discriminator from {config.init_discriminator_path}"
@@ -531,6 +536,7 @@ def train(config: Config):
         "beta1": config.beta1,
         "beta2": config.beta2,
         "n_critic": config.n_critic,
+        "model_arch": config.model_arch,
         "batch_size": config.batch_size,
         "lambda_cls": config.lambda_cls,
         "fire_module1_cache_path": config.fire_module1_cache_path,
@@ -611,6 +617,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume-state", default=None,
                          help="Per-epoch resume file (put it on Drive). Re-running with the same "
                               "path continues after the last finished epoch.")
+    add_arch_arg(parser)
     parser.add_argument("--style-dim", type=int, default=None,
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
@@ -658,6 +665,7 @@ if __name__ == "__main__":
     if cfg.d_lr > cfg.g_lr:
         print(f"⚠ --d-lr {cfg.d_lr} > --g-lr {cfg.g_lr}: the critic usually needs lr <= the generator's")
     cfg.style_dim = args.style_dim
+    cfg.model_arch = args.model_arch
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
     cfg.num_workers = args.num_workers

@@ -70,7 +70,7 @@ from torchvision.utils import save_image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from base_model import Discriminator, Generator  # noqa: E402
+from base_model import Discriminator, Generator, add_arch_arg, arch_kwargs  # noqa: E402
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
 from train_module2_poc import denorm, grad_norm, gradient_penalty, write_batch_log  # noqa: E402
@@ -96,6 +96,7 @@ class Config:
     d_conv_dim = 64
     c_dim = NUM_STAGES
     style_dim = None
+    model_arch = "prefinals"  # base_model.MODEL_ARCHS -- must match the fine-tuning run's --model-arch
     g_repeat_num = 6
     d_repeat_num = 6
 
@@ -314,10 +315,12 @@ def train(config):
         print("⚠ No --module1-cache/--profiles -- biomarker losses OFF (plain stage translation)")
 
     print("\n[2/4] Initializing models...")
+    g_kwargs, d_kwargs = arch_kwargs(config.model_arch)
     G = Generator(conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num,
-                  style_dim=config.style_dim).to(device)
+                  style_dim=config.style_dim, **g_kwargs).to(device)
     D = Discriminator(image_size=config.image_size, conv_dim=config.d_conv_dim, c_dim=config.c_dim,
-                      repeat_num=config.d_repeat_num).to(device)
+                      repeat_num=config.d_repeat_num, **d_kwargs).to(device)
+    print(f"  Model architecture: {config.model_arch} (G {g_kwargs}, D {d_kwargs})")
     R = BiomarkerRegressor().to(device)
     g_opt = optim.Adam(G.parameters(), lr=config.g_lr, betas=(config.beta1, config.beta2))
     d_opt = optim.Adam(D.parameters(), lr=config.d_lr, betas=(config.beta1, config.beta2))
@@ -437,7 +440,7 @@ def train(config):
         "stage": "nonlong_pretrain",
         "dataset_dir": config.dataset_dir, "preset": config.preset,
         "module1_cache_path": config.module1_cache_path, "profiles_path": config.profiles_path,
-        "num_epochs": config.num_epochs, "image_size": config.image_size,
+        "num_epochs": config.num_epochs, "image_size": config.image_size, "model_arch": config.model_arch,
         "lambdas": {k: getattr(config, k) for k in dir(config) if k.startswith("lambda_")},
         "bio_margin": config.bio_margin, "p_adjacent": config.p_adjacent, "seed": config.seed,
         "g_lr": config.g_lr, "d_lr": config.d_lr, "n_critic": config.n_critic, "batch_size": config.batch_size,
@@ -463,6 +466,7 @@ if __name__ == "__main__":
     p.add_argument("--module1-cache", default=None)
     p.add_argument("--profiles", default=None, help="stage_biomarker_profiles.py JSON")
     p.add_argument("--image-size", type=int, default=Config.image_size)
+    add_arch_arg(p)
     p.add_argument("--batch-size", type=int, default=Config.batch_size)
     p.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     p.add_argument("--samples-per-epoch", type=int, default=Config.samples_per_epoch)

@@ -52,7 +52,7 @@ from PIL import Image
 from torchvision import transforms
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
-from base_model import Generator  # noqa: E402
+from base_model import Generator, add_arch_arg, arch_kwargs, load_checkpoint  # noqa: E402
 from trajectory_inference import _module1_predict, synthesize_trajectory  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module3"))
@@ -224,10 +224,10 @@ def evaluate(config):
     print("\n[2/4] Loading Generator checkpoint and Module 1 classifier/segmentation models...")
     style_dim = config.style_dim or config.c_dim
     G = Generator(
-        conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim
-    ).to(device)
+        conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim,
+        **arch_kwargs(config.model_arch)[0]).to(device)
     if not config.dry_run:
-        G.load_state_dict(torch.load(config.generator_checkpoint, map_location=device))
+        load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
     G.eval()
     classifier, seg_models = load_module1_models(config, device)
 
@@ -412,6 +412,7 @@ if __name__ == "__main__":
                          help="Cap on pairs evaluated per self-consistency source (0 = no cap).")
     parser.add_argument("--out", default="./trajectory_eval_results.json")
     add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
+    add_arch_arg(parser)  # must match the Generator checkpoint's run
     add_seg_inference_args(parser)
     args = parser.parse_args()
     apply_classifier_norm_args(args)
