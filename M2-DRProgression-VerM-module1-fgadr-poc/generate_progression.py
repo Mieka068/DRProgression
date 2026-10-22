@@ -51,7 +51,7 @@ from apply_to_progression_data import (  # noqa: E402
     apply_seg_inference_args,
     process_image,
 )
-from base_model import Generator, add_arch_arg, arch_kwargs, load_checkpoint  # noqa: E402
+from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
 from visualize_trajectory import (  # noqa: E402
@@ -162,6 +162,7 @@ def main(config):
                   style_dim=config.style_dim or config.c_dim,
                   **arch_kwargs(config.model_arch)[0]).to(device)
     if not config.dry_run:
+        check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
         load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
     G.eval()
     classifier, seg_models = load_module1_models(config, device)

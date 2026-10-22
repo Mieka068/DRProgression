@@ -100,7 +100,14 @@ import torch.optim as optim
 from torchvision.utils import save_image
 
 sys.path.insert(0, "./DRForestGAN-v2")
-from base_model import Discriminator, Generator, add_arch_arg, arch_kwargs, load_checkpoint  # noqa: E402
+from base_model import (  # noqa: E402
+    Discriminator,
+    Generator,
+    add_arch_arg,
+    arch_kwargs,
+    check_run_config,
+    load_checkpoint,
+)
 from combined_dataset import get_combined_loader, get_combined_train_val_loaders  # noqa: E402
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
@@ -110,7 +117,7 @@ class Config:
     fire_dir = "./FIRE_dataset"
     longdr_dir = "./LongDRScreening_20150209"
     tianjin_dir = None  # optional -- e.g. "./retinal-dr-longitudinal"; None skips Tianjin
-    image_size = 128
+    image_size = 128  # same value in every Module 2 script (item 4.3); 256 = ~4x time per epoch
     batch_size = 8  # was 4 (docstring point 3)
     augment = True
     num_workers = 0
@@ -353,6 +360,9 @@ def train(config: Config):
         **d_kwargs).to(device)
     print(f"  Model architecture: {config.model_arch} (G {g_kwargs}, D {d_kwargs})")
 
+    for _init in (config.init_generator_path, config.init_discriminator_path):
+        if _init:
+            check_run_config(_init, config.image_size, config.model_arch)  # fails loudly on a mismatch
     if config.init_generator_path:
         load_checkpoint(G, config.init_generator_path, device, config.model_arch)
         print(f"✓ Initialized Generator from {config.init_generator_path}")
@@ -529,6 +539,7 @@ def train(config: Config):
 
     results = {
         "num_epochs": config.num_epochs,
+        "image_size": config.image_size,
         "num_pairs": num_pairs,
         "effective_samples": len(loader.dataset),
         "g_lr": config.g_lr,
@@ -618,6 +629,9 @@ if __name__ == "__main__":
                          help="Per-epoch resume file (put it on Drive). Re-running with the same "
                               "path continues after the last finished epoch.")
     add_arch_arg(parser)
+    parser.add_argument("--image-size", type=int, default=Config.image_size,
+                         help="Must match the pretraining, the registration cache and every later "
+                              "script (evaluate/visualize_trajectory.py, generate_progression.py)")
     parser.add_argument("--style-dim", type=int, default=None,
                          help="AdaIN style vector size; omit to default to --c-dim")
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
@@ -666,6 +680,7 @@ if __name__ == "__main__":
         print(f"⚠ --d-lr {cfg.d_lr} > --g-lr {cfg.g_lr}: the critic usually needs lr <= the generator's")
     cfg.style_dim = args.style_dim
     cfg.model_arch = args.model_arch
+    cfg.image_size = args.image_size
     cfg.num_epochs = args.num_epochs
     cfg.batch_size = args.batch_size
     cfg.num_workers = args.num_workers

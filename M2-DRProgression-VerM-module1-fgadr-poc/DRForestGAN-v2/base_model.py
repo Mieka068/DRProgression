@@ -43,6 +43,35 @@ def add_arch_arg(parser):
                              "before these changes)")
 
 
+RUN_RESULT_FILES = ("poc_results.json", "nonlong_pretrain_results.json")
+
+
+def check_run_config(ckpt_path, image_size=None, model_arch=None):
+    """Fail loudly if the training run that saved ckpt_path (its poc_results.json /
+    nonlong_pretrain_results.json in the same folder, when present) used a different image_size
+    or --model-arch than the caller -- every Module 2 script must use the same image_size (item
+    4.3; the Discriminator's class-head kernel and the Generator's learned scale depend on it).
+    Runs from before these fields were recorded are 128 px / legacy."""
+    import json
+    import os
+
+    for name in RUN_RESULT_FILES:
+        path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)), name)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            run = json.load(f)
+        saved = {"image_size": run.get("image_size", 128), "model_arch": run.get("model_arch", "legacy")}
+        wanted = {"image_size": image_size, "model_arch": model_arch}
+        bad = {k: (saved[k], v) for k, v in wanted.items() if v is not None and saved[k] != v}
+        if bad:
+            raise ValueError(f"{ckpt_path} was trained with " + ", ".join(f"{k}={a}" for k, (a, _) in bad.items())
+                             + " but this run uses " + ", ".join(f"{k}={b}" for k, (_, b) in bad.items())
+                             + f" ({path}). Pass the same --image-size / --model-arch as that run.")
+        return saved
+    return None
+
+
 def load_checkpoint(model, path, map_location=None, arch=None):
     """load_state_dict(torch.load(path)) that fails loudly, with the likely fix, when the checkpoint
     was saved by the other architecture (see the module docstring)."""

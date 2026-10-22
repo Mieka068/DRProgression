@@ -17,7 +17,7 @@ import numpy as np
 from pathlib import Path
 import re
 
-from fire_dataset import module1_grade_onehot
+from fire_dataset import load_registration_cache, module1_grade_onehot
 
 
 class LongDRScreeningDataset(Dataset):
@@ -62,8 +62,7 @@ class LongDRScreeningDataset(Dataset):
 
         self.registration_cache = None
         if registration_cache_path:
-            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
-            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
+            self.registration_cache = load_registration_cache(registration_cache_path, image_size)
 
         # Choose which folder to use
         folder_name = 'FundusImagesNormalized' if use_normalized else 'FundusImagesColor'

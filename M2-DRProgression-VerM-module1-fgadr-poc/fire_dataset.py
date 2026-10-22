@@ -19,6 +19,18 @@ def module1_grade_onehot(module1_output, num_stages=5, placeholder=2):
     return onehot
 
 
+def load_registration_cache(path, image_size):
+    """module1/train_registration.py's cache ({(source, baseline_path): CHW uint8}), checked to hold
+    images at this image_size -- warps made at another size would be silently resized (item 4.3)."""
+    cache = torch.load(path, weights_only=False)
+    first = next(iter(cache.values()), None)
+    if first is not None and first.shape[-1] != image_size:
+        raise ValueError(f"Registration cache {path} holds {first.shape[-1]} px images but image_size is "
+                         f"{image_size} -- re-run module1/train_registration.py --image-size {image_size}.")
+    print(f"✓ Loaded registration cache: {len(cache)} pairs ({path})")
+    return cache
+
+
 class FIREDataset(Dataset):
     """
     Loads FIRE image pairs for longitudinal training.
@@ -72,8 +84,7 @@ class FIREDataset(Dataset):
 
         self.registration_cache = None
         if registration_cache_path:
-            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
-            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
+            self.registration_cache = load_registration_cache(registration_cache_path, image_size)
 
         # Find all image pairs in the specified category
         self.pairs = self._find_pairs()

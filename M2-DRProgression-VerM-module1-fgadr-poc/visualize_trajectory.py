@@ -48,7 +48,7 @@ from PIL import Image  # noqa: E402
 from torchvision import transforms  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
-from base_model import Generator, add_arch_arg, arch_kwargs, load_checkpoint  # noqa: E402
+from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module3"))
@@ -223,6 +223,7 @@ def run(config):
         conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim,
         **arch_kwargs(config.model_arch)[0]).to(device)
     if not config.dry_run:
+        check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
         load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
     G.eval()
     classifier, seg_models = load_module1_models(config, device)

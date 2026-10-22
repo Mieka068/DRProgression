@@ -75,6 +75,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from fire_dataset import load_registration_cache
+
 EXCLUDED_GRADES = {6, 7}  # post-photocoagulation, ungradable
 NUM_STAGES = 5  # ICDR 0-4, matching target_grade elsewhere in this repo
 BASELINE_SUBDIR = "baseline fundus images"
@@ -219,8 +221,7 @@ class TianjinLongitudinalDataset(Dataset):
 
         self.registration_cache = None
         if registration_cache_path:
-            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
-            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
+            self.registration_cache = load_registration_cache(registration_cache_path, image_size)
 
         manifest_path = os.path.join(dataset_dir, "corrected_manifest.csv")
         if not os.path.isfile(manifest_path):
