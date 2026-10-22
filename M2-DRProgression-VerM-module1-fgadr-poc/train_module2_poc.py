@@ -70,6 +70,14 @@ change:
      norm at the GP interpolates, and the G losses on G-step batches -- so a D-loss spike can be
      located instead of hidden in an epoch mean. The rows live in the resume state too (a resumed
      run keeps the earlier epochs' rows); the CSV is rewritten after every epoch.
+ 13. Best-epoch selection score (item 5.3): with --selection-classifier-checkpoint (Module 1's
+     grader, + --classifier-norm as for the pipeline), every epoch also measures Module 1's
+     agreement with the target stage on G's val outputs (does the synthesized follow-up read as
+     target_grade?) and best-G.ckpt is the epoch with the lowest
+         score = val_l1 - selection_alpha * agreement
+     (val L1 alone, the earlier rule, without a classifier or with --selection-alpha 0). Optional
+     early stopping: --early-stop-patience N stops after N epochs without a better score
+     (0 = off); a resumed run that already stopped goes straight to the final evaluation.
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -99,7 +107,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision.utils import save_image
 
-sys.path.insert(0, "./DRForestGAN-v2")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module1"))
 from base_model import (  # noqa: E402
     Discriminator,
     Generator,
@@ -110,6 +119,7 @@ from base_model import (  # noqa: E402
 )
 from combined_dataset import get_combined_loader, get_combined_train_val_loaders  # noqa: E402
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
+from apply_to_progression_data import add_classifier_norm_args, apply_classifier_norm_args  # noqa: E402
 
 
 class Config:
@@ -133,6 +143,9 @@ class Config:
     seed = 0  # fixes weight init / shuffling / augmentation so runs are reproducible
     val_fraction = 0.1  # eyes/patients held out for best-epoch selection (docstring point 8)
     condition_on = "followup"  # target_grade = follow-up grade; "baseline" = earlier (docstring point 9)
+    selection_classifier_path = None  # Module 1 grader for the best-epoch score (docstring point 13)
+    selection_alpha = 0.1
+    early_stop_patience = 0  # epochs without a better selection score before stopping; 0 = off
     progress_fraction = 0.3  # share of training samples drawn from progressing pairs; 0 = uniform (point 10)
 
     # Model
@@ -233,6 +246,29 @@ def validation_l1(G, loader, device):
         return None, None
     mse = mse_sum / n_px
     return l1_sum / n_px, float(10 * torch.log10(torch.tensor(1.0 / max(mse, 1e-10))))
+
+
+@torch.no_grad()
+def validation_agreement(G, loader, classifier, device):
+    """Fraction of held-out pairs whose synthesized follow-up Module 1's grader reads as the
+    requested target_grade (all pairs, and the clinically graded Tianjin ones separately)."""
+    from torchvision.transforms.functional import to_pil_image
+
+    from apply_to_progression_data import predict_grade
+
+    G.eval()
+    hits = n = hits_real = n_real = 0
+    for batch in loader:
+        x_real = torch.cat([batch["baseline"].to(device), batch["mask"].to(device)], dim=1)
+        target = batch["target_grade"].argmax(1)
+        fake = denorm(G(x_real, batch["target_grade"].to(device))).cpu()
+        for img, t, real in zip(fake, target.tolist(), batch["grade_is_real"].tolist()):
+            ok = int(predict_grade(classifier, to_pil_image(img), device=device) == t)
+            hits += ok; n += 1
+            if real:
+                hits_real += ok; n_real += 1
+    G.train()
+    return (hits / n if n else None), (hits_real / n_real if n_real else None)
 
 
 def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50, n_bootstrap=10):
@@ -394,11 +430,21 @@ def train(config: Config):
     # a disconnect after the best epoch doesn't lose them (save_dir is on the runtime disk).
     val_history = extra.get("val_history", [])
     best = extra.get("best", {"epoch": None, "val_l1": float("inf"), "G": None})
+    best.setdefault("score", best["val_l1"])  # resume states from before the selection score
+    stopped_at = extra.get("early_stopped_at")
+    selection_classifier = None
+    if config.selection_classifier_path and val_loader is not None:
+        from apply_to_progression_data import load_classifier
+        selection_classifier = load_classifier(config.selection_classifier_path, device=device)
+        print(f"  Best-epoch score: val L1 - {config.selection_alpha} x Module 1 agreement "
+              f"({config.selection_classifier_path})")
     g_steps = loss_history[-1].get("g_steps", 0) if loss_history else 0
     batch_log = extra.get("batch_log", [])  # docstring point 12
     batch_log_path = os.path.join(config.save_dir, "batch_log.csv")
 
-    for epoch in range(start_epoch, config.num_epochs):
+    if stopped_at:
+        print(f"[resume] this run early-stopped after epoch {stopped_at} -- skipping to evaluation")
+    for epoch in range(start_epoch if not stopped_at else config.num_epochs, config.num_epochs):
         epoch_g_loss = epoch_d_loss = epoch_rec_loss = epoch_cls_loss = 0
         n_g = 0  # G steps this epoch (1 per n_critic batches)
         for i, batch in enumerate(loader):
@@ -474,14 +520,27 @@ def train(config: Config):
         )
         if val_loader is not None:
             val_l1, val_psnr = validation_l1(G, val_loader, device)
-            val_history.append({"epoch": epoch + 1, "val_l1": val_l1, "val_psnr": val_psnr})
-            is_best = val_l1 < best["val_l1"]
+            agree = agree_real = None
+            score = val_l1
+            if selection_classifier is not None:
+                agree, agree_real = validation_agreement(G, val_loader, selection_classifier, device)
+                score = val_l1 - config.selection_alpha * (agree or 0.0)
+            val_history.append({"epoch": epoch + 1, "val_l1": val_l1, "val_psnr": val_psnr,
+                                "module1_agreement": agree, "module1_agreement_clinical": agree_real,
+                                "selection_score": score})
+            is_best = score < best["score"]
             if is_best:
-                best = {"epoch": epoch + 1, "val_l1": val_l1,
+                best = {"epoch": epoch + 1, "val_l1": val_l1, "score": score, "module1_agreement": agree,
                         "G": {k: v.detach().cpu().clone() for k, v in G.state_dict().items()}}
                 torch.save(best["G"], os.path.join(config.save_dir, "best-G.ckpt"))
             print(f"  val L1 {val_l1:.4f} | val PSNR {val_psnr:.2f} dB"
+                  + (f" | Module 1 agreement {agree:.1%} -> score {score:.4f}" if agree is not None else "")
                   + (" | ★ new best -> best-G.ckpt" if is_best else f" | best so far: epoch {best['epoch']}"))
+            if (config.early_stop_patience and best["epoch"]
+                    and epoch + 1 - best["epoch"] >= config.early_stop_patience):
+                stopped_at = epoch + 1
+                print(f"  Early stop: no better selection score for {config.early_stop_patience} epochs "
+                      f"(best: epoch {best['epoch']})")
 
         if (epoch + 1) % config.save_step == 0 or epoch == config.num_epochs - 1:
             G.eval()
@@ -500,8 +559,10 @@ def train(config: Config):
         save_resume_state(config.resume_state_path, epoch, {"G": G, "D": D},
                           {"g_opt": g_optimizer, "d_opt": d_optimizer},
                           {"loss_history": loss_history, "val_history": val_history, "best": best,
-                           "batch_log": batch_log},
-                          num_epochs=config.num_epochs)
+                           "batch_log": batch_log, "early_stopped_at": stopped_at},
+                          num_epochs=config.num_epochs if not stopped_at else epoch + 1)
+        if stopped_at:
+            break
 
     final_g_path = os.path.join(config.save_dir, "final-G.ckpt")
     torch.save(G.state_dict(), final_g_path)  # last epoch
@@ -510,8 +571,8 @@ def train(config: Config):
         best_g_path = os.path.join(config.save_dir, "best-G.ckpt")
         torch.save(best["G"], best_g_path)  # rewritten here too in case this runtime is a resumed one
         G.load_state_dict(best["G"])
-        print(f"\n✓ Best epoch: {best['epoch']} (val L1 {best['val_l1']:.4f}) -> {best_g_path}; "
-              f"final-G.ckpt = last epoch ({config.num_epochs})")
+        print(f"\n✓ Best epoch: {best['epoch']} (val L1 {best['val_l1']:.4f}, score {best['score']:.4f}) -> "
+              f"{best_g_path}; final-G.ckpt = last epoch ({stopped_at or config.num_epochs})")
     metrics_loader = val_loader if val_loader is not None else loader
 
     print(f"\n[4/4] Computing POC metrics (FID/PSNR/SSIM on up to {config.eval_batches} batches of the "
@@ -566,6 +627,11 @@ def train(config: Config):
         "split": split_info,
         "best_epoch": best["epoch"],
         "best_val_l1": best["val_l1"] if best["epoch"] else None,
+        "best_selection_score": best["score"] if best["epoch"] else None,
+        "best_module1_agreement": best.get("module1_agreement"),
+        "selection_classifier": config.selection_classifier_path,
+        "selection_alpha": config.selection_alpha if config.selection_classifier_path else None,
+        "early_stopped_at": stopped_at,
         "best_checkpoint": best_g_path,
         "metrics_model": "best-G" if best_g_path else "final-G",
         "metrics_on": "held-out val pairs" if val_loader is not None else "training pairs (not held out)",
@@ -614,6 +680,13 @@ if __name__ == "__main__":
     parser.add_argument("--condition-on", choices=["followup", "baseline"], default=Config.condition_on,
                          help="Stage the Generator is conditioned on: the follow-up visit's grade "
                               "(default -- what it must produce) or the baseline's (earlier behaviour)")
+    parser.add_argument("--selection-classifier-checkpoint", default=None,
+                         help="Module 1 grader: best epoch by val L1 - alpha x its agreement with the "
+                              "target stage on val outputs (omit = val L1 only)")
+    parser.add_argument("--selection-alpha", type=float, default=Config.selection_alpha)
+    parser.add_argument("--early-stop-patience", type=int, default=Config.early_stop_patience,
+                         help="Stop after N epochs without a better selection score (0 = off)")
+    add_classifier_norm_args(parser)
     parser.add_argument("--progress-fraction", type=float, default=Config.progress_fraction,
                          help="Oversample progressing pairs to this share of training samples "
                               "(0 = uniform shuffle, the earlier behaviour)")
@@ -645,6 +718,8 @@ if __name__ == "__main__":
                               "Give each run its own directory -- this script always trains G/D "
                               "from scratch and will silently overwrite an earlier run's "
                               "checkpoints left at the same path.")
+    parser.add_argument("--sample-dir", default=Config.sample_dir,
+                         help="Where epoch_<N>.jpg training samples go (give each run its own)")
     parser.add_argument("--min-n-for-fid", type=int, default=Config.min_n_for_fid,
                          help="Minimum eval samples before FID (feature=2048)/KID are reported "
                               "instead of None.")
@@ -674,6 +749,10 @@ if __name__ == "__main__":
     cfg.val_fraction = args.val_fraction
     cfg.condition_on = args.condition_on
     cfg.progress_fraction = args.progress_fraction
+    cfg.selection_classifier_path = args.selection_classifier_checkpoint
+    cfg.selection_alpha = args.selection_alpha
+    cfg.early_stop_patience = args.early_stop_patience
+    apply_classifier_norm_args(args)
     cfg.lambda_cls = args.lambda_cls
     cfg.g_lr, cfg.d_lr, cfg.n_critic = args.g_lr, args.d_lr, args.n_critic
     if cfg.d_lr > cfg.g_lr:
@@ -685,6 +764,7 @@ if __name__ == "__main__":
     cfg.batch_size = args.batch_size
     cfg.num_workers = args.num_workers
     cfg.save_dir = args.save_dir
+    cfg.sample_dir = args.sample_dir
     cfg.min_n_for_fid = args.min_n_for_fid
     cfg.eval_batches = args.eval_batches
     cfg.fid_n_bootstrap = args.fid_n_bootstrap
