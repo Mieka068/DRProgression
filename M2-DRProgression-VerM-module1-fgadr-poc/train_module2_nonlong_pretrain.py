@@ -48,6 +48,10 @@ Usage (Colab):
         --init-discriminator ./DRForestGAN-v2/stargan/models_nonlong/final-D.ckpt \
         --save-dir ./DRForestGAN-v2/stargan/models_poc_from_nonlong/
 
+Per-batch log (CODE_FIXES item 3.7): <save_dir>/batch_log.csv, one row per batch -- D loss and its
+adversarial / gradient-penalty / class terms, D's parameter-gradient norm, the mean gradient norm at
+the GP interpolates, and the G losses on G-step batches. Kept in the resume state as well.
+
 Dry run (synthetic images + labels, no data needed -- plumbing check only):
     python train_module2_nonlong_pretrain.py --dry-run --save-dir /tmp/nonlong_dry
 """
@@ -69,7 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from base_model import Discriminator, Generator  # noqa: E402
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
-from train_module2_poc import denorm, gradient_penalty  # noqa: E402
+from train_module2_poc import denorm, grad_norm, gradient_penalty, write_batch_log  # noqa: E402
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
@@ -324,6 +328,10 @@ def train(config):
     models, opts = {"G": G, "D": D, "R": R}, {"g_opt": g_opt, "d_opt": d_opt, "r_opt": r_opt}
     start_epoch, extra = load_resume_state(config.resume_state_path, models, opts, device)
     history = extra.get("history", [])
+    batch_log = extra.get("batch_log", [])
+    batch_log_path = os.path.join(config.save_dir, "batch_log.csv")
+    batch_fields = ["epoch", "batch", "g_step", "d_loss", "d_adv", "gp", "d_cls", "d_grad_norm",
+                    "gp_grad_norm", "g_loss", "g_adv", "g_cls", "g_cyc", "g_bio", "g_mono"]
     g_steps = history[-1].get("g_steps", 0) if history else 0  # G updates so far (1 per n_critic batches)
     for epoch in range(start_epoch, config.num_epochs):
         bio_on = use_bio and epoch >= config.bio_warmup_epochs
@@ -352,10 +360,15 @@ def train(config):
             with torch.no_grad():
                 fake = G(x_in, c_trg)
             out_fake, _ = D(fake)
-            gp = gradient_penalty(D, x, fake, device)
-            d_loss = d_real + out_fake.mean() + config.lambda_gp * gp + config.lambda_cls * d_cls
-            d_opt.zero_grad(); d_loss.backward(); d_opt.step()
+            gp, gp_norm = gradient_penalty(D, x, fake, device, return_norm=True)
+            d_adv = d_real + out_fake.mean()
+            d_loss = d_adv + config.lambda_gp * gp + config.lambda_cls * d_cls
+            d_opt.zero_grad(); d_loss.backward()
+            d_gnorm = grad_norm(D)
+            d_opt.step()
             sums["d"] += d_loss.item()
+            row = [epoch + 1, i, None, d_loss.item(), d_adv.item(), gp.item(), d_cls.item(), d_gnorm, gp_norm,
+                   None, None, None, None, None, None]
 
             # --- Generator ---
             if i % config.n_critic == 0:
@@ -385,6 +398,10 @@ def train(config):
                 r_opt.zero_grad()
                 sums["g"] += g_loss.item(); sums["cls"] += g_cls.item(); sums["cyc"] += g_cyc.item()
                 n_g += 1
+                row[2] = g_steps + n_g
+                row[9:] = [g_loss.item(), g_adv.item(), g_cls.item(), g_cyc.item(),
+                           g_bio.item() if bio_on else None, g_mono.item() if bio_on else None]
+            batch_log.append(row)
 
         nb = max(len(train_loader), 1)
         g_steps += n_g
@@ -405,7 +422,8 @@ def train(config):
         # per-epoch copies (~33 MB each) add up; resume uses resume_state, inference final-G.ckpt.
         if (epoch + 1) % config.save_every == 0:
             torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
-        save_resume_state(config.resume_state_path, epoch, models, opts, {"history": history},
+        write_batch_log(batch_log_path, batch_fields, batch_log)
+        save_resume_state(config.resume_state_path, epoch, models, opts, {"history": history, "batch_log": batch_log},
                           num_epochs=config.num_epochs)
 
     print("\n[4/4] Evaluating on the held-out val split...")

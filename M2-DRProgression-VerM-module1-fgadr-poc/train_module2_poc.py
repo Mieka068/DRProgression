@@ -63,6 +63,11 @@ change:
      grade -- and G is trained so D grades its output as target_grade:
        D: + lambda_cls * CE(cls_real, follow-up grade)    G: + lambda_cls * CE(cls_fake, target grade)
      --lambda-cls 0 = the earlier adversarial + reconstruction losses only.
+ 12. Per-batch log (item 3.7): <save_dir>/batch_log.csv gets one row per batch -- D loss, its
+     adversarial / gradient-penalty / class terms, D's parameter-gradient norm, the mean gradient
+     norm at the GP interpolates, and the G losses on G-step batches -- so a D-loss spike can be
+     located instead of hidden in an epoch mean. The rows live in the resume state too (a resumed
+     run keeps the earlier epochs' rows); the CSV is rewritten after every epoch.
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -80,6 +85,7 @@ notebooks/06_module2_poc_with_tianjin_colab.ipynb):
         --num-epochs 5
 """
 import argparse
+import csv
 import json
 import os
 import sys
@@ -155,7 +161,8 @@ class Config:
     fid_n_bootstrap = 10  # number of with-replacement resamples for the FID stability range
 
 
-def gradient_penalty(D, real, fake, device):
+def gradient_penalty(D, real, fake, device, return_norm=False):
+    """WGAN-GP term; with return_norm also the mean gradient norm at the interpolates (logged)."""
     batch_size = real.size(0)
     alpha = torch.rand(batch_size, 1, 1, 1).to(device)
     interpolates = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
@@ -167,8 +174,28 @@ def gradient_penalty(D, real, fake, device):
         create_graph=True,
         retain_graph=True,
     )[0]
-    gradients = gradients.view(batch_size, -1)
-    return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    norms = gradients.view(batch_size, -1).norm(2, dim=1)
+    gp = ((norms - 1) ** 2).mean()
+    return (gp, norms.detach().mean().item()) if return_norm else gp
+
+
+def grad_norm(module):
+    """L2 norm of all of module's parameter gradients (after backward)."""
+    sq = [p.grad.detach().pow(2).sum() for p in module.parameters() if p.grad is not None]
+    return float(torch.stack(sq).sum().sqrt()) if sq else 0.0
+
+
+def write_batch_log(path, fields, rows):
+    """Rewrites the per-batch CSV (rows: lists in `fields` order; None -> empty cell)."""
+    with open(path + ".tmp", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        w.writerows(["" if v is None else v for v in r] for r in rows)
+    os.replace(path + ".tmp", path)
+
+
+BATCH_LOG_FIELDS = ["epoch", "batch", "g_step", "d_loss", "d_adv", "gp", "d_cls", "d_grad_norm",
+                    "gp_grad_norm", "g_loss", "g_adv", "g_rec", "g_cls"]
 
 
 def denorm(x):
@@ -353,6 +380,8 @@ def train(config: Config):
     val_history = extra.get("val_history", [])
     best = extra.get("best", {"epoch": None, "val_l1": float("inf"), "G": None})
     g_steps = loss_history[-1].get("g_steps", 0) if loss_history else 0
+    batch_log = extra.get("batch_log", [])  # docstring point 12
+    batch_log_path = os.path.join(config.save_dir, "batch_log.csv")
 
     for epoch in range(start_epoch, config.num_epochs):
         epoch_g_loss = epoch_d_loss = epoch_rec_loss = epoch_cls_loss = 0
@@ -374,14 +403,19 @@ def train(config: Config):
                 fake = G(x_real, target_grade)
             out_fake, _ = D(fake)
             d_loss_fake = torch.mean(out_fake)
-            gp = gradient_penalty(D, follow_up, fake, device)
+            gp, gp_norm = gradient_penalty(D, follow_up, fake, device, return_norm=True)
             d_loss = d_loss_real + d_loss_fake + 10 * gp
+            d_cls = None
             if config.lambda_cls > 0 and cls_real_ok.any():
-                d_loss = d_loss + config.lambda_cls * F.cross_entropy(cls_real[cls_real_ok], target_idx[cls_real_ok])
+                d_cls = F.cross_entropy(cls_real[cls_real_ok], target_idx[cls_real_ok])
+                d_loss = d_loss + config.lambda_cls * d_cls
 
             d_optimizer.zero_grad()
             d_loss.backward()
+            d_gnorm = grad_norm(D)
             d_optimizer.step()
+            row = [epoch + 1, i, None, d_loss.item(), (d_loss_real + d_loss_fake).item(), gp.item(),
+                   None if d_cls is None else d_cls.item(), d_gnorm, gp_norm, None, None, None, None]
 
             if i % config.n_critic == 0:
                 fake = G(x_real, target_grade)
@@ -389,6 +423,7 @@ def train(config: Config):
                 g_loss_adv = -torch.mean(out_fake)
                 g_loss_rec = l1_loss(fake, follow_up)
                 g_loss = config.lambda_adv * g_loss_adv + config.lambda_rec * g_loss_rec
+                g_loss_cls = None
                 if config.lambda_cls > 0:
                     g_loss_cls = F.cross_entropy(cls_fake, target_idx)
                     g_loss = g_loss + config.lambda_cls * g_loss_cls
@@ -402,7 +437,11 @@ def train(config: Config):
                 epoch_rec_loss += g_loss_rec.item()
                 n_g += 1
                 g_steps += 1
+                row[2] = g_steps
+                row[9:] = [g_loss.item(), g_loss_adv.item(), g_loss_rec.item(),
+                           None if g_loss_cls is None else g_loss_cls.item()]
             epoch_d_loss += d_loss.item()
+            batch_log.append(row)
 
         elapsed = time.time() - start_time
         # G losses are means over the epoch's G steps, D loss over its batches (n_critic > 1).
@@ -442,9 +481,11 @@ def train(config: Config):
             G.train()
             torch.save(G.state_dict(), os.path.join(config.save_dir, f"{epoch + 1}-G.ckpt"))
 
+        write_batch_log(batch_log_path, BATCH_LOG_FIELDS, batch_log)
         save_resume_state(config.resume_state_path, epoch, {"G": G, "D": D},
                           {"g_opt": g_optimizer, "d_opt": d_optimizer},
-                          {"loss_history": loss_history, "val_history": val_history, "best": best},
+                          {"loss_history": loss_history, "val_history": val_history, "best": best,
+                           "batch_log": batch_log},
                           num_epochs=config.num_epochs)
 
     final_g_path = os.path.join(config.save_dir, "final-G.ckpt")
@@ -514,6 +555,7 @@ def train(config: Config):
         "metrics": metrics,
         "val_history": val_history,
         "loss_history": loss_history,
+        "batch_log": batch_log_path,
         "total_time_min": (time.time() - start_time) / 60,
     }
     results_path = os.path.join(config.save_dir, "poc_results.json")
