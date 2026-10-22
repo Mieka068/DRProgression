@@ -41,6 +41,13 @@ dr_segmentation/train.py + utils.py -- also reused for DDR (same layout as IDRiD
   values; the group transforms treat it identically), cutting mask memory to a third -- needed
   for DDR (532 images) and the FGADR + DDR combined run (853) to fit in Colab's RAM.
 
+Small-lesion loss (separate marker, applies to already-patched clones; CODE_FIXES item 1.4):
+  DRG-Net's config has LESION_DICE_WEIGHT, but train.py / train_fgadr.py never read it -- the loss is
+  plain class-weighted cross-entropy. With DRG_SEG_DICE_WEIGHT=w > 0 the patch adds w x soft Dice
+  loss (1 - Dice of the lesion-class softmax vs. the mask, per batch) to it, which weighs a lesion
+  by its area rather than its pixel count -- aimed at microaneurysms, whose few pixels barely move
+  the CE loss. Unset / 0 = DRG-Net's loss.
+
 Drive mirroring (separate marker, applies to already-patched clones): every overwrite of a file on
 a Colab-mounted Drive leaves the old copy behind, counted against the Drive quota -- rewriting
 ~250 MB checkpoints every few epochs straight onto Drive fills it within hours, after which model
@@ -187,6 +194,17 @@ UTILS_DATASET_EDITS = [
 ]
 
 
+LOSS_MARK = "# [loss patch]"
+SEG_LOSS_ANCHOR = "            ce_weight = 1.\n            g_loss = loss_ce * ce_weight\n"
+SEG_LOSS_EDITS = [(SEG_LOSS_ANCHOR, SEG_LOSS_ANCHOR + """\
+            _dice_w = float(os.environ.get('DRG_SEG_DICE_WEIGHT', 0))  # [loss patch] soft Dice term
+            if _dice_w > 0:
+                _p = torch.softmax(masks_pred, dim=1)[:, 1]
+                _t = true_masks_indices.float()
+                g_loss = g_loss + _dice_w * (1 - (2 * (_p * _t).sum() + 1.) / (_p.sum() + _t.sum() + 1.))
+""")]
+
+
 MIRROR_MARK = "# [mirror patch]"
 
 
@@ -235,6 +253,7 @@ def apply(drg_root):
     _patch(os.path.join(drg_root, "dr_segmentation", "dataset.py"), DATASET_PY_EDITS, DATASET_MARK)
     for script in ("train.py", "train_fgadr.py"):
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_MIRROR_EDITS, MIRROR_MARK)
+        _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_LOSS_EDITS, LOSS_MARK)
     _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_MIRROR_EDITS, MIRROR_MARK)
 
 
