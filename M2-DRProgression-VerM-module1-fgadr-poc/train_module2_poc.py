@@ -37,6 +37,10 @@ change:
      which were pretrained on a large cross-sectional graded set (EyePACS) to learn stage
      appearance + per-stage biomarkers. This script is then the longitudinal fine-tuning stage.
      Architecture args (image_size, conv dims, repeat nums, style_dim) must match the pretrain.
+     The Discriminator is NOT loaded by default (--init-discriminator-mode fresh, CODE_FIXES 3.5):
+     the pretrained critic was tuned to EyePACS images and its stage head ended at 0 % accuracy on
+     real val images, so it starts fine-tuning from random init; 'reset-cls-head' loads it but
+     re-initializes the class head; 'full' loads all of it (the earlier behaviour).
   8. Best-epoch saving: val_fraction (default 0.1) of the eyes/patients of each source are held
      out (combined_dataset.get_combined_train_val_loaders -- split by eye/patient, never seen in
      training). After every epoch G is scored on them by mean L1 between its synthesized
@@ -109,6 +113,7 @@ class Config:
     registration_cache_path = None  # optional -- see module1/train_registration.py
     init_generator_path = None  # optional -- see docstring point 7
     init_discriminator_path = None
+    init_discriminator_mode = "fresh"  # fresh / reset-cls-head / full -- docstring point 7
     resume_state_path = None  # optional -- per-epoch resume file (see resume_utils.py)
     seed = 0  # fixes weight init / shuffling / augmentation so runs are reproducible
     val_fraction = 0.1  # eyes/patients held out for best-epoch selection (docstring point 8)
@@ -319,9 +324,15 @@ def train(config: Config):
     if config.init_generator_path:
         G.load_state_dict(torch.load(config.init_generator_path, map_location=device))
         print(f"✓ Initialized Generator from {config.init_generator_path}")
-    if config.init_discriminator_path:
+    if config.init_discriminator_path and config.init_discriminator_mode == "fresh":
+        print(f"  Discriminator: random init (--init-discriminator-mode fresh) -- "
+              f"{config.init_discriminator_path} not loaded")
+    elif config.init_discriminator_path:
         D.load_state_dict(torch.load(config.init_discriminator_path, map_location=device))
-        print(f"✓ Initialized Discriminator from {config.init_discriminator_path}")
+        if config.init_discriminator_mode == "reset-cls-head":
+            D.conv2.reset_parameters()
+        print(f"✓ Initialized Discriminator from {config.init_discriminator_path}"
+              + (" (class head re-initialized)" if config.init_discriminator_mode == "reset-cls-head" else ""))
 
     g_optimizer = optim.Adam(G.parameters(), lr=config.g_lr, betas=(config.beta1, config.beta2))
     d_optimizer = optim.Adam(D.parameters(), lr=config.d_lr, betas=(config.beta1, config.beta2))
@@ -488,6 +499,7 @@ def train(config: Config):
         "registration_cache_path": config.registration_cache_path,
         "init_generator_path": config.init_generator_path,
         "init_discriminator_path": config.init_discriminator_path,
+        "init_discriminator_mode": config.init_discriminator_mode,
         "resumed_from_epoch": start_epoch,
         "seed": config.seed,
         "val_fraction": config.val_fraction,
@@ -530,7 +542,12 @@ if __name__ == "__main__":
                          help="Optional G checkpoint to start from, e.g. "
                               "train_module2_nonlong_pretrain.py's final-G.ckpt")
     parser.add_argument("--init-discriminator", default=None,
-                         help="Optional D checkpoint to start from (final-D.ckpt from the pretrain)")
+                         help="Optional D checkpoint (final-D.ckpt from the pretrain); how it is used "
+                              "depends on --init-discriminator-mode")
+    parser.add_argument("--init-discriminator-mode", choices=["fresh", "reset-cls-head", "full"],
+                         default=Config.init_discriminator_mode,
+                         help="fresh (default): random-init D even if --init-discriminator is given; "
+                              "reset-cls-head: load it but re-init the stage head; full: load all (earlier)")
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--val-fraction", type=float, default=Config.val_fraction,
                          help="Fraction of eyes/patients held out for best-epoch selection "
@@ -588,6 +605,7 @@ if __name__ == "__main__":
     cfg.registration_cache_path = args.registration_cache
     cfg.init_generator_path = args.init_generator
     cfg.init_discriminator_path = args.init_discriminator
+    cfg.init_discriminator_mode = args.init_discriminator_mode
     cfg.resume_state_path = args.resume_state
     cfg.seed = args.seed
     cfg.val_fraction = args.val_fraction
