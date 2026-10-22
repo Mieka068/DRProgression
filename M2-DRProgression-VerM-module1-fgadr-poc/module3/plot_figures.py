@@ -4,7 +4,8 @@ few representative per-patient Weibull survival curves across LBS strata.
 
 The calibration/ROC/survival-curve figures need per-patient predictions, which
 train_module3_poc.py's own evaluate() only ever aggregates -- so this script rebuilds the
-SAME held-out val split (same seed/val_fraction, read back from poc_results.json) and reruns
+SAME held-out split -- the test patients when the run had a test split (item 6.1), else val
+(same seed/fractions, read back from poc_results.json) -- and reruns
 the saved checkpoint over it, the same "load a trained checkpoint and recompute" pattern
 visualize_trajectory.py already uses for Module 3. This never re-trains anything.
 
@@ -42,13 +43,17 @@ def load_val_predictions(tianjin_dir, tianjin_module1_cache, checkpoint_path, po
         results = json.load(f)
     seed = results.get("seed", 42)
     val_fraction = results.get("val_fraction", 0.2)
+    test_fraction = results.get("test_fraction", 0.0)
     image_size = results.get("image_size", 380)
     batch_size = results.get("batch_size", 8)
 
     full_dataset = TianjinSurvivalDataset(
-        tianjin_dir, module1_cache_path=tianjin_module1_cache, image_size=image_size
+        tianjin_dir, module1_cache_path=tianjin_module1_cache, image_size=image_size,
+        min_baseline_grade=results.get("min_baseline_grade", 0),
     )
-    _, val_set = patient_level_split(full_dataset, val_fraction=val_fraction, seed=seed)
+    # The patients the reported metrics come from: the test split when the run had one (item 6.1).
+    splits = patient_level_split(full_dataset, val_fraction=val_fraction, seed=seed, test_fraction=test_fraction)
+    val_set = splits[-1]
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, drop_last=False)
 
     model = EfficientNetWeibullSurvival(pretrained=False).to(device)

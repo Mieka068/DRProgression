@@ -34,6 +34,18 @@ final-model.ckpt stays the last epoch. The reported metrics are best-model's. Ca
 patients both pick the epoch and give the reported metrics, so those metrics are slightly
 optimistic -- there is no separate test split at this data size.
 
+Changes on branch AllModuleEdits-PreFinals (CODE_FIXES section 6; each has a flag back to the
+earlier behaviour):
+  6.1 Patient-level train / val / test = 70 / 15 / 15 (--val-fraction 0.15 --test-fraction 0.15):
+      val picks the epoch, the TEST patients (never used for selection) give the reported
+      metrics; val metrics are reported alongside. --test-fraction 0 --val-fraction 0.2 = the
+      earlier train/val split (and the optimism caveat above applies again).
+  6.2 --freeze-blocks N (default 6): the stem and MBConv stages 1-5 keep their ImageNet
+      weights; 0 = fine-tune the whole backbone.
+  6.3 Train-time augmentation (h-flip, +/-15 deg rotation, mild brightness/contrast;
+      --no-augment = off) and AdamW weight decay (--weight-decay, default 1e-2; 0 = Adam as before).
+  7.2 --min-baseline-grade 1 keeps only eyes that start at >= mild NPDR (default 0: all).
+
 Usage (Colab, after notebook 05 has built module1_outputs_tianjin.pt):
     python train_module3_poc.py \
         --tianjin-dir /content/data/retinal-dr-longitudinal \
@@ -63,7 +75,12 @@ class Config:
     tianjin_module1_cache_path = None
     image_size = 380
     batch_size = 8
-    val_fraction = 0.2
+    val_fraction = 0.15
+    test_fraction = 0.15  # 0 = no test split (earlier behaviour, with val_fraction 0.2)
+    freeze_blocks = 6  # stem + MBConv stages 1-5 (3.6M of 17.5M backbone params); 0 = all trained
+    augment = True
+    weight_decay = 1e-2
+    min_baseline_grade = 0
     num_epochs = 10
     lr = 1e-4
     save_dir = "./module3_runs_poc/"
@@ -137,16 +154,28 @@ def train(config: Config):
         config.tianjin_dir,
         module1_cache_path=config.tianjin_module1_cache_path,
         image_size=config.image_size,
+        min_baseline_grade=config.min_baseline_grade,
     )
-    train_set, val_set = patient_level_split(full_dataset, val_fraction=config.val_fraction, seed=config.seed)
-    print(f"✓ {len(full_dataset)} usable pairs -> {len(train_set)} train / {len(val_set)} val (patient-level split)")
+    splits = patient_level_split(full_dataset, val_fraction=config.val_fraction, seed=config.seed,
+                                 test_fraction=config.test_fraction, augment_train=config.augment)
+    train_set, val_set = splits[0], splits[1]
+    test_set = splits[2] if len(splits) == 3 else None
+    print(f"✓ {len(full_dataset)} usable pairs -> {len(train_set)} train / {len(val_set)} val"
+          + (f" / {len(test_set)} test" if test_set is not None else "") + " (patient-level split)"
+          + (" | train augmentation on" if config.augment else ""))
 
     train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False, drop_last=False)
+    test_loader = (DataLoader(test_set, batch_size=config.batch_size, shuffle=False, drop_last=False)
+                   if test_set is not None and len(test_set) else None)
 
     print("\n[2/4] Initializing model (ImageNet-pretrained EfficientNet-B4 backbone)...")
-    model = EfficientNetWeibullSurvival(pretrained=True).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    model = EfficientNetWeibullSurvival(pretrained=True, freeze_blocks=config.freeze_blocks).to(device)
+    trainable = [prm for prm in model.parameters() if prm.requires_grad]
+    print(f"  freeze_blocks={config.freeze_blocks}: {sum(p.numel() for p in trainable):,} of "
+          f"{sum(p.numel() for p in model.parameters()):,} parameters trained")
+    # AdamW with weight_decay 0 is plain Adam (the earlier optimizer).
+    optimizer = optim.AdamW(trainable, lr=config.lr, weight_decay=config.weight_decay)
 
     print(f"\n[3/4] Training for {config.num_epochs} epochs (POC scale)...")
     start_time = time.time()
@@ -199,28 +228,45 @@ def train(config: Config):
               f"final-model.ckpt = last epoch ({config.num_epochs})")
 
     print(f"\n[4/4] Evaluating {'best-model' if best_path else 'final-model'} on held-out patients...")
-    metrics = evaluate(model, val_loader, device)
-    print(
-        f"✓ n={metrics['n']} | mean predicted P(progression by 2yr)="
-        f"{metrics['mean_predicted_progression_by_2yr']:.3f} | actual rate="
-        f"{metrics['actual_progression_rate']:.3f} | AUROC={metrics['auroc']:.3f} | "
-        f"Brier={metrics['brier_score']:.4f}"
-    )
+    val_metrics = evaluate(model, val_loader, device)
+    test_metrics = evaluate(model, test_loader, device) if test_loader is not None else None
+    # The reported metrics: test patients when there is a test split (never used to pick the
+    # epoch), else val (the earlier, slightly optimistic setup).
+    metrics = test_metrics if test_metrics is not None else val_metrics
+    for name, m in (("val (epoch selection)", val_metrics), ("TEST", test_metrics)):
+        if m is None:
+            continue
+        print(
+            f"✓ {name}: n={m['n']} | mean predicted P(progression by 2yr)="
+            f"{m['mean_predicted_progression_by_2yr']:.3f} | actual rate="
+            f"{m['actual_progression_rate']:.3f} | AUROC={m['auroc']:.3f} | "
+            f"Brier={m['brier_score']:.4f} (constant-rate guess: "
+            f"{m['actual_progression_rate'] * (1 - m['actual_progression_rate']):.4f})"
+        )
 
     results = {
         "num_epochs": config.num_epochs,
         "n_train": len(train_set),
         "n_val": len(val_set),
+        "n_test": len(test_set) if test_set is not None else 0,
         "tianjin_module1_cache_path": config.tianjin_module1_cache_path,
         "best_epoch": best["epoch"],
         "best_val_nll": best["val_nll"] if best["epoch"] else None,
         "best_checkpoint": best_path,
         "metrics_model": "best-model" if best_path else "final-model",
+        "metrics_on": "test patients" if test_metrics is not None else "val patients (also used for epoch selection)",
         "metrics": metrics,
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
         "loss_history": loss_history,
         "total_time_min": (time.time() - start_time) / 60,
         "seed": config.seed,
         "val_fraction": config.val_fraction,
+        "test_fraction": config.test_fraction,
+        "freeze_blocks": config.freeze_blocks,
+        "augment": config.augment,
+        "weight_decay": config.weight_decay,
+        "min_baseline_grade": config.min_baseline_grade,
         "image_size": config.image_size,
         "batch_size": config.batch_size,
     }
@@ -251,6 +297,18 @@ if __name__ == "__main__":
     parser.add_argument("--num-epochs", type=int, default=Config.num_epochs)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--lr", type=float, default=Config.lr)
+    parser.add_argument("--val-fraction", type=float, default=Config.val_fraction)
+    parser.add_argument("--test-fraction", type=float, default=Config.test_fraction,
+                        help="Patients held out for the reported metrics (0 = no test split, earlier)")
+    parser.add_argument("--freeze-blocks", type=int, default=Config.freeze_blocks,
+                        help="Frozen EfficientNet-B4 feature blocks (0 = fine-tune all, earlier)")
+    parser.add_argument("--no-augment", dest="augment", action="store_false",
+                        help="No train-time augmentation (earlier behaviour)")
+    parser.add_argument("--weight-decay", type=float, default=Config.weight_decay,
+                        help="AdamW weight decay (0 = Adam, earlier)")
+    parser.add_argument("--min-baseline-grade", type=int, default=Config.min_baseline_grade,
+                        help="1 = only eyes starting at >= mild NPDR (item 7.2); 0 = all")
+    parser.add_argument("--save-dir", default=Config.save_dir)
     parser.add_argument("--resume-state", default=None,
                         help="Per-epoch resume file (put it on Drive); re-running with the same path "
                              "continues after the last finished epoch")
@@ -263,5 +321,9 @@ if __name__ == "__main__":
     cfg.batch_size = args.batch_size
     cfg.lr = args.lr
     cfg.resume_state_path = args.resume_state
+    cfg.val_fraction, cfg.test_fraction = args.val_fraction, args.test_fraction
+    cfg.freeze_blocks, cfg.augment, cfg.weight_decay = args.freeze_blocks, args.augment, args.weight_decay
+    cfg.min_baseline_grade = args.min_baseline_grade
+    cfg.save_dir = args.save_dir
 
     train(cfg)

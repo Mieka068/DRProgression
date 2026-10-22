@@ -71,7 +71,8 @@ class TianjinSurvivalDataset(Dataset):
     a plain random split to avoid leaking a patient across train/val.
     """
 
-    def __init__(self, dataset_dir, module1_cache_path, image_size=380, fixed_followup_years=2.0):
+    def __init__(self, dataset_dir, module1_cache_path, image_size=380, fixed_followup_years=2.0,
+                 min_baseline_grade=0):
         """
         Args:
             dataset_dir: path to the extracted usama10/retinal-dr-longitudinal dataset (same
@@ -86,6 +87,9 @@ class TianjinSurvivalDataset(Dataset):
                 interval is fixed at 2 years for the whole cohort, exposed as a parameter
                 rather than hardcoded so a future variable-interval source can reuse this
                 class/interface.
+            min_baseline_grade: drop eye-pairs whose baseline ICDR grade is below this -- 1 keeps
+                only eyes starting at >= mild NPDR (the manuscript's scope, CODE_FIXES item 7.2); 0
+                (default) keeps Stage 0 baselines too.
         """
         self.dataset_dir = dataset_dir
         self.image_size = image_size
@@ -146,6 +150,10 @@ class TianjinSurvivalDataset(Dataset):
 
         manifest["baseline_icdr"] = manifest["baseline_grade_raw"].astype(int).map(tianjin_grade_to_icdr)
         manifest["followup_icdr"] = manifest["followup_grade_raw"].astype(int).map(tianjin_grade_to_icdr)
+        if min_baseline_grade > 0:
+            before = len(manifest)
+            manifest = manifest[manifest["baseline_icdr"] >= min_baseline_grade]
+            print(f"  Baseline grade >= {min_baseline_grade} (min_baseline_grade): {before} -> {len(manifest)} pairs")
         # Event = progressed by at least one ICDR stage within the fixed follow-up window.
         manifest["event"] = (manifest["followup_icdr"] > manifest["baseline_icdr"]).astype(int)
         manifest["time_to_followup"] = fixed_followup_years
@@ -198,6 +206,26 @@ class TianjinSurvivalDataset(Dataset):
                 transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ]
         )
+        # Train-time augmentation (item 6.3), only on the training view (augmented_view()): h-flip,
+        # +/-15 deg rotation, mild brightness/contrast -- the same medically safe set as Module 2's.
+        self.augment = False
+        self.augment_transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(15),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ]
+        )
+
+    def augmented_view(self):
+        """Same rows, augmented images -- for the training Subset (val/test stay un-augmented)."""
+        view = TianjinSurvivalDataset.__new__(TianjinSurvivalDataset)
+        view.__dict__.update(self.__dict__)
+        view.augment = True
+        return view
 
     @staticmethod
     def _load_progression_labels(dataset_dir) -> pd.DataFrame:
@@ -293,7 +321,7 @@ class TianjinSurvivalDataset(Dataset):
             img = Image.open(baseline_path).convert("RGB")
         except Exception:
             return self.__getitem__((idx + 1) % len(self.manifest))
-        img = self.transform(img)
+        img = (self.augment_transform if self.augment else self.transform)(img)
 
         return {
             "baseline": img,
@@ -307,22 +335,36 @@ class TianjinSurvivalDataset(Dataset):
         }
 
 
-def patient_level_split(dataset: TianjinSurvivalDataset, val_fraction=0.2, seed=42):
+def patient_level_split(dataset: TianjinSurvivalDataset, val_fraction=0.2, seed=42, test_fraction=0.0,
+                        augment_train=False):
     """
     Splits at the patient level, not the row level -- a plain torch.utils.data.random_split
     could put the same patient's two eyes into both train and val, leaking the label across
     the split.
+
+    test_fraction > 0 (CODE_FIXES item 6.1) also holds out a test set of patients, taken first
+    from the shuffled patient list, then val: (train, val, test). Val picks the epoch, test is
+    only for the reported metrics. test_fraction=0 returns (train, val) exactly as before (the
+    same patients for the same seed/val_fraction). augment_train: the train Subset uses
+    dataset.augmented_view() (item 6.3).
     """
     patient_ids = dataset.manifest["patient_id"].tolist()
     unique_patients = sorted(set(patient_ids))
     rng = random.Random(seed)
     rng.shuffle(unique_patients)
+    n_test_patients = int(round(len(unique_patients) * test_fraction)) if test_fraction > 0 else 0
+    test_patients = set(unique_patients[:n_test_patients])
+    rest = unique_patients[n_test_patients:]
     n_val_patients = max(1, int(len(unique_patients) * val_fraction))
-    val_patients = set(unique_patients[:n_val_patients])
+    val_patients = set(rest[:n_val_patients])
 
-    train_idx = [i for i, pid in enumerate(patient_ids) if pid not in val_patients]
+    train_idx = [i for i, pid in enumerate(patient_ids) if pid not in val_patients and pid not in test_patients]
     val_idx = [i for i, pid in enumerate(patient_ids) if pid in val_patients]
-    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+    train_ds = dataset.augmented_view() if augment_train else dataset
+    if not test_fraction > 0:
+        return Subset(train_ds, train_idx), Subset(dataset, val_idx)
+    test_idx = [i for i, pid in enumerate(patient_ids) if pid in test_patients]
+    return Subset(train_ds, train_idx), Subset(dataset, val_idx), Subset(dataset, test_idx)
 
 
 if __name__ == "__main__":
