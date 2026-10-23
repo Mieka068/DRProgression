@@ -184,11 +184,19 @@ def plot_survival_curves(records, out_path, baseline_grade=None, t_max=4.0, n_po
             strata_present = set(r["lbs_stratum_idx"] for r in records if r["baseline_grade"] == g)
             if strata_present == {0, 1, 2}:
                 grades_with_all_strata.append(g)
-        if not grades_with_all_strata:
-            raise ValueError("No single baseline grade has patients in all 3 LBS strata in "
-                              "the val set -- pass --baseline-grade explicitly and accept a "
-                              "partial comparison.")
-        baseline_grade = grades_with_all_strata[0]
+        if grades_with_all_strata:
+            baseline_grade = grades_with_all_strata[0]
+        else:
+            # Small held-out split (e.g. the 15 % test patients): no grade covers all 3 strata. Plot
+            # the grade covering the most (a partial comparison, said in the title) instead of failing.
+            if not records:
+                print("⚠ No held-out predictions -- survival-curve figure skipped")
+                return
+            n_strata = {g: len({r["lbs_stratum_idx"] for r in records if r["baseline_grade"] == g})
+                        for g in {r["baseline_grade"] for r in records}}
+            baseline_grade = max(sorted(n_strata), key=lambda g: n_strata[g])
+            print(f"⚠ No baseline grade has patients in all 3 LBS strata in the held-out split -- plotting "
+                  f"grade {baseline_grade} ({n_strata[baseline_grade]} strata); pass --baseline-grade to choose")
 
     t = np.linspace(0.01, t_max, n_points)
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -204,7 +212,9 @@ def plot_survival_curves(records, out_path, baseline_grade=None, t_max=4.0, n_po
     ax.set_xlabel("Time (years)")
     ax.set_ylabel("S(t) = P(no progression by t)")
     ax.set_ylim(0, 1.02)
-    ax.set_title(f"Module 3: example survival curves by LBS stratum (baseline ICDR grade {baseline_grade})\n"
+    n_shown = len(ax.get_lines()) - 1  # minus the 2-year marker
+    partial = "" if n_shown == 3 else f", {n_shown} of 3 strata present"
+    ax.set_title(f"Module 3: example survival curves by LBS stratum (baseline ICDR grade {baseline_grade}{partial})\n"
                  "Note: only t=2yr has training signal -- other horizons are the fitted "
                  "Weibull's extrapolation.")
     ax.legend(fontsize=8)
@@ -228,11 +238,11 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print("Rebuilding val split and running the trained checkpoint over it...")
+    print("Rebuilding the held-out split (test patients, else val) and running the checkpoint over it...")
     records = load_val_predictions(
         args.tianjin_dir, args.tianjin_module1_cache, args.checkpoint, args.poc_results_json, args.device
     )
-    print(f"✓ {len(records)} val predictions")
+    print(f"✓ {len(records)} held-out predictions")
 
     plot_calibration(records, os.path.join(args.out_dir, "module3_calibration.png"))
     plot_roc(records, os.path.join(args.out_dir, "module3_roc.png"))
