@@ -118,7 +118,7 @@ change that alters results keeps the earlier behaviour behind a flag:
 | 1.1 / 1.2 | Lesion segmentation on overlapping 512 px tiles of a ~1280 px retina crop (pipeline, `evaluate_segmentation_dice_iou.py`, seg-grid figure); grader also sees the retina crop; masks clipped to the field of view | `--seg-mode resize --no-retina-crop` |
 | 1.3 / 1.4 | FGADR + DDR segmenters to 200 epochs (per-lesion `SEG_EPOCHS`, resumes from 100); soft Dice term for MA (`SEG_DICE_WEIGHT`, `DRG_SEG_DICE_WEIGHT`) | `SEG_EPOCHS` 100, `SEG_DICE_WEIGHT = {}` |
 | 1.5 | Grader learning-curve cell fixed (bash syntax error) | -- |
-| 1.7 | EyePACS pickle: blank `Usage` = training image (was dropped -> 0 train images); EyePACS grader trained (nb 11, progressively balanced) and used as `CLASSIFIER_RUN = 'eyepacs'` (falls back to FGADR's until it exists) | `CLASSIFIER_RUN = 'fgadr'` |
+| 1.7 | EyePACS pickle: blank `Usage` = training image (was dropped -> 0 train images). The EyePACS grader is ready to train (nb 11 `RUN['eyepacs_cls']`, progressively balanced) but OFF for now; the pipeline uses the FGADR grader (`CLASSIFIER_RUN = 'fgadr'`; `'eyepacs'` once trained) | -- |
 | 2.1 / 2.2 | Fine-tuning conditions on the FOLLOW-UP grade (Tianjin clinical; FIRE/LongDR Module 1's grade of the follow-up image) | `--condition-on baseline` |
 | 2.3 | Stage classification loss in fine-tuning (D on clinically graded real follow-ups, G on its outputs) | `--lambda-cls 0` |
 | 2.4 | Progressing pairs oversampled to 30 % of training samples | `--progress-fraction 0` |
@@ -140,8 +140,8 @@ checkpoints from `mod-2-NonLongIntegration` (including the EyePACS pretraining) 
 default models -- the scripts stop with an error naming `--model-arch legacy`, which loads them. The
 whole Module 2 chain (09 pretraining -> 06 fine-tuning) must be retrained on this branch.
 
-**Re-run order:** 11 (tiled re-evaluation, 200-epoch segmenters, EyePACS grader + laterality
-validation) -> 04_05 (rebuild all Module 1 caches) -> 09 (EyePACS cache, profiles, pretraining) -> 06
+**Re-run order:** 11 (tiled re-evaluation, 200-epoch segmenters, laterality validation on an
+EyePACS sample) -> 04_05 (rebuild all Module 1 caches) -> 09 (EyePACS cache, profiles, pretraining) -> 06
 (fine-tuning, trajectory evaluation, epoch-0 eval; then optionally the `USE_NONLONG_PRETRAIN = False`
 ablation) -> 07 -> 08 -> 10.
 
