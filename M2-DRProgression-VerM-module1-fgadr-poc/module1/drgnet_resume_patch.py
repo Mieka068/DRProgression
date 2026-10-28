@@ -48,6 +48,10 @@ Small-lesion loss (separate marker, applies to already-patched clones; CODE_FIXE
   by its area rather than its pixel count -- aimed at microaneurysms, whose few pixels barely move
   the CE loss. Unset / 0 = DRG-Net's loss.
 
+Resume loading (separate marker): PyTorch >= 2.6 defaults torch.load to weights_only=True, which
+  rejects model_last.pth.tar (numpy scalars inside), so a resumed segmentation run crashed before
+  training -- the resume load now passes weights_only=False (and best_ap is saved as a plain float).
+
 Drive mirroring (separate marker, applies to already-patched clones): every overwrite of a file on
 a Colab-mounted Drive leaves the old copy behind, counted against the Drive quota -- rewriting
 ~250 MB checkpoints every few epochs straight onto Drive fills it within hours, after which model
@@ -155,7 +159,7 @@ def seg_edits(eval_every, save_anchor):
                 or epoch + 1 == start_epoch + num_epochs:  # [resume patch]
             _last = os.path.join(dir_checkpoint, 'model_last.pth.tar')
             torch.save({'epoch': epoch, 'step': tot_step_count, 'state_dict': model.state_dict(),
-                        'optimizer': g_optimizer.state_dict(), 'best_ap': best_ap}, _last + '.tmp')
+                        'optimizer': g_optimizer.state_dict(), 'best_ap': float(best_ap)}, _last + '.tmp')
             os.replace(_last + '.tmp', _last)
 """
     return [
@@ -203,6 +207,14 @@ SEG_LOSS_EDITS = [(SEG_LOSS_ANCHOR, SEG_LOSS_ANCHOR + """\
                 _t = true_masks_indices.float()
                 g_loss = g_loss + _dice_w * (1 - (2 * (_p * _t).sum() + 1.) / (_p.sum() + _t.sum() + 1.))
 """)]
+
+
+# PyTorch >= 2.6 loads with weights_only=True by default, which rejects DRG-Net's resume checkpoints
+# (they hold numpy scalars, e.g. best_ap): resuming crashed on Colab before training started. Our own
+# checkpoint files, so load them fully. Separate marker, so already-patched clones get it too.
+LOAD_MARK = "# [load patch]"
+SEG_LOAD_EDITS = [("            checkpoint = torch.load(resume)\n",
+                   "            checkpoint = torch.load(resume, weights_only=False)  # [load patch]\n")]
 
 
 MIRROR_MARK = "# [mirror patch]"
@@ -254,6 +266,7 @@ def apply(drg_root):
     for script in ("train.py", "train_fgadr.py"):
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_MIRROR_EDITS, MIRROR_MARK)
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_LOSS_EDITS, LOSS_MARK)
+        _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_LOAD_EDITS, LOAD_MARK)
     _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_MIRROR_EDITS, MIRROR_MARK)
 
 
