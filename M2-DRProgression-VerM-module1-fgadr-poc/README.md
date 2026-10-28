@@ -118,7 +118,7 @@ change that alters results keeps the earlier behaviour behind a flag:
 | 1.1 / 1.2 | Lesion segmentation on overlapping 512 px tiles of a ~1280 px retina crop (pipeline, `evaluate_segmentation_dice_iou.py`, seg-grid figure); grader also sees the retina crop; masks clipped to the field of view | `--seg-mode resize --no-retina-crop` |
 | 1.3 / 1.4 | FGADR + DDR segmenters to 200 epochs (per-lesion `SEG_EPOCHS`, resumes from 100); soft Dice term for MA (`SEG_DICE_WEIGHT`, `DRG_SEG_DICE_WEIGHT`) | `SEG_EPOCHS` 100, `SEG_DICE_WEIGHT = {}` |
 | 1.5 | Grader learning-curve cell fixed (bash syntax error) | -- |
-| 1.7 | EyePACS pickle: blank `Usage` = training image (was dropped -> 0 train images). The EyePACS grader is ready to train (nb 11 `RUN['eyepacs_cls']`, progressively balanced) but OFF for now; the pipeline uses the FGADR grader (`CLASSIFIER_RUN = 'fgadr'`; `'eyepacs'` once trained) | -- |
+| 1.7 | EyePACS pickle: blank `Usage` = training image (was dropped -> 0 train images). EyePACS grader trained in nb 11 (capped at `EYEPACS_MAX_PER_GRADE` = 3000/grade, progressively balanced; test acc 0.762 / kappa 0.721). Pipeline default `CLASSIFIER_RUN = 'eyepacs'` (its `best_validation_weights.pt`); nb 04_05's grader-comparison cell (`module1/compare_graders_tianjin.py`) scores both graders against Tianjin's clinical grades to confirm the choice | `CLASSIFIER_RUN = 'fgadr'` |
 | 2.1 / 2.2 | Fine-tuning conditions on the FOLLOW-UP grade (Tianjin clinical; FIRE/LongDR Module 1's grade of the follow-up image) | `--condition-on baseline` |
 | 2.3 | Stage classification loss in fine-tuning (D on clinically graded real follow-ups, G on its outputs) | `--lambda-cls 0` |
 | 2.4 | Progressing pairs oversampled to 30 % of training samples | `--progress-fraction 0` |
@@ -132,7 +132,7 @@ change that alters results keeps the earlier behaviour behind a flag:
 | 5.3 | Best epoch = lowest val L1 - 0.1 x Module 1 agreement with the target stage; early stopping (patience 25) | `--selection-alpha 0`, `--early-stop-patience 0` |
 | 5.4-5.7 | Pretrained G evaluated as "epoch 0"; FID range by subsampling without replacement (+ no negative error bars); samples sorted numerically; ablation runs get their own folders | `range_method="bootstrap"` |
 | 6.1-6.3 | Module 3: patient-level 70/15/15 split, metrics on TEST patients; first 6 EfficientNet-B4 blocks frozen; augmentation + AdamW weight decay 1e-2 | `--test-fraction 0 --val-fraction 0.2 --freeze-blocks 0 --no-augment --weight-decay 0` |
-| 7.1 | Laterality: disc found inside the field of view, pair constraint, validated on EyePACS (nb 11) -- **check the OD/OS convention it reports** (`--disc-left-is`) | `--legacy-estimator --no-pair-constraint` |
+| 7.1 | Laterality: disc found inside the field of view, pair constraint, validated on EyePACS (nb 11). EyePACS mixes mirrored and non-mirrored images (only ~61 % accuracy), so the validation is used only at >= 80 %; otherwise the default convention -- **check a few Tianjin images by eye and set `LATERALITY_DISC_LEFT_IS`** (nb 04_05/06/07). Written to `laterality_resolved_v2.csv` | `--legacy-estimator --no-pair-constraint` |
 | 7.2 / 7.3 | `MIN_BASELINE_GRADE` (0 = keep Stage 0, 1 = >= mild NPDR); `tools/dataset_image_sizes.py` | -- |
 
 **Checkpoints:** items 3.4/3.6/4.1/4.2 change the Generator/Discriminator `state_dict`s, so
@@ -144,6 +144,12 @@ whole Module 2 chain (09 pretraining -> 06 fine-tuning) must be retrained on thi
 EyePACS sample) -> 04_05 (rebuild all Module 1 caches) -> 09 (EyePACS cache, profiles, pretraining) -> 06
 (fine-tuning, trajectory evaluation, epoch-0 eval; then optionally the `USE_NONLONG_PRETRAIN = False`
 ablation) -> 07 -> 08 -> 10.
+
+**Module 1 caches** record the models and settings they were built with (`<cache>.meta.json`):
+`apply_to_progression_data.py --resume` only continues a cache built the same way and otherwise
+rebuilds it, so changing the grader or re-training the segmenters never mixes two Module 1
+versions in one cache. **Segmentation resume** (nb 11) failed on PyTorch >= 2.6 before 9e0404e --
+the segmenters in the "reran notebook 11" run are still the 100-epoch models; re-run nb 11.
 
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |

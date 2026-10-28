@@ -331,6 +331,27 @@ def process_image(image_path, classifier, seg_models: dict, device="cpu"):
     }
 
 
+def _file_id(path):
+    """Identity of a checkpoint file: path + size + modification time (a re-trained model differs)."""
+    if not path:
+        return None
+    st = os.stat(path)
+    return {"path": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def cache_settings(args, seg_paths):
+    """Everything that changes what a cache entry contains -- written next to the cache as
+    <out>.meta.json, so --resume only continues a cache built with the same models and settings."""
+    return {
+        "classifier": _file_id(args.classifier_checkpoint) if not args.dry_run else "dry-run",
+        "classifier_norm": {"mean": list(CLASSIFIER_MEAN), "std": list(CLASSIFIER_STD)},
+        "seg": {k: (_file_id(v) if not args.dry_run else "dry-run") for k, v in sorted(seg_paths.items())},
+        "seg_inference": {"mode": SEG_MODE, "retina_size": SEG_RETINA_SIZE, "tile": SEG_TILE,
+                          "stride": SEG_STRIDE, "retina_crop": RETINA_CROP},
+        "mask_size": args.mask_size,
+    }
+
+
 def downsample_mask(mask: np.ndarray, size: int) -> np.ndarray:
     """Nearest-neighbour resize of a 0/1 mask to size x size (all Module 2 loaders resize to
     image_size anyway, so storing a full-resolution mask is only needed for LBS, which is
@@ -398,8 +419,10 @@ def main():
     classifier = load_classifier(args.classifier_checkpoint, device=device, dry_run=args.dry_run)
 
     seg_models = {lesion: None for lesion in ALL_LESIONS}
+    seg_paths = {}
     for entry in args.seg_checkpoint:
         lesion, path = entry.split("=", 1)
+        seg_paths[lesion] = path
         seg_models[lesion] = load_segmentation_model(path, device=device, dry_run=args.dry_run)
     if args.dry_run and not args.seg_checkpoint:
         # exercise at least one segmentation head so the dry run covers both code paths
@@ -427,11 +450,24 @@ def main():
     cache = {}
     work = local_twin(args.out)  # == args.out unless --out is on Drive
     os.makedirs(os.path.dirname(os.path.abspath(work)), exist_ok=True)
+    import json
+
+    settings = cache_settings(args, seg_paths)
+    meta_path = args.out + ".meta.json"  # small, written once per run -- fine on Drive
     if args.resume:
         restore_from_drive(args.out)
-        if os.path.isfile(work):
+        old = json.load(open(meta_path)) if os.path.isfile(meta_path) else None
+        if os.path.isfile(work) and old == settings:
             cache = torch.load(work, weights_only=False)
             print(f"--resume: {len(cache)} images already cached in {args.out}, skipping them")
+        elif os.path.isfile(work):
+            # Built with other models / settings (or before this record existed): continuing would mix
+            # two Module 1 versions in one cache, so start over (the file is overwritten as it goes).
+            print(f"--resume: {args.out} was built with "
+                  + ("different models or settings" if old else "unrecorded models / settings")
+                  + " -- rebuilding it from scratch")
+    with open(meta_path, "w") as f:
+        json.dump(settings, f, indent=2)
 
     n_new = 0
     for i, relpath in enumerate(image_files):
