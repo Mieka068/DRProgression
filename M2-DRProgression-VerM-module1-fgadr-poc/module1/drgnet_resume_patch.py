@@ -51,6 +51,9 @@ Small-lesion loss (separate marker, applies to already-patched clones; CODE_FIXE
 Resume loading (separate marker): PyTorch >= 2.6 defaults torch.load to weights_only=True, which
   rejects model_last.pth.tar (numpy scalars inside), so a resumed segmentation run crashed before
   training -- the resume load now passes weights_only=False (and best_ap is saved as a plain float).
+  Resume device (separate marker): the model is moved to the GPU before the optimizer state is
+  restored, so SGD's momentum buffers land on the GPU too (otherwise the first resumed step fails
+  with "Expected all tensors to be on the same device").
 
 Drive mirroring (separate marker, applies to already-patched clones): every overwrite of a file on
 a Colab-mounted Drive leaves the old copy behind, counted against the Drive quota -- rewriting
@@ -216,6 +219,18 @@ LOAD_MARK = "# [load patch]"
 SEG_LOAD_EDITS = [("            checkpoint = torch.load(resume)\n",
                    "            checkpoint = torch.load(resume, weights_only=False)  # [load patch]\n")]
 
+# DRG-Net restores the optimizer state while the model is still on the CPU (it is moved to the GPU only
+# when train_model() starts), so SGD's momentum buffers stay on the CPU and the first step after a resume
+# fails ("Expected all tensors to be on the same device, cuda:0 and cpu"). Move the model first: the
+# Parameter objects stay the same, and load_state_dict puts the state on the parameters' device.
+DEVICE_MARK = "# [device patch]"
+SEG_DEVICE_ANCHOR = ("            model.load_state_dict(checkpoint['state_dict'])\n"
+                     "            g_optimizer.load_state_dict(checkpoint['optimizer'])\n")
+SEG_DEVICE_EDITS = [(SEG_DEVICE_ANCHOR,
+                     "            model.load_state_dict(checkpoint['state_dict'])\n"
+                     "            model.to(device=device)  # [device patch] optimizer state follows the params\n"
+                     "            g_optimizer.load_state_dict(checkpoint['optimizer'])\n")]
+
 
 MIRROR_MARK = "# [mirror patch]"
 
@@ -267,6 +282,7 @@ def apply(drg_root):
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_MIRROR_EDITS, MIRROR_MARK)
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_LOSS_EDITS, LOSS_MARK)
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_LOAD_EDITS, LOAD_MARK)
+        _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_DEVICE_EDITS, DEVICE_MARK)
     _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_MIRROR_EDITS, MIRROR_MARK)
 
 
