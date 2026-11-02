@@ -120,6 +120,8 @@ def main():
                 - (g["results"][str(lo)]["vs_clinical"]["quadratic_kappa"] or 0) for n, g in out["graders"].items()}
         out["kappa_gain_high_vs_low"] = gain
         best = max(gain.values())
+        # read by notebooks 06/08/09/10 when MODULE2_IMAGE_SIZE = 'auto'
+        out["recommended_image_size"] = hi if best >= 0.05 else lo
         out["recommendation"] = (f"train Module 2 at {hi} px (kappa +{best:.2f} over {lo} px)" if best >= 0.05
                                  else f"{hi} px barely helps the grader (kappa +{best:.2f}) -- {lo} px is enough")
         print(f"\nRecommendation: {out['recommendation']}")
