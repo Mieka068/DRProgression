@@ -63,8 +63,10 @@ class AugmentedPairDataset(Dataset):
         follow_up = sample['follow_up']
         
         if self.augment:
-            # Apply same random augmentation to both images
-            baseline, follow_up = self._sync_augment(baseline, follow_up)
+            # Apply same random augmentation to both images -- and to the lesion mask, which is
+            # the baseline's: before round 4 the mask stayed unflipped/unrotated while the images
+            # moved, so the lesion channel pointed at the wrong places on ~3/4 of the samples.
+            baseline, follow_up, sample['mask'] = self._sync_augment(baseline, follow_up, sample['mask'])
         
         sample['baseline'] = baseline
         sample['follow_up'] = follow_up
@@ -86,7 +88,7 @@ class AugmentedPairDataset(Dataset):
 
         return sample
     
-    def _sync_augment(self, img1, img2):
+    def _sync_augment(self, img1, img2, mask=None):
         """
         Apply same augmentation to both images to preserve pair correspondence.
         
@@ -106,14 +108,19 @@ class AugmentedPairDataset(Dataset):
         if random.random() > 0.5:
             img1 = torch.flip(img1, dims=[2])
             img2 = torch.flip(img2, dims=[2])
+            if mask is not None:
+                mask = torch.flip(mask, dims=[2])
         
         # Small random rotation (±15 degrees) - SAFE
         if random.random() > 0.5:
             angle = random.uniform(-15, 15)
             # Rotate using affine transformation
             from torchvision.transforms.functional import rotate
-            img1 = rotate(img1, angle)
-            img2 = rotate(img2, angle)
+            # fill=-1: black in the [-1, 1] range (the default 0 would be mid-grey corners)
+            img1 = rotate(img1, angle, fill=-1.0)
+            img2 = rotate(img2, angle, fill=-1.0)
+            if mask is not None:
+                mask = rotate(mask, angle)
         
         # Mild brightness variation (mimics camera differences) - SAFE
         if random.random() > 0.5:
@@ -121,7 +128,7 @@ class AugmentedPairDataset(Dataset):
             img1 = (img1 * brightness).clamp(-1, 1)
             img2 = (img2 * brightness).clamp(-1, 1)
         
-        return img1, img2
+        return img1, img2, mask
 
 
 def _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
@@ -146,7 +153,7 @@ def _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_ca
 
     # Try to load LongDRScreening
     try:
-        longdr = LongDRScreeningDataset(longdr_dir, image_size=image_size, use_normalized=True,
+        longdr = LongDRScreeningDataset(longdr_dir, image_size=image_size,  # folder: DRP_LONGDR_FOLDER
                                          module1_cache_path=longdr_module1_cache_path,
                                          registration_cache_path=registration_cache_path,
                                          condition_on=condition_on)
@@ -257,6 +264,7 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
     rng = np.random.RandomState(seed)
     train_idx, val_idx, n_val_groups, offset = [], [], 0, 0
     progressed = []
+    train_tianjin_patients = set()
     for ds in datasets:
         progressed += _progressed_flags(ds)
         groups = _group_ids(ds)
@@ -267,6 +275,8 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
         n_val_groups += n_val
         for i, g in enumerate(groups):
             (val_idx if g in val_groups else train_idx).append(offset + i)
+            if g not in val_groups and g.startswith("tianjin:"):
+                train_tianjin_patients.add(g[len("tianjin:"):])
         offset += len(ds)
 
     train_set = AugmentedPairDataset(Subset(combined, train_idx), image_size=image_size, augment=augment)
@@ -293,7 +303,10 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
                             drop_last=False)
     info = {"num_pairs": len(combined), "n_train_pairs": len(train_idx), "n_val_pairs": len(val_idx),
             "n_val_groups": n_val_groups, "n_train_progressed": int(sum(train_prog)),
-            "progress_fraction": progress_fraction if sampler is not None else None}
+            "progress_fraction": progress_fraction if sampler is not None else None,
+            # every Tianjin patient with a pair in training -- evaluate_trajectory.py
+            # --exclude-train-from leaves them out, so the cascade metrics are on unseen patients
+            "train_tianjin_patients": sorted(train_tianjin_patients)}
     return train_loader, val_loader, info
 
 

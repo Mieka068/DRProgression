@@ -47,11 +47,11 @@ import random
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 from torchvision import transforms
 from torchvision.transforms.functional import rotate
 
+from fundus_preprocess import crop_mask, load_fundus, mask_to_tensor, retina_crop_enabled
 from stage_biomarker_profiles import N_BIOMARKERS, biomarker_vector
 
 NUM_STAGES = 5
@@ -112,7 +112,7 @@ def index_images(root, ext=None):
     index, n_dupes = {}, 0
     for dirpath, _dirs, files in os.walk(root):
         for f in sorted(files):
-            if f.lower().endswith(exts):
+            if f.lower().endswith(exts) and not f.startswith("._"):  # skip macOS metadata files
                 stem = os.path.splitext(f)[0]
                 if stem in index:
                     n_dupes += 1
@@ -163,7 +163,7 @@ class CrossSectionalDRDataset(Dataset):
 
     def __init__(self, dataset_dir, preset="eyepacs_resized", labels_csv=None, images_dir=None,
                  image_col=None, label_col=None, ext=None, image_size=128, augment=True,
-                 module1_cache_path=None, max_per_grade=None, seed=0):
+                 module1_cache_path=None, max_per_grade=None, seed=0, retina_crop=None):
         """
         Args:
             dataset_dir: root folder of the dataset (relative labels_csv/images_dir resolve
@@ -179,6 +179,8 @@ class CrossSectionalDRDataset(Dataset):
             max_per_grade: optional cap on images kept per grade (random, seeded) -- EyePACS is
                 ~73% grade 0, so capping is a cheap way to cut epoch time without losing the
                 rare stages.
+            retina_crop: crop to the square retina box before resizing (fundus_preprocess.py);
+                None = DRP_RETINA_CROP (on). Keep it the same as the longitudinal fine-tuning.
         """
         cfg = dict(PRESETS.get(preset, {}))
         for key, val in (("labels_csv", labels_csv), ("images_subdir", images_dir),
@@ -191,6 +193,7 @@ class CrossSectionalDRDataset(Dataset):
         self.images_dir = os.path.join(dataset_dir, cfg.get("images_subdir", ""))
         self.image_size = image_size
         self.augment = augment
+        self.retina_crop = retina_crop_enabled() if retina_crop is None else retina_crop
 
         df = load_labels(find_file(dataset_dir, cfg["labels_csv"]), cfg.get("image_col"), cfg.get("label_col"))
         index = index_images(self.images_dir, ext)
@@ -236,7 +239,7 @@ class CrossSectionalDRDataset(Dataset):
             img, mask = torch.flip(img, dims=[2]), torch.flip(mask, dims=[2])
         if random.random() > 0.5:
             angle = random.uniform(-15, 15)
-            img, mask = rotate(img, angle), rotate(mask, angle)
+            img, mask = rotate(img, angle, fill=-1.0), rotate(mask, angle)  # fill -1 = black, not grey
         if random.random() > 0.5:
             img = (img * (0.9 + random.random() * 0.2)).clamp(-1, 1)
         return img, mask
@@ -244,16 +247,15 @@ class CrossSectionalDRDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         try:
-            img = self.transform(Image.open(row["path"]).convert("RGB"))
+            img, box, size = load_fundus(row["path"], self.retina_crop)
+            img = self.transform(img)
         except Exception:
             return self.__getitem__((idx + 1) % len(self.df))
 
         key = self.cache_keys.get(row["image_id"])
         entry = self.module1_cache[key] if key is not None else None
         if entry is not None:
-            mask_img = Image.fromarray((entry["mask"] * 255).astype(np.uint8)).resize(
-                (self.image_size, self.image_size), Image.NEAREST)
-            mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
+            mask = mask_to_tensor(crop_mask(entry["mask"], box, size), self.image_size)
         else:
             mask = torch.zeros(1, self.image_size, self.image_size)
 

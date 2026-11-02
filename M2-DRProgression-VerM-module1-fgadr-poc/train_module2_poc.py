@@ -78,6 +78,22 @@ change:
      (val L1 alone, the earlier rule, without a classifier or with --selection-alpha 0). Optional
      early stopping: --early-stop-patience N stops after N epochs without a better score
      (0 = off); a resumed run that already stopped goes straight to the final evaluation.
+ 14. Round 4 (gan_guidance.py has the details):
+     * Frozen-grader loss (item R4-3.1): --grader-loss-checkpoint (Module 1's grader, frozen, with
+       --grader-loss-norm) scores every G step's output after a random differentiable augmentation;
+       G gets + lambda_grader x CE(grader(fake), target stage). D's own stage head stays (lambda_cls).
+     * DiffAugment for the critic (item R4-3.2): --diffaugment "color,translation,cutout" (default;
+       "" = off) on real and fake images on every critic call, and on G's fake on the G step, plus a
+       small drift penalty lambda_drift x E[D(real)^2] (Karras et al. 2018; keeps the WGAN critic's
+       outputs from drifting -- round 3's D loss went negative from epoch 34).
+     * Best-epoch selection on STAGE CONTROL with an INDEPENDENT grader (item R4-3.3):
+       --selection-mode controllability (default) asks G for one stage above each held-out pair's
+       baseline stage and scores how often --selection-classifier-checkpoint (normalised with
+       --selection-classifier-norm) reads that stage: score = val_l1 - alpha x controllability.
+       The round-3 rule (agreement with the pair's own follow-up grade, --selection-mode target)
+       mostly rewarded copying the baseline -- most held-out pairs do not progress.
+     * split.train_tianjin_patients in poc_results.json lists every Tianjin patient with a training
+       pair, for evaluate_trajectory.py --exclude-train-from (item R4-2.5).
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -120,6 +136,7 @@ from base_model import (  # noqa: E402
 from combined_dataset import get_combined_loader, get_combined_train_val_loaders  # noqa: E402
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 from apply_to_progression_data import add_classifier_norm_args, apply_classifier_norm_args  # noqa: E402
+from gan_guidance import FrozenGrader, diff_augment  # noqa: E402
 
 
 class Config:
@@ -148,6 +165,14 @@ class Config:
     selection_alpha = 0.1
     early_stop_patience = 0  # epochs without a better selection score before stopping; 0 = off
     progress_fraction = 0.3  # share of training samples drawn from progressing pairs; 0 = uniform (point 10)
+    selection_classifier_norm = None  # None = --classifier-norm (point 14)
+    selection_mode = "controllability"  # or "target" (round 3's rule) -- point 14
+    grader_loss_path = None  # frozen Module 1 grader in G's loss (point 14); None = off
+    grader_loss_norm = "eyepacs"
+    grader_input_size = 512
+    lambda_grader = 1.0
+    diffaugment = "color,translation,cutout"  # "" = off (point 14)
+    lambda_drift = 0.001
 
     # Model
     g_conv_dim = 64
@@ -219,7 +244,7 @@ def write_batch_log(path, fields, rows):
 
 
 BATCH_LOG_FIELDS = ["epoch", "batch", "g_step", "d_loss", "d_adv", "gp", "d_cls", "d_grad_norm",
-                    "gp_grad_norm", "g_loss", "g_adv", "g_rec", "g_cls"]
+                    "gp_grad_norm", "g_loss", "g_adv", "g_rec", "g_cls", "g_grader"]
 
 
 def denorm(x):
@@ -250,13 +275,15 @@ def validation_l1(G, loader, device):
 
 
 @torch.no_grad()
-def validation_agreement(G, loader, classifier, device):
+def validation_agreement(G, loader, classifier, device, norm=None):
     """Fraction of held-out pairs whose synthesized follow-up Module 1's grader reads as the
-    requested target_grade (all pairs, and the clinically graded Tianjin ones separately)."""
+    requested target_grade (all pairs, and the clinically graded Tianjin ones separately).
+    norm: (mean, std) of the grader's training config; None = the module-level --classifier-norm."""
     from torchvision.transforms.functional import to_pil_image
 
     from apply_to_progression_data import predict_grade
 
+    mean, std = norm if norm else (None, None)
     G.eval()
     hits = n = hits_real = n_real = 0
     for batch in loader:
@@ -264,12 +291,39 @@ def validation_agreement(G, loader, classifier, device):
         target = batch["target_grade"].argmax(1)
         fake = denorm(G(x_real, batch["target_grade"].to(device))).cpu()
         for img, t, real in zip(fake, target.tolist(), batch["grade_is_real"].tolist()):
-            ok = int(predict_grade(classifier, to_pil_image(img), device=device) == t)
+            ok = int(predict_grade(classifier, to_pil_image(img), mean=mean, std=std, device=device) == t)
             hits += ok; n += 1
             if real:
                 hits_real += ok; n_real += 1
     G.train()
     return (hits / n if n else None), (hits_real / n_real if n_real else None)
+
+
+@torch.no_grad()
+def validation_controllability(G, loader, classifier, device, norm=None, c_dim=5):
+    """Stage control on held-out pairs (docstring point 14): ask G for ONE stage above each pair's
+    baseline stage (source_grade; pairs already at the top stage are skipped) and return the fraction
+    the grader reads as that requested stage. Needs no real progression, so all held-out pairs count."""
+    from torchvision.transforms.functional import to_pil_image
+
+    from apply_to_progression_data import predict_grade
+
+    mean, std = norm if norm else (None, None)
+    G.eval()
+    hits = n = 0
+    for batch in loader:
+        src = batch["source_grade"].argmax(1)
+        keep = src < c_dim - 1
+        if not keep.any():
+            continue
+        req = F.one_hot(src[keep] + 1, c_dim).float()
+        x_real = torch.cat([batch["baseline"][keep], batch["mask"][keep]], dim=1).to(device)
+        fake = denorm(G(x_real, req.to(device))).cpu()
+        for img, t in zip(fake, (src[keep] + 1).tolist()):
+            hits += int(predict_grade(classifier, to_pil_image(img), mean=mean, std=std, device=device) == t)
+            n += 1
+    G.train()
+    return hits / n if n else None
 
 
 def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50, n_bootstrap=10):
@@ -436,11 +490,31 @@ def train(config: Config):
     best.setdefault("score", best["val_l1"])  # resume states from before the selection score
     stopped_at = extra.get("early_stopped_at")
     selection_classifier = None
+    selection_norm = None
     if config.selection_classifier_path and val_loader is not None:
-        from apply_to_progression_data import load_classifier
+        from apply_to_progression_data import CLASSIFIER_NORMS, load_classifier
         selection_classifier = load_classifier(config.selection_classifier_path, device=device)
-        print(f"  Best-epoch score: val L1 - {config.selection_alpha} x Module 1 agreement "
-              f"({config.selection_classifier_path})")
+        if config.selection_classifier_norm:
+            selection_norm = CLASSIFIER_NORMS[config.selection_classifier_norm]
+        what = ("stage control (one stage above baseline)" if config.selection_mode == "controllability"
+                else "agreement with the target grade")
+        print(f"  Best-epoch score: val L1 - {config.selection_alpha} x {what}, graded by "
+              f"{config.selection_classifier_path}")
+        if config.grader_loss_path and os.path.abspath(config.grader_loss_path) == os.path.abspath(
+                config.selection_classifier_path):
+            print("  ⚠ the selection grader is the grader in G's loss -- the selection score is then the number "
+                  "G was optimised on; use the other grader (e.g. FGADR) for --selection-classifier-checkpoint")
+    grader = None
+    if config.grader_loss_path and config.lambda_grader > 0:
+        grader = FrozenGrader(config.grader_loss_path, norm=config.grader_loss_norm,
+                              input_size=config.grader_input_size, device=device)
+        print(f"  Frozen-grader loss: {config.lambda_grader} x CE (grader {config.grader_loss_path}, "
+              f"norm {config.grader_loss_norm}, {config.grader_input_size} px, augmented views)")
+    if config.diffaugment:
+        print(f"  DiffAugment on the critic: {config.diffaugment} | drift penalty {config.lambda_drift}")
+
+    def aug(x):
+        return diff_augment(x, config.diffaugment) if config.diffaugment else x
     g_steps = loss_history[-1].get("g_steps", 0) if loss_history else 0
     batch_log = extra.get("batch_log", [])  # docstring point 12
     batch_log_path = os.path.join(config.save_dir, "batch_log.csv")
@@ -448,7 +522,7 @@ def train(config: Config):
     if stopped_at:
         print(f"[resume] this run early-stopped after epoch {stopped_at} -- skipping to evaluation")
     for epoch in range(start_epoch if not stopped_at else config.num_epochs, config.num_epochs):
-        epoch_g_loss = epoch_d_loss = epoch_rec_loss = epoch_cls_loss = 0
+        epoch_g_loss = epoch_d_loss = epoch_rec_loss = epoch_cls_loss = epoch_grd_loss = 0
         n_g = 0  # G steps this epoch (1 per n_critic batches)
         for i, batch in enumerate(loader):
             baseline = batch["baseline"].to(device)
@@ -461,14 +535,18 @@ def train(config: Config):
 
             x_real = torch.cat([baseline, mask], dim=1)
 
-            out_real, cls_real = D(follow_up)
+            real_aug = aug(follow_up)
+            out_real, cls_real = D(real_aug)
             d_loss_real = -torch.mean(out_real)
             with torch.no_grad():
                 fake = G(x_real, target_grade)
-            out_fake, _ = D(fake)
+            fake_aug = aug(fake)
+            out_fake, _ = D(fake_aug)
             d_loss_fake = torch.mean(out_fake)
-            gp, gp_norm = gradient_penalty(D, follow_up, fake, device, return_norm=True)
+            gp, gp_norm = gradient_penalty(D, real_aug, fake_aug, device, return_norm=True)
             d_loss = d_loss_real + d_loss_fake + 10 * gp
+            if config.lambda_drift > 0:
+                d_loss = d_loss + config.lambda_drift * torch.mean(out_real ** 2)
             d_cls = None
             if config.lambda_cls > 0 and cls_real_ok.any():
                 d_cls = F.cross_entropy(cls_real[cls_real_ok], target_idx[cls_real_ok])
@@ -479,11 +557,11 @@ def train(config: Config):
             d_gnorm = grad_norm(D)
             d_optimizer.step()
             row = [epoch + 1, i, None, d_loss.item(), (d_loss_real + d_loss_fake).item(), gp.item(),
-                   None if d_cls is None else d_cls.item(), d_gnorm, gp_norm, None, None, None, None]
+                   None if d_cls is None else d_cls.item(), d_gnorm, gp_norm, None, None, None, None, None]
 
             if i % config.n_critic == 0:
                 fake = G(x_real, target_grade)
-                out_fake, cls_fake = D(fake)
+                out_fake, cls_fake = D(aug(fake))
                 g_loss_adv = -torch.mean(out_fake)
                 g_loss_rec = l1_loss(fake, follow_up)
                 g_loss = config.lambda_adv * g_loss_adv + config.lambda_rec * g_loss_rec
@@ -492,6 +570,11 @@ def train(config: Config):
                     g_loss_cls = F.cross_entropy(cls_fake, target_idx)
                     g_loss = g_loss + config.lambda_cls * g_loss_cls
                     epoch_cls_loss += g_loss_cls.item()
+                g_loss_grd = None
+                if grader is not None:  # frozen Module 1 grader (docstring point 14)
+                    g_loss_grd = F.cross_entropy(grader(fake), target_idx)
+                    g_loss = g_loss + config.lambda_grader * g_loss_grd
+                    epoch_grd_loss += g_loss_grd.item()
 
                 g_optimizer.zero_grad()
                 g_loss.backward()
@@ -503,7 +586,8 @@ def train(config: Config):
                 g_steps += 1
                 row[2] = g_steps
                 row[9:] = [g_loss.item(), g_loss_adv.item(), g_loss_rec.item(),
-                           None if g_loss_cls is None else g_loss_cls.item()]
+                           None if g_loss_cls is None else g_loss_cls.item(),
+                           None if g_loss_grd is None else g_loss_grd.item()]
             epoch_d_loss += d_loss.item()
             batch_log.append(row)
 
@@ -514,30 +598,37 @@ def train(config: Config):
         mean_rec_loss = epoch_rec_loss / max(n_g, 1)
         loss_history.append({
             "epoch": epoch + 1, "d_loss": mean_d_loss, "g_loss": mean_g_loss, "rec_loss": mean_rec_loss,
-            "g_cls_loss": epoch_cls_loss / max(n_g, 1), "g_steps": g_steps,
+            "g_cls_loss": epoch_cls_loss / max(n_g, 1), "g_grader_loss": epoch_grd_loss / max(n_g, 1),
+            "g_steps": g_steps,
         })
         print(
             f"Epoch [{epoch + 1}/{config.num_epochs}] | D_loss: {mean_d_loss:.4f} | "
-            f"G_loss: {mean_g_loss:.4f} | Rec_loss: {mean_rec_loss:.4f} | G steps: {g_steps} | "
-            f"Elapsed: {elapsed / 60:.1f}min"
+            f"G_loss: {mean_g_loss:.4f} | Rec_loss: {mean_rec_loss:.4f} | "
+            + (f"Grader CE: {epoch_grd_loss / max(n_g, 1):.3f} | " if grader is not None else "")
+            + f"G steps: {g_steps} | Elapsed: {elapsed / 60:.1f}min"
         )
         if val_loader is not None:
             val_l1, val_psnr = validation_l1(G, val_loader, device)
-            agree = agree_real = None
+            agree = agree_real = control = None
             score = val_l1
             if selection_classifier is not None:
-                agree, agree_real = validation_agreement(G, val_loader, selection_classifier, device)
-                score = val_l1 - config.selection_alpha * (agree or 0.0)
+                agree, agree_real = validation_agreement(G, val_loader, selection_classifier, device, selection_norm)
+                control = validation_controllability(G, val_loader, selection_classifier, device, selection_norm,
+                                                     config.c_dim)
+                signal = control if config.selection_mode == "controllability" else agree
+                score = val_l1 - config.selection_alpha * (signal or 0.0)
             val_history.append({"epoch": epoch + 1, "val_l1": val_l1, "val_psnr": val_psnr,
                                 "module1_agreement": agree, "module1_agreement_clinical": agree_real,
-                                "selection_score": score})
+                                "stage_control": control, "selection_score": score})
             is_best = score < best["score"]
             if is_best:
                 best = {"epoch": epoch + 1, "val_l1": val_l1, "score": score, "module1_agreement": agree,
+                        "stage_control": control,
                         "G": {k: v.detach().cpu().clone() for k, v in G.state_dict().items()}}
                 torch.save(best["G"], os.path.join(config.save_dir, "best-G.ckpt"))
             print(f"  val L1 {val_l1:.4f} | val PSNR {val_psnr:.2f} dB"
-                  + (f" | Module 1 agreement {agree:.1%} -> score {score:.4f}" if agree is not None else "")
+                  + (f" | agreement {agree:.1%} | stage control {control if control is None else f'{control:.1%}'}"
+                     f" -> score {score:.4f}" if agree is not None else "")
                   + (" | ★ new best -> best-G.ckpt" if is_best else f" | best so far: epoch {best['epoch']}"))
             if (config.early_stop_patience and best["epoch"]
                     and epoch + 1 - best["epoch"] >= config.early_stop_patience):
@@ -633,7 +724,17 @@ def train(config: Config):
         "best_val_l1": best["val_l1"] if best["epoch"] else None,
         "best_selection_score": best["score"] if best["epoch"] else None,
         "best_module1_agreement": best.get("module1_agreement"),
+        "best_stage_control": best.get("stage_control"),
         "selection_classifier": config.selection_classifier_path,
+        "selection_classifier_norm": config.selection_classifier_norm,
+        "selection_mode": config.selection_mode,
+        "grader_loss_checkpoint": config.grader_loss_path,
+        "grader_loss_norm": config.grader_loss_norm if config.grader_loss_path else None,
+        "lambda_grader": config.lambda_grader if config.grader_loss_path else None,
+        "diffaugment": config.diffaugment,
+        "lambda_drift": config.lambda_drift,
+        "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
+        "longdr_folder": os.environ.get("DRP_LONGDR_FOLDER", "FundusImagesColor"),
         "selection_alpha": config.selection_alpha if config.selection_classifier_path else None,
         "early_stopped_at": stopped_at,
         "best_checkpoint": best_g_path,
@@ -690,6 +791,21 @@ if __name__ == "__main__":
                          help="Module 1 grader: best epoch by val L1 - alpha x its agreement with the "
                               "target stage on val outputs (omit = val L1 only)")
     parser.add_argument("--selection-alpha", type=float, default=Config.selection_alpha)
+    parser.add_argument("--selection-classifier-norm", choices=["fgadr", "eyepacs"], default=None,
+                         help="Normalisation of the selection grader (default: --classifier-norm)")
+    parser.add_argument("--selection-mode", choices=["controllability", "target"], default=Config.selection_mode,
+                         help="controllability: stage control one stage above baseline (default); target: "
+                              "agreement with the pair's own target grade (round 3)")
+    parser.add_argument("--grader-loss-checkpoint", default=None,
+                         help="Frozen Module 1 grader in G's loss (docstring point 14); omit = off")
+    parser.add_argument("--grader-loss-norm", choices=["fgadr", "eyepacs"], default=Config.grader_loss_norm)
+    parser.add_argument("--grader-input-size", type=int, default=Config.grader_input_size,
+                         help="G's output is upsampled to this before the grader (it was trained at 512)")
+    parser.add_argument("--lambda-grader", type=float, default=Config.lambda_grader)
+    parser.add_argument("--diffaugment", default=Config.diffaugment,
+                         help='DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off')
+    parser.add_argument("--lambda-drift", type=float, default=Config.lambda_drift,
+                         help="Critic drift penalty weight (E[D(real)^2]); 0 = off")
     parser.add_argument("--early-stop-patience", type=int, default=Config.early_stop_patience,
                          help="Stop after N epochs without a better selection score (0 = off)")
     add_classifier_norm_args(parser)
@@ -759,6 +875,14 @@ if __name__ == "__main__":
     cfg.selection_classifier_path = args.selection_classifier_checkpoint
     cfg.selection_alpha = args.selection_alpha
     cfg.early_stop_patience = args.early_stop_patience
+    cfg.selection_classifier_norm = args.selection_classifier_norm
+    cfg.selection_mode = args.selection_mode
+    cfg.grader_loss_path = args.grader_loss_checkpoint
+    cfg.grader_loss_norm = args.grader_loss_norm
+    cfg.grader_input_size = args.grader_input_size
+    cfg.lambda_grader = args.lambda_grader
+    cfg.diffaugment = args.diffaugment
+    cfg.lambda_drift = args.lambda_drift
     apply_classifier_norm_args(args)
     cfg.lambda_cls = args.lambda_cls
     cfg.g_lr, cfg.d_lr, cfg.n_critic = args.g_lr, args.d_lr, args.n_critic

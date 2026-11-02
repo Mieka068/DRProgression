@@ -350,7 +350,13 @@ def main():
     elif args.command == "seg-learning":
         plot_seg_learning(dict(item.split("=", 1) for item in args.log), args.out, args.title)
     elif args.command == "cls-curve":
-        epochs, kappas, accuracies = parse_drgnet_cls_log(args.log)
+        try:
+            epochs, kappas, accuracies = parse_drgnet_cls_log(args.log)
+        except ValueError as e:
+            # e.g. a run that resumed straight to evaluation this session: its log has no
+            # per-epoch validation lines -- skip the figure instead of failing the whole cell
+            print(f"⚠ skipped the {args.dataset_name} classification curve: {e}")
+            return
         plot_training_curve(epochs, kappas, accuracies, args.out,
                             title=f"{args.dataset_name} classification: validation kappa/accuracy vs. epoch")
     elif args.command == "confusion":

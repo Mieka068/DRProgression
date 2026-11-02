@@ -434,11 +434,17 @@ def main():
     # "eye_003__visit_1_image_1") -- longdr_dataset.py builds the same id when looking the
     # cache up, so keep the two in sync if this scheme ever changes.
     image_files = []
+    n_junk = 0
     for root, _dirs, files in os.walk(args.images_dir):
         for f in sorted(files):
+            if f.startswith("._"):  # macOS AppleDouble metadata (Tianjin's zip has 16) -- not images
+                n_junk += f.lower().endswith((".jpg", ".jpeg", ".png"))
+                continue
             if f.lower().endswith((".jpg", ".jpeg", ".png")):
                 image_files.append(os.path.relpath(os.path.join(root, f), args.images_dir))
     image_files.sort()
+    if n_junk:
+        print(f"Skipped {n_junk} macOS '._*' metadata files (not images)")
     if args.image_list:
         with open(args.image_list) as f:
             wanted = {os.path.splitext(os.path.basename(line.strip()))[0] for line in f if line.strip()}

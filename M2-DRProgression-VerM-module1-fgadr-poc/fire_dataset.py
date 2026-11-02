@@ -11,6 +11,8 @@ from PIL import Image
 import numpy as np
 from pathlib import Path
 
+from fundus_preprocess import crop_mask, load_fundus, mask_to_tensor, retina_crop_enabled
+
 
 def module1_grade_onehot(module1_output, num_stages=5, placeholder=2):
     """One-hot of a Module 1 cache entry's predicted grade; the Stage-2 placeholder if None."""
@@ -46,7 +48,7 @@ class FIREDataset(Dataset):
     SOURCE_NAME = "FIRE"
 
     def __init__(self, fire_dir, image_size=128, category='A', module1_cache_path=None,
-                 registration_cache_path=None, condition_on='followup'):
+                 registration_cache_path=None, condition_on='followup', retina_crop=None):
         """
         Args:
             fire_dir: Path to FIRE_dataset folder
@@ -69,6 +71,8 @@ class FIREDataset(Dataset):
                 cache holds both visits), falling back to the baseline's and then to the Stage-2
                 placeholder if missing; 'baseline' -- the earlier behaviour, Module 1's grade of
                 the baseline image. Either way it is a predicted grade, so grade_is_real=False.
+            retina_crop: crop each image to its square retina box before resizing
+                (fundus_preprocess.py); None = DRP_RETINA_CROP (on by default).
         """
         if condition_on not in ('followup', 'baseline'):
             raise ValueError(f"condition_on must be 'followup' or 'baseline', not {condition_on!r}")
@@ -76,6 +80,7 @@ class FIREDataset(Dataset):
         self.fire_dir = fire_dir
         self.image_size = image_size
         self.category = category
+        self.retina_crop = retina_crop_enabled() if retina_crop is None else retina_crop
 
         self.module1_cache = None
         if module1_cache_path:
@@ -156,16 +161,17 @@ class FIREDataset(Dataset):
         """Returns (baseline_image, follow_up_image, dummy_mask, target_grade)"""
         img1_path, img2_path = self.pairs[idx]
         
-        # Load images
-        img1 = Image.open(img1_path).convert('RGB')
+        # Load images (cropped to the retina, fundus_preprocess.py)
+        img1, box1, size1 = load_fundus(img1_path, self.retina_crop)
 
         # Use the pre-registered (baseline-aligned) follow-up image if a registration cache
         # was supplied and has an entry for this pair, else fall back to the raw follow-up image.
+        # The cached warp is already in the loader's (cropped, image_size) frame.
         warped = self.registration_cache.get((self.SOURCE_NAME, img1_path)) if self.registration_cache else None
         if warped is not None:
             img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
         else:
-            img2 = Image.open(img2_path).convert('RGB')
+            img2, _box2, _size2 = load_fundus(img2_path, self.retina_crop)
 
         img1 = self.transform(img1)
         img2 = self.transform(img2)
@@ -178,11 +184,7 @@ class FIREDataset(Dataset):
         followup_output = self.module1_cache.get(Path(img2_path).stem) if self.module1_cache else None
 
         if module1_output is not None:
-            mask_np = module1_output['mask']
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (self.image_size, self.image_size), Image.NEAREST
-            )
-            mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
+            mask = mask_to_tensor(crop_mask(module1_output['mask'], box1, size1), self.image_size)
         else:
             # FIRE doesn't have lesion masks, so use empty mask
             # In real training, you'd run Module 1 to generate masks

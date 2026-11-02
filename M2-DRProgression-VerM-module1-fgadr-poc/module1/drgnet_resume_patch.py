@@ -65,6 +65,20 @@ local disk and sets
     * DRG_CLS_MIRROR_DIR / DRG_CLS_MIRROR_EVERY (classification): same for save_path after the
       epoch's resume_state.pt (the epoch_N.pt snapshots stay local).
 
+Fine-tuning (separate marker, train.py only -- the FGADR + DDR combined segmenters; round 4,
+item R4-1.3). The 200-epoch runs never decayed their learning rate (StepLR steps every 200 epochs),
+so their validation AP zig-zags at 1e-3. Env-driven, unset = unchanged behaviour:
+    * DRG_SEG_FINETUNE_FROM=<model_2.pth.tar>: start a NEW run from these weights (weights only --
+      fresh optimizer, epoch count from 0, so DRG_SEG_EPOCHS is the number of fine-tuning epochs).
+      Ignored when DRG_SEG_RESUME is set and exists (a resumed fine-tune continues as usual).
+    * DRG_SEG_LR: the starting learning rate of a new run (default config.G_LEARNING_RATE).
+    * DRG_SEG_LR_SCHEDULE=cosine: cosine decay from that LR to DRG_SEG_LR_MIN (default 1e-5) over
+      DRG_SEG_EPOCHS, in closed form, so a resumed run lands on the same LR (default: DRG-Net's StepLR).
+    * DRG_SEG_COLOR_AUG=1: image-only photometric augmentation on the training crops (brightness,
+      contrast, saturation, small hue, gamma, occasional blur) -- other cameras' colour and contrast
+      (IDRiD, Tianjin, LongDR) are a domain shift the 200-epoch models over-fitted to FGADR/DDR's
+      look (IDRiD test AP for MA/SE halved from 100 to 200 epochs). Masks are untouched.
+
 Usage:  python module1/drgnet_resume_patch.py /content/dr-joint-learning
 """
 import os
@@ -265,6 +279,62 @@ CLS_MIRROR_EDITS = [(CLS_MIRROR_ANCHOR, CLS_MIRROR_ANCHOR + _mirror_code(
      "_mirror")))]
 
 
+FINETUNE_MARK = "# [finetune patch]"
+_FT_RESUME_ANCHOR = """    else:
+        start_epoch = 0
+        start_step = 0
+"""
+_FT_SCHED_ANCHOR = ("    g_scheduler = lr_scheduler.StepLR(g_optimizer, step_size=200, gamma=0.9)\n"
+                    "    g_scheduler.last_epoch = start_epoch  # [resume patch] continue the LR schedule\n")
+_FT_AUG_ANCHOR = """                            RandomCrop(image_size),
+                ]))
+"""
+_FT_CLASS_ANCHOR = "if __name__ == '__main__':\n"
+SEG_FINETUNE_EDITS = [
+    (_FT_RESUME_ANCHOR, _FT_RESUME_ANCHOR + """    _resumed = bool(resume and os.path.isfile(resume))  # [finetune patch]
+    _ft_from = os.environ.get('DRG_SEG_FINETUNE_FROM')
+    if _ft_from and not _resumed:
+        model.load_state_dict(torch.load(_ft_from, map_location='cpu', weights_only=False)['state_dict'])
+        print('[finetune] new run from the weights in {} (fresh optimizer, epoch 0)'.format(_ft_from))
+    if os.environ.get('DRG_SEG_LR') and not _resumed:
+        for _g in g_optimizer.param_groups:
+            _g['lr'] = float(os.environ['DRG_SEG_LR'])
+"""),
+    (_FT_SCHED_ANCHOR, """    if os.environ.get('DRG_SEG_LR_SCHEDULE') == 'cosine':  # [finetune patch] closed-form cosine decay
+        import math as _math
+        _lr0 = g_optimizer.param_groups[0].get('initial_lr', g_optimizer.param_groups[0]['lr'])
+        _lr_min = min(float(os.environ.get('DRG_SEG_LR_MIN', 1e-5)), _lr0)
+        _T = max(config.EPOCHES, 1)
+        g_scheduler = lr_scheduler.LambdaLR(g_optimizer, lambda e: (
+            _lr_min + (_lr0 - _lr_min) * 0.5 * (1 + _math.cos(_math.pi * min(e, _T) / _T))) / _lr0)
+        g_scheduler.last_epoch = start_epoch
+        print('[finetune] cosine LR {:.1e} -> {:.1e} over {} epochs (from epoch {})'.format(_lr0, _lr_min, _T, start_epoch))
+    else:
+""" + "".join("    " + l + "\n" for l in _FT_SCHED_ANCHOR.splitlines())),
+    (_FT_AUG_ANCHOR, """                            RandomCrop(image_size),
+                ] + ([_PhotometricAug()] if os.environ.get('DRG_SEG_COLOR_AUG') == '1' else [])))  # [finetune patch]
+"""),
+    (_FT_CLASS_ANCHOR, """class _PhotometricAug(object):  # [finetune patch] image-only colour/contrast jitter
+    def __init__(self, brightness=0.2, contrast=0.25, saturation=0.2, hue=0.02, gamma=(0.7, 1.4), blur_p=0.2):
+        from torchvision import transforms as _tv
+        self.jitter = _tv.ColorJitter(brightness, contrast, saturation, hue)
+        self.gamma, self.blur_p = gamma, blur_p
+
+    def __call__(self, imgs):
+        from PIL import ImageFilter
+        img = self.jitter(imgs[0])
+        if random.random() < 0.5:
+            _g = random.uniform(*self.gamma)
+            img = img.point(lambda v: int(round(255 * (v / 255.) ** _g)))
+        if random.random() < self.blur_p:
+            img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 1.2)))
+        return [img] + list(imgs[1:])
+
+
+""" + _FT_CLASS_ANCHOR),
+]
+
+
 def apply(drg_root):
     _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_EDITS)
     _patch(os.path.join(drg_root, "dr_segmentation", "train_fgadr.py"), seg_edits(
@@ -284,6 +354,7 @@ def apply(drg_root):
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_LOAD_EDITS, LOAD_MARK)
         _patch(os.path.join(drg_root, "dr_segmentation", script), SEG_DEVICE_EDITS, DEVICE_MARK)
     _patch(os.path.join(drg_root, "dr_classification", "train.py"), CLS_MIRROR_EDITS, MIRROR_MARK)
+    _patch(os.path.join(drg_root, "dr_segmentation", "train.py"), SEG_FINETUNE_EDITS, FINETUNE_MARK)
 
 
 if __name__ == "__main__":

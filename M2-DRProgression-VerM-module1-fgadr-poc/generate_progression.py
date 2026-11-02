@@ -54,6 +54,7 @@ from apply_to_progression_data import (  # noqa: E402
 from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
+from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa: E402
 from visualize_trajectory import (  # noqa: E402
     denorm,
     estimate_module3_progression,
@@ -97,7 +98,7 @@ def run_one(path, G, classifier, seg_models, module3, thresholds, config, device
     m1 = process_image(path, classifier, seg_models, device=device)
     start = config.start_stage if config.start_stage is not None else int(m1["grade"])
     image = load_module2_image(path, config.image_size).to(device)
-    mask = mask_to_tensor(m1["mask"], config.image_size).to(device)
+    mask = _fp_load_module2_mask(m1["mask"], path, config.image_size).to(device)  # same retina crop as the image
     summary = {
         "input": path,
         "module1_input_grade": int(m1["grade"]),
@@ -110,6 +111,12 @@ def run_one(path, G, classifier, seg_models, module3, thresholds, config, device
     }
 
     # 2) Cascade.
+    if start < config.min_start_stage:
+        # Round 4: the thesis scope starts at mild NPDR -- a stage-0 input is outside it.
+        print(f"  {name}: start stage {start} < --min-start-stage {config.min_start_stage} (outside the scope) "
+              "-- skipped; pass --start-stage to force a known clinical grade")
+        summary["skipped"] = f"start stage {start} < min_start_stage {config.min_start_stage}"
+        return summary
     if start >= config.end_stage:
         print(f"  {name}: already at stage {start} (>= end stage {config.end_stage}) -- nothing to synthesize")
         trajectory = [{"stage": start, "image": image, "mask": mask, "consistency": None, "grade_probs": None}]
@@ -182,6 +189,9 @@ def main(config):
     print(f"Generating stage trajectories up to stage {config.end_stage} for {len(inputs)} image(s)...")
     os.makedirs(config.out_dir, exist_ok=True)
     summaries = [run_one(p, G, classifier, seg_models, module3, thresholds, config, device) for p in inputs]
+    n_skip = sum(1 for s_ in summaries if s_.get("skipped"))
+    if n_skip:
+        print(f"⚠ {n_skip} of {len(summaries)} input(s) skipped as out of scope (--min-start-stage {config.min_start_stage})")
     with open(os.path.join(config.out_dir, "all_trajectories.json"), "w") as f:
         json.dump(summaries, f, indent=2)
     print(f"✓ Done -- outputs in {config.out_dir}")
@@ -197,6 +207,8 @@ if __name__ == "__main__":
     p.add_argument("--start-stage", type=int, default=None,
                    help="Override Module 1's grade with a known clinical stage (0-4)")
     p.add_argument("--end-stage", type=int, default=4, help="Last stage to synthesize (default 4 = PDR)")
+    p.add_argument("--min-start-stage", type=int, default=0,
+                   help="Skip inputs whose start stage is below this (1 = the thesis scope, >= mild NPDR)")
     p.add_argument("--module3-checkpoint", default=None)
     p.add_argument("--module3-thresholds-json", default=None)
     p.add_argument("--image-size", type=int, default=128)

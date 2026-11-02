@@ -45,7 +45,6 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from PIL import Image  # noqa: E402
-from torchvision import transforms  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
 from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
@@ -69,6 +68,8 @@ from compute_lbs import classify_lbs_stratum, compute_lbs, estimate_retinal_fov_
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tianjin_dataset import _module1_image_id_candidates  # noqa: E402
+from fundus_preprocess import load_module2_image as _fp_load_module2_image  # noqa: E402
+from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa: E402
 
 STRATUM_TO_IDX = {"low": 0, "medium": 1, "high": 2}
 
@@ -78,27 +79,16 @@ def denorm(x):
 
 
 def load_module2_image(path, image_size):
-    """Loads an image in Module 2's [-1,1] normalization convention (not Module 3's ImageNet
-    stats) -- this feeds the Generator, matching train_module2_poc.py/evaluate_trajectory.py."""
-    tfm = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ]
-    )
-    img = Image.open(path).convert("RGB")
-    return tfm(img).unsqueeze(0)
+    """[-1, 1] tensor of the image, retina-cropped like the training loaders (fundus_preprocess.py)."""
+    return _fp_load_module2_image(path, image_size)
 
 
-def load_mask(cache, baseline_path, image_size):
+def load_mask(cache, baseline_path, image_size, dataset_dir=None):
     for candidate_id in _module1_image_id_candidates(baseline_path):
         if candidate_id in cache:
-            mask_np = cache[candidate_id]["mask"]
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (image_size, image_size), Image.NEAREST
-            )
-            return torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0).unsqueeze(0)
+            # cropped with the image's own retina box -- needs the openable path (dataset_dir + relative)
+            return _fp_load_module2_mask(cache[candidate_id]["mask"],
+                                         os.path.join(dataset_dir or "", baseline_path), image_size)
     return torch.zeros(1, 1, image_size, image_size)
 
 
@@ -205,10 +195,16 @@ def run(config):
 
     print("\n[1/4] Loading Tianjin survival dataset (source of real progression pairs)...")
     survival_dataset = TianjinSurvivalDataset(
-        config.tianjin_dir, module1_cache_path=config.tianjin_module1_cache, image_size=config.image_size
+        config.tianjin_dir, module1_cache_path=config.tianjin_module1_cache, image_size=config.image_size,
+        min_baseline_grade=config.min_baseline_grade,
     )
     manifest = survival_dataset.manifest
     cache = torch.load(config.tianjin_module1_cache, weights_only=False)
+    if config.exclude_train_from:  # round 4: show patients the Generator never trained on
+        _train = set(str(p) for p in (json.load(open(config.exclude_train_from)).get("split") or {})
+                     .get("train_tianjin_patients") or [])
+        manifest = manifest[~manifest["patient_id"].astype(str).isin(_train)]
+        print(f"  --exclude-train-from: {len(_train)} Generator-training patients left out")
 
     progressing = manifest[manifest["followup_icdr"] > manifest["baseline_icdr"]]
     if len(progressing) == 0:
@@ -257,7 +253,7 @@ def run(config):
     for _, row in selected.iterrows():
         baseline_path = os.path.join(config.tianjin_dir, row["baseline_path"])
         baseline_img = load_module2_image(baseline_path, config.image_size).to(device)
-        mask = load_mask(cache, row["baseline_path"], config.image_size)
+        mask = load_mask(cache, row["baseline_path"], config.image_size, config.tianjin_dir)
 
         start_stage = int(row["baseline_icdr"])
         # Default: stop at this patient's real follow-up grade. --end-stage 4 instead projects
@@ -317,6 +313,10 @@ if __name__ == "__main__":
     parser.add_argument("--g-repeat-num", type=int, default=6)
     parser.add_argument("--style-dim", type=int, default=None, help="Defaults to c_dim, matching Generator's own default")
     parser.add_argument("--num-patients", type=int, default=4)
+    parser.add_argument("--exclude-train-from", default=None,
+                        help="train_module2_poc.py's poc_results.json: only patients the Generator never trained on")
+    parser.add_argument("--min-baseline-grade", type=int, default=0,
+                        help="1 = only eyes starting at >= mild NPDR (the thesis scope)")
     parser.add_argument("--end-stage", type=int, default=None,
                         help="Cascade every patient up to this stage (e.g. 4 = PDR). Omit to stop at "
                              "each patient's real follow-up grade (the original behaviour).")

@@ -46,6 +46,19 @@ earlier behaviour):
       --no-augment = off) and AdamW weight decay (--weight-decay, default 1e-2; 0 = Adam as before).
   7.2 --min-baseline-grade 1 keeps only eyes that start at >= mild NPDR (default 0: all).
 
+Round 4 (items R4-6):
+  * --report-min-baseline-grade 1 (default): metrics are reported on ALL held-out eyes and on the
+    in-scope ones (baseline >= mild NPDR, the manuscript's scope) -- training keeps every eye
+    (--min-baseline-grade 0), since the baseline grade is an input and the in-scope subset alone
+    has few progression events.
+  * 95 % bootstrap intervals (patients resampled) for AUROC and Brier -- with ~20 test events a
+    single AUROC is not interpretable on its own.
+  * Tabular baselines on the SAME patients (fit on train, scored on val/test): the train event rate
+    per clinical baseline grade, and logistic regression on clinical baseline grade (one-hot) +
+    log LBS + Module 1's predicted grade. The image model has to beat these to add anything.
+  * The output is P(progression by 2 years) -- with every follow-up at t = 2 the Weibull shape is
+    not identifiable, so report the 2-year probability, not survival curves at other horizons.
+
 Usage (Colab, after notebook 05 has built module1_outputs_tianjin.pt):
     python train_module3_poc.py \
         --tianjin-dir /content/data/retinal-dr-longitudinal \
@@ -71,6 +84,8 @@ from resume_utils import load_resume_state, save_resume_state, seed_everything  
 
 
 class Config:
+    report_min_baseline_grade = 1  # round 4: also report metrics on eyes with baseline >= this
+    n_bootstrap = 1000
     tianjin_dir = "../retinal-dr-longitudinal"
     tianjin_module1_cache_path = None
     image_size = 380
@@ -88,7 +103,85 @@ class Config:
     resume_state_path = None  # optional per-epoch resume file (see resume_utils.py)
 
 
-def evaluate(model, loader, device):
+def binary_metrics(probs, events, groups=None, n_bootstrap=0, seed=0):
+    """AUROC / Brier / rates for P(progression by 2yr); with n_bootstrap, 95 % intervals from
+    resampling patients (groups) with replacement."""
+    import numpy as np
+    from sklearn.metrics import brier_score_loss, roc_auc_score
+
+    probs, events = np.asarray(probs, dtype=float), np.asarray(events, dtype=float)
+    n = len(probs)
+    out = {"n": n, "n_events": int(events.sum()) if n else 0,
+           "mean_predicted_progression_by_2yr": float(probs.mean()) if n else float("nan"),
+           "actual_progression_rate": float(events.mean()) if n else float("nan"),
+           "auroc": float(roc_auc_score(events, probs)) if n and len(set(events)) > 1 else float("nan"),
+           "brier_score": float(brier_score_loss(events, probs)) if n else float("nan")}
+    out["brier_constant_rate"] = out["actual_progression_rate"] * (1 - out["actual_progression_rate"]) if n else float("nan")
+    if n_bootstrap and n and len(set(events)) > 1:
+        rng = np.random.default_rng(seed)
+        groups = np.arange(n) if groups is None else np.asarray(groups)
+        uniq = np.unique(groups)
+        rows = {g: np.nonzero(groups == g)[0] for g in uniq}
+        aucs, briers = [], []
+        for _ in range(n_bootstrap):
+            idx = np.concatenate([rows[g] for g in rng.choice(uniq, size=len(uniq), replace=True)])
+            if len(set(events[idx])) > 1:
+                aucs.append(roc_auc_score(events[idx], probs[idx]))
+            briers.append(brier_score_loss(events[idx], probs[idx]))
+        if aucs:
+            out["auroc_95ci"] = [float(np.percentile(aucs, 2.5)), float(np.percentile(aucs, 97.5))]
+        out["brier_95ci"] = [float(np.percentile(briers, 2.5)), float(np.percentile(briers, 97.5))]
+    return out
+
+
+def _fmt(m):
+    if not m or not m.get("n"):
+        return "n=0"
+    ci = m.get("auroc_95ci")
+    return (f"n={m['n']} ({m['n_events']} events) | AUROC={m['auroc']:.3f}"
+            + (f" [{ci[0]:.3f}, {ci[1]:.3f}]" if ci else "")
+            + f" | Brier={m['brier_score']:.4f} (constant-rate guess: {m['brier_constant_rate']:.4f})")
+
+
+def tabular_baselines(full_dataset, train_idx, eval_sets, report_min_grade, n_bootstrap, seed):
+    """Round 4: non-image baselines fit on the training patients, scored on each eval set.
+    eval_sets: {name: indices}. Returns {baseline: {set name: metrics, set name + '_in_scope': metrics}}."""
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+
+    m = full_dataset.manifest
+    def feats(idx):
+        rows = m.iloc[idx]
+        g = rows["baseline_icdr"].astype(int).to_numpy()
+        onehot = np.eye(5)[g]
+        lbs = np.log10(rows["lbs"].astype(float).to_numpy() + 1e-5)[:, None]
+        m1 = rows["module1_grade"].fillna(-1).astype(float).to_numpy()[:, None]
+        return np.hstack([onehot, lbs, m1]), rows["event"].to_numpy(), g, rows["patient_id"].to_numpy()
+
+    Xtr, ytr, gtr, _ = feats(train_idx)
+    out = {}
+    if len(set(ytr)) < 2:
+        return out
+    # 1) event rate per clinical baseline grade (train), overall rate for unseen grades
+    rate = {k: float(ytr[gtr == k].mean()) for k in np.unique(gtr)}
+    overall = float(ytr.mean())
+    # 2) logistic regression: grade one-hot + log LBS + Module 1 grade
+    lr = LogisticRegression(C=1.0, max_iter=2000).fit(Xtr, ytr)
+    for name, idx in eval_sets.items():
+        if idx is None or not len(idx):
+            continue
+        X, y, g, pid = feats(idx)
+        preds = {"grade_event_rate": np.array([rate.get(k, overall) for k in g]),
+                 "logreg_grade_lbs_module1": lr.predict_proba(X)[:, 1]}
+        for bname, p in preds.items():
+            out.setdefault(bname, {})[name] = binary_metrics(p, y, pid, n_bootstrap, seed)
+            keep = g >= report_min_grade
+            if report_min_grade > 0 and keep.any():
+                out[bname][name + "_in_scope"] = binary_metrics(p[keep], y[keep], pid[keep], n_bootstrap, seed)
+    return out
+
+
+def evaluate(model, loader, device, report_min_grade=0, n_bootstrap=0, seed=0):
     """
     Evaluation at t=2 years (Tianjin's only observed horizon): mean predicted P(progression)
     vs. actual event rate, plus AUROC as a discrimination metric. Not a concordance index --
@@ -98,7 +191,7 @@ def evaluate(model, loader, device):
     from sklearn.metrics import brier_score_loss, roc_auc_score
 
     model.eval()
-    all_probs, all_events = [], []
+    all_probs, all_events, all_grades, all_pids = [], [], [], []
     nll_sum, nll_n = 0.0, 0
     with torch.no_grad():
         for batch in loader:
@@ -116,6 +209,8 @@ def evaluate(model, loader, device):
 
             all_probs.extend(prob_progression.tolist())
             all_events.extend(event.tolist())
+            all_grades.extend(batch["baseline_grade_icdr"].tolist())
+            all_pids.extend(batch["patient_id"])
     model.train()
 
     n = len(all_probs)
@@ -127,7 +222,7 @@ def evaluate(model, loader, device):
         auroc = float("nan")
     brier = brier_score_loss(all_events, all_probs) if n else float("nan")
 
-    return {
+    result = {
         "n": n,
         "mean_predicted_progression_by_2yr": mean_pred,
         "actual_progression_rate": actual_rate,
@@ -135,6 +230,16 @@ def evaluate(model, loader, device):
         "brier_score": brier,
         "nll": nll_sum / nll_n if nll_n else float("nan"),
     }
+    if n_bootstrap:
+        result.update({k: v for k, v in binary_metrics(all_probs, all_events, all_pids, n_bootstrap, seed).items()
+                       if k not in result})
+    if report_min_grade > 0 and n:
+        keep = [g >= report_min_grade for g in all_grades]
+        result["in_scope"] = binary_metrics([p for p, k in zip(all_probs, keep) if k],
+                                            [e for e, k in zip(all_events, keep) if k],
+                                            [q for q, k in zip(all_pids, keep) if k], n_bootstrap, seed)
+        result["in_scope"]["min_baseline_grade"] = report_min_grade
+    return result
 
 
 def train(config: Config):
@@ -228,8 +333,9 @@ def train(config: Config):
               f"final-model.ckpt = last epoch ({config.num_epochs})")
 
     print(f"\n[4/4] Evaluating {'best-model' if best_path else 'final-model'} on held-out patients...")
-    val_metrics = evaluate(model, val_loader, device)
-    test_metrics = evaluate(model, test_loader, device) if test_loader is not None else None
+    rmg, nb = config.report_min_baseline_grade, config.n_bootstrap
+    val_metrics = evaluate(model, val_loader, device, rmg, nb, config.seed)
+    test_metrics = evaluate(model, test_loader, device, rmg, nb, config.seed) if test_loader is not None else None
     # The reported metrics: test patients when there is a test split (never used to pick the
     # epoch), else val (the earlier, slightly optimistic setup).
     metrics = test_metrics if test_metrics is not None else val_metrics
@@ -239,10 +345,22 @@ def train(config: Config):
         print(
             f"✓ {name}: n={m['n']} | mean predicted P(progression by 2yr)="
             f"{m['mean_predicted_progression_by_2yr']:.3f} | actual rate="
-            f"{m['actual_progression_rate']:.3f} | AUROC={m['auroc']:.3f} | "
-            f"Brier={m['brier_score']:.4f} (constant-rate guess: "
+            f"{m['actual_progression_rate']:.3f} | AUROC={m['auroc']:.3f}"
+            + (f" [{m['auroc_95ci'][0]:.3f}, {m['auroc_95ci'][1]:.3f}]" if m.get("auroc_95ci") else "")
+            + f" | Brier={m['brier_score']:.4f} (constant-rate guess: "
             f"{m['actual_progression_rate'] * (1 - m['actual_progression_rate']):.4f})"
         )
+        if m.get("in_scope"):
+            print(f"    in scope (baseline >= {rmg}): {_fmt(m['in_scope'])}")
+
+    # Round 4: non-image baselines on the same patients (fit on train).
+    _ix = lambda s: list(s.indices) if s is not None else None  # noqa: E731
+    baselines = tabular_baselines(full_dataset, _ix(train_set), {"val": _ix(val_set), "test": _ix(test_set)},
+                                  rmg, nb, config.seed)
+    print("\nTabular baselines (fit on the training patients; the image model has to beat these):")
+    for bname, sets in baselines.items():
+        for sname, bm in sets.items():
+            print(f"  {bname:<26} {sname:<14} {_fmt(bm)}")
 
     results = {
         "num_epochs": config.num_epochs,
@@ -256,6 +374,10 @@ def train(config: Config):
         "metrics_model": "best-model" if best_path else "final-model",
         "metrics_on": "test patients" if test_metrics is not None else "val patients (also used for epoch selection)",
         "metrics": metrics,
+        "output_meaning": "P(progression by 2 years) -- every follow-up is at t = 2, so the Weibull shape is "
+                          "not identifiable; do not report survival at other horizons",
+        "tabular_baselines": baselines,
+        "report_min_baseline_grade": config.report_min_baseline_grade,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
         "loss_history": loss_history,
@@ -308,6 +430,10 @@ if __name__ == "__main__":
                         help="AdamW weight decay (0 = Adam, earlier)")
     parser.add_argument("--min-baseline-grade", type=int, default=Config.min_baseline_grade,
                         help="1 = only eyes starting at >= mild NPDR (item 7.2); 0 = all")
+    parser.add_argument("--report-min-baseline-grade", type=int, default=Config.report_min_baseline_grade,
+                        help="Also report metrics on eyes with baseline >= this (1 = the manuscript's scope); 0 = off")
+    parser.add_argument("--n-bootstrap", type=int, default=Config.n_bootstrap,
+                        help="Patient-level bootstrap resamples for the 95 %% intervals (0 = off)")
     parser.add_argument("--save-dir", default=Config.save_dir)
     parser.add_argument("--resume-state", default=None,
                         help="Per-epoch resume file (put it on Drive); re-running with the same path "
@@ -324,6 +450,8 @@ if __name__ == "__main__":
     cfg.val_fraction, cfg.test_fraction = args.val_fraction, args.test_fraction
     cfg.freeze_blocks, cfg.augment, cfg.weight_decay = args.freeze_blocks, args.augment, args.weight_decay
     cfg.min_baseline_grade = args.min_baseline_grade
+    cfg.report_min_baseline_grade = args.report_min_baseline_grade
+    cfg.n_bootstrap = args.n_bootstrap
     cfg.save_dir = args.save_dir
 
     train(cfg)

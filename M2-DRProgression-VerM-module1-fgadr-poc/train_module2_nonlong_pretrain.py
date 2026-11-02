@@ -52,6 +52,13 @@ Per-batch log (CODE_FIXES item 3.7): <save_dir>/batch_log.csv, one row per batch
 adversarial / gradient-penalty / class terms, D's parameter-gradient norm, the mean gradient norm at
 the GP interpolates, and the G losses on G-step batches. Kept in the resume state as well.
 
+Round 4 -- frozen-grader loss (item R4-3.1, gan_guidance.py): --grader-loss-checkpoint adds
+lambda_grader x CE(grader(G(x, k)), k) to the Generator's loss, with Module 1's grader frozen and a
+fresh random augmentation in front of it. Round 3's D stage head graded real val images at 17.5 %
+(balanced 27 %) yet accepted 74-100 % of G's outputs as the requested stage; the EyePACS grader is
+in-domain here (kappa 0.72 on EyePACS test). The stage-head numbers in nonlong_pretrain_results.json
+stay D's; notebook 09 also scores the outputs with the OTHER grader (FGADR).
+
 Dry run (synthetic images + labels, no data needed -- plumbing check only):
     python train_module2_nonlong_pretrain.py --dry-run --save-dir /tmp/nonlong_dry
 """
@@ -74,6 +81,7 @@ from base_model import Discriminator, Generator, add_arch_arg, arch_kwargs  # no
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
 from train_module2_poc import denorm, grad_norm, gradient_penalty, write_batch_log  # noqa: E402
+from gan_guidance import FrozenGrader  # noqa: E402  (after train_module2_poc, which puts module1/ on sys.path)
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
@@ -121,6 +129,10 @@ class Config:
     bio_margin = 1.0  # |z| within this many stage-SDs of the stage mean is not penalised
     bio_warmup_epochs = 1  # train the BiomarkerRegressor alone first so it isn't random
     p_adjacent = 0.5
+    grader_loss_path = None  # round 4: frozen Module 1 grader in G's loss; None = off
+    grader_loss_norm = "eyepacs"
+    grader_input_size = 512
+    lambda_grader = 1.0
 
     save_dir = "./DRForestGAN-v2/stargan/models_nonlong/"
     sample_dir = "./training_samples_nonlong/"
@@ -343,6 +355,12 @@ def train(config):
     g_opt = optim.Adam(G.parameters(), lr=config.g_lr, betas=(config.beta1, config.beta2))
     d_opt = optim.Adam(D.parameters(), lr=config.d_lr, betas=(config.beta1, config.beta2))
     r_opt = optim.Adam(R.parameters(), lr=config.r_lr, betas=(0.9, 0.999))
+    grader = None
+    if config.grader_loss_path and config.lambda_grader > 0:
+        grader = FrozenGrader(config.grader_loss_path, norm=config.grader_loss_norm,
+                              input_size=config.grader_input_size, device=device)
+        print(f"  Frozen-grader loss: {config.lambda_grader} x CE ({config.grader_loss_path}, "
+              f"norm {config.grader_loss_norm}, {config.grader_input_size} px, augmented views)")
 
     print(f"\n[3/4] Training for {config.num_epochs} epochs ({len(train_loader)} batches/epoch)...")
     start = time.time()
@@ -352,11 +370,11 @@ def train(config):
     batch_log = extra.get("batch_log", [])
     batch_log_path = os.path.join(config.save_dir, "batch_log.csv")
     batch_fields = ["epoch", "batch", "g_step", "d_loss", "d_adv", "gp", "d_cls", "d_grad_norm",
-                    "gp_grad_norm", "g_loss", "g_adv", "g_cls", "g_cyc", "g_bio", "g_mono"]
+                    "gp_grad_norm", "g_loss", "g_adv", "g_cls", "g_cyc", "g_bio", "g_mono", "g_grader"]
     g_steps = history[-1].get("g_steps", 0) if history else 0  # G updates so far (1 per n_critic batches)
     for epoch in range(start_epoch, config.num_epochs):
         bio_on = use_bio and epoch >= config.bio_warmup_epochs
-        sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, bio=0.0, mono=0.0, r=0.0)
+        sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, bio=0.0, mono=0.0, r=0.0, grd=0.0)
         n_g = 0
         for i, batch in enumerate(train_loader):
             x = batch["image"].to(device)
@@ -389,7 +407,7 @@ def train(config):
             d_opt.step()
             sums["d"] += d_loss.item()
             row = [epoch + 1, i, None, d_loss.item(), d_adv.item(), gp.item(), d_cls.item(), d_gnorm, gp_norm,
-                   None, None, None, None, None, None]
+                   None, None, None, None, None, None, None]
 
             # --- Generator ---
             if i % config.n_critic == 0:
@@ -413,6 +431,11 @@ def train(config):
                     g_mono = monotonic_loss(pred_fake, pred_real, src, trg)
                     g_loss = g_loss + config.lambda_bio * g_bio + config.lambda_mono * g_mono
                     sums["bio"] += g_bio.item(); sums["mono"] += g_mono.item()
+                g_grd = None
+                if grader is not None:
+                    g_grd = F.cross_entropy(grader(fake), trg)
+                    g_loss = g_loss + config.lambda_grader * g_grd
+                    sums["grd"] += g_grd.item()
                 g_opt.zero_grad(); g_loss.backward(); g_opt.step()
                 # g_loss.backward() also reaches R's params through R(fake); R is only updated
                 # by its own real-image loss, so drop those gradients.
@@ -421,18 +444,20 @@ def train(config):
                 n_g += 1
                 row[2] = g_steps + n_g
                 row[9:] = [g_loss.item(), g_adv.item(), g_cls.item(), g_cyc.item(),
-                           g_bio.item() if bio_on else None, g_mono.item() if bio_on else None]
+                           g_bio.item() if bio_on else None, g_mono.item() if bio_on else None,
+                           None if g_grd is None else g_grd.item()]
             batch_log.append(row)
 
         nb = max(len(train_loader), 1)
         g_steps += n_g
         rec_ = {"epoch": epoch + 1, "d_loss": sums["d"] / nb, "r_loss": sums["r"] / nb, "g_steps": g_steps,
-                **{f"g_{k}": sums[k] / max(n_g, 1) for k in ("g", "cls", "cyc", "bio", "mono")},
+                **{f"g_{k}": sums[k] / max(n_g, 1) for k in ("g", "cls", "cyc", "bio", "mono", "grd")},
                 "biomarker_losses_on": bio_on}
         history.append(rec_)
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] D {rec_['d_loss']:.3f} | G {rec_['g_g']:.3f} "
               f"(cls {rec_['g_cls']:.3f}, cyc {rec_['g_cyc']:.3f}, bio {rec_['g_bio']:.3f}, "
-              f"mono {rec_['g_mono']:.3f}) | R {rec_['r_loss']:.3f} | G steps {g_steps} | "
+              f"mono {rec_['g_mono']:.3f}" + (f", grader {rec_['g_grd']:.3f}" if grader is not None else "")
+              + f") | R {rec_['r_loss']:.3f} | G steps {g_steps} | "
               f"{(time.time() - start) / 60:.1f}min")
 
         val_batch = next(iter(val_loader), None)
@@ -462,6 +487,8 @@ def train(config):
         "lambdas": {k: getattr(config, k) for k in dir(config) if k.startswith("lambda_")},
         "bio_margin": config.bio_margin, "p_adjacent": config.p_adjacent, "seed": config.seed,
         "g_lr": config.g_lr, "d_lr": config.d_lr, "n_critic": config.n_critic, "batch_size": config.batch_size,
+        "grader_loss_checkpoint": config.grader_loss_path, "grader_loss_norm": config.grader_loss_norm,
+        "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
     }
@@ -497,6 +524,11 @@ if __name__ == "__main__":
     for name in ("lambda_cls", "lambda_cyc", "lambda_id", "lambda_bio", "lambda_mono", "bio_margin", "p_adjacent"):
         p.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(Config, name))
     p.add_argument("--bio-warmup-epochs", type=int, default=Config.bio_warmup_epochs)
+    p.add_argument("--grader-loss-checkpoint", default=None,
+                   help="Frozen Module 1 grader in G's loss (round 4, gan_guidance.py); omit = off")
+    p.add_argument("--grader-loss-norm", choices=["fgadr", "eyepacs"], default=Config.grader_loss_norm)
+    p.add_argument("--grader-input-size", type=int, default=Config.grader_input_size)
+    p.add_argument("--lambda-grader", type=float, default=Config.lambda_grader)
     p.add_argument("--save-dir", default=Config.save_dir)
     p.add_argument("--seed", type=int, default=Config.seed)
     p.add_argument("--resume-state", default=None,
@@ -514,6 +546,7 @@ if __name__ == "__main__":
     cfg.module1_cache_path = args.module1_cache
     cfg.profiles_path = args.profiles
     cfg.resume_state_path = args.resume_state
+    cfg.grader_loss_path = args.grader_loss_checkpoint
     cfg.dataset_kwargs = {k: v for k, v in {"labels_csv": args.labels_csv, "images_dir": args.images_subdir,
                                             "image_col": args.image_col, "label_col": args.label_col,
                                             "ext": args.ext}.items() if v is not None}

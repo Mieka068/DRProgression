@@ -151,6 +151,38 @@ rebuilds it, so changing the grader or re-training the segmenters never mixes tw
 versions in one cache. **Segmentation resume** (nb 11) failed on PyTorch >= 2.6 before 9e0404e --
 the segmenters in the "reran notebook 11" run are still the 100-epoch models; re-run nb 11.
 
+# Round 4 (after the "3rd round run" notebooks in `outputs/`)
+Pipeline outputs go to NEW Drive folders: `ROUND_TAG = '_r4'` (first code cell of 04_05-10) is
+appended to every cache / Module 2 / Module 3 folder (`module1_cache_drgnet_comb_prefinals_r4/`, ...);
+model folders (`drgnet_replication_prefinals/`) and the laterality file are shared. `ROUND_TAG = ''`
+reads/writes round 3's folders again. Each change keeps the round-3 behaviour behind a flag:
+
+| Item | Round-3 finding | Change (default now) | Round-3 behaviour |
+|---|---|---|---|
+| R4-1.1 | LongDR grade-0 eyes had LBS 0.1-0.34 (Tianjin/FIRE ~0.001): the segmenters ran on `FundusImagesNormalized`; 559 of 917 Module 2 pairs | LongDR's raw colour photos everywhere (`DRP_LONGDR_FOLDER`, `fundus_preprocess.py`); nb 04_05 shows both versions' lesion maps first and prints median LBS by grade per source | `DRP_LONGDR_FOLDER=FundusImagesNormalized` |
+| R4-1.2 | 3:2 photos squashed into ovals at 128 px | Retina crop + pad to square in every Module 2/3 loader, evaluation and inference script (masks cropped with the same box); 256 px (`MODULE2_IMAGE_SIZE`) | `DRP_RETINA_CROP=0`, 128 |
+| R4-1.3 | Segmentation LR never decayed (StepLR every 200 epochs); 100 -> 200 epochs halved IDRiD MA/SE AP | nb 11 `RUN['comb_seg_ft']`: 50-epoch fine-tune of each `comb_models_*` from its best weights, cosine LR 1e-3 -> 1e-5, image-only colour augmentation, Dice on MA + SE, model kept only if it beats the 200-epoch validation AP (`comb_ft_models_*`, used by 04_05-10 once all four exist); IDRiD stays external | `RUN['comb_seg_ft'] = False` |
+| R4-1.4 | 16 `._*.jpg` files failed in 04_05; nb 11 figure cell crashed on a log without validation lines | skipped / figure skipped with a message | -- |
+| R4-1.5 | Augmentation flipped/rotated the images but not the lesion mask; rotation filled grey | mask transformed with the images; black fill | -- |
+| R4-2.5 | Trajectory evaluation ran on all Tianjin pairs, incl. the Generator's training patients | `evaluate_trajectory.py --exclude-train-from poc_results.json` (training patients listed in `split.train_tianjin_patients`); in-scope run (`--min-baseline-grade 1`); same for nb 08's figures | omit the flag |
+| R4-2.6 | FID at n = 38 fell outside its own range | FID only from n >= 50, KID from n >= 10 (primary) | `--min-n-for-fid 5` |
+| R4-3.1 | D's stage head: 17.5 % on real val images (balanced 27 %), yet 74-100 % "agreement" on fakes; cascade re-graded as the target 1.5 % | Frozen Module 1 grader (EyePACS) in G's loss, behind a random differentiable augmentation (`gan_guidance.FrozenGrader`), in pretraining and fine-tuning | `--lambda-grader 0` / no `--grader-loss-checkpoint` |
+| R4-3.2 | 35 progressing training pairs; best epoch 11, D loss negative from epoch 34 | DiffAugment (color, translation, cutout) on every critic call + drift penalty 0.001 | `--diffaugment "" --lambda-drift 0` |
+| R4-3.3 | Best epoch rewarded copying the baseline (most val pairs don't progress) | Selection on stage control (one stage above each held-out baseline) graded by the OTHER grader (FGADR) | `--selection-mode target`, same grader |
+| R4-3.4 | -- | `tools/stage_control_check.py` (nb 09): pretrained G's outputs graded by both graders; `tools/grader_resolution_check.py` (nb 04_05): graders on real Tianjin images at 128/256 px = the cascade metric's ceiling | -- |
+| R4-6 | Module 3 test AUROC 0.551, Brier = constant guess, heavy over-fitting | freeze 8 blocks; metrics also on in-scope eyes (baseline >= mild NPDR) with patient-bootstrap 95 % CIs; tabular baselines (grade event rate, logistic regression on grade + log LBS + Module 1 grade) on the same patients; output reported as P(progression by 2 years) | `--freeze-blocks 6 --report-min-baseline-grade 0 --n-bootstrap 0` |
+| R4-7 | Registration net 45.0 px vs no warp 44.6 px; SIFT mean 1,738 px from a few wild matrices | `--method auto`: identity / net / SIFT (cropped frame, implausible affines rejected) scored on FIRE, cache built with the lowest median error | `REGISTRATION_METHOD = 'net'` |
+| R4-scope | Demo used a grade-0 image | `generate_progression.py --min-start-stage 1` (nb 10) | `MIN_START_STAGE = 0` |
+
+**Scope (baseline >= mild NPDR):** both Modules TRAIN on every eye (grade 0 eyes still teach image
+realism and the 0 -> 1 transition, and the baseline grade is an input) but every reported metric has an
+in-scope version (nb 06 `_in_scope.json`, nb 07 `in_scope`, nb 08 figures, nb 10 inputs).
+
+**Re-run order (round 4):** 11 (fine-tune, ~1 h per lesion on an L4) -> 04_05 (caches + Phase-0
+checks) -> 09 (EyePACS cache with the fine-tuned segmenters, 256 px pretraining with the grader loss,
+stage-control check) -> 06 -> 07 -> 08 -> 10. Every 256 px Module 2 checkpoint is new (the 128 px ones
+don't load at 256).
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

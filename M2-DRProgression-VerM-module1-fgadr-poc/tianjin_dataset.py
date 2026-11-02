@@ -76,6 +76,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from fire_dataset import load_registration_cache
+from fundus_preprocess import crop_mask, load_fundus, mask_to_tensor, retina_crop_enabled
 
 EXCLUDED_GRADES = {6, 7}  # post-photocoagulation, ungradable
 NUM_STAGES = 5  # ICDR 0-4, matching target_grade elsewhere in this repo
@@ -181,6 +182,7 @@ class TianjinLongitudinalDataset(Dataset):
         registration_cache_path=None,
         condition_on="followup",
         min_baseline_grade=0,
+        retina_crop=None,
     ):
         """
         Args:
@@ -207,12 +209,15 @@ class TianjinLongitudinalDataset(Dataset):
                 the baseline grade. See the module docstring.
             min_baseline_grade: drop eye-pairs whose baseline ICDR grade is below this (1 =
                 exclude Stage 0 baselines, item 7.2). 0 keeps every grade.
+            retina_crop: crop to the square retina box before resizing (fundus_preprocess.py;
+                Tianjin's 3:2 photos were squashed into ovals); None = DRP_RETINA_CROP (on).
         """
         if condition_on not in ("followup", "baseline"):
             raise ValueError(f"condition_on must be 'followup' or 'baseline', not {condition_on!r}")
         self.condition_on = condition_on
         self.dataset_dir = dataset_dir
         self.image_size = image_size
+        self.retina_crop = retina_crop_enabled() if retina_crop is None else retina_crop
 
         self.module1_cache = None
         if module1_cache_path:
@@ -394,7 +399,7 @@ class TianjinLongitudinalDataset(Dataset):
         followup_path = os.path.join(self.dataset_dir, row["followup_path"])
 
         try:
-            img1 = Image.open(baseline_path).convert("RGB")
+            img1, box1, size1 = load_fundus(baseline_path, self.retina_crop)
             warped = (
                 self.registration_cache.get((self.SOURCE_NAME, row["baseline_path"]))
                 if self.registration_cache
@@ -403,7 +408,7 @@ class TianjinLongitudinalDataset(Dataset):
             if warped is not None:
                 img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
             else:
-                img2 = Image.open(followup_path).convert("RGB")
+                img2, _box2, _size2 = load_fundus(followup_path, self.retina_crop)
         except Exception:
             return self.__getitem__((idx + 1) % len(self.manifest))
 
@@ -418,11 +423,7 @@ class TianjinLongitudinalDataset(Dataset):
                     break
 
         if module1_output is not None:
-            mask_np = module1_output["mask"]
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (self.image_size, self.image_size), Image.NEAREST
-            )
-            mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
+            mask = mask_to_tensor(crop_mask(module1_output["mask"], box1, size1), self.image_size)
         else:
             mask = torch.zeros(1, self.image_size, self.image_size)
 

@@ -34,7 +34,6 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
 from torch.utils.data import Dataset, Subset
 from torchvision import transforms
 
@@ -46,6 +45,7 @@ for _p in (_REPO_ROOT, _MODULE1_DIR):
         sys.path.insert(0, _p)
 
 from compute_lbs import stratify_lbs_by_grade  # noqa: E402
+from fundus_preprocess import load_fundus  # noqa: E402
 from tianjin_dataset import (  # noqa: E402
     EXCLUDED_GRADES,
     _find_column,
@@ -176,6 +176,14 @@ class TianjinSurvivalDataset(Dataset):
             return None
 
         manifest["lbs"] = manifest["baseline_path"].apply(lookup_lbs)
+
+        def lookup_grade(baseline_path):  # Module 1's predicted grade -- for the tabular baseline (round 4)
+            for candidate_id in _module1_image_id_candidates(baseline_path):
+                if candidate_id in cache:
+                    return cache[candidate_id].get("grade")
+            return None
+
+        manifest["module1_grade"] = manifest["baseline_path"].apply(lookup_grade)
         before = len(manifest)
         manifest = manifest.dropna(subset=["lbs"])
         print(f"  Rows with a Module 1 LBS cache hit: {before} -> {len(manifest)}")
@@ -318,7 +326,7 @@ class TianjinSurvivalDataset(Dataset):
         row = self.manifest.iloc[idx]
         baseline_path = os.path.join(self.dataset_dir, row["baseline_path"])
         try:
-            img = Image.open(baseline_path).convert("RGB")
+            img, _box, _size = load_fundus(baseline_path)  # square retina crop (DRP_RETINA_CROP)
         except Exception:
             return self.__getitem__((idx + 1) % len(self.manifest))
         img = (self.augment_transform if self.augment else self.transform)(img)

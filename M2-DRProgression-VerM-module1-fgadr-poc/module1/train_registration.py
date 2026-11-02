@@ -26,6 +26,18 @@ curve over thresholds 0-25 px, for 'identity' (no registration), 'net' (this net
 --validation-out. --method sift builds the cache with the classical registration instead of the
 network (no training) -- use it if the network's gain over identity is negligible.
 
+Round 4 (items R4-7):
+  * SIFT runs on the same retina-cropped square frame the loaders produce (fundus_preprocess.py),
+    so its affine applies to the loaders' images; FIRE's control points are mapped into / out of
+    each image's crop for the validation.
+  * Implausible SIFT affines (scale outside 0.8-1.25, shear/anisotropy > 15 %, rotation > 30 deg,
+    shift > 25 % of the frame, or < 30 % RANSAC inliers) count as failures and fall back to no warp
+    -- a few wild matrices made the round-3 SIFT mean error 1,738 px although its median (35.7 px)
+    beat no warp (44.2 px).
+  * --method auto (notebook 06's default): train the network, validate identity / net / sift on
+    FIRE's ground truth, and build the cache with whichever has the lowest MEDIAN error ('identity'
+    = the unwarped follow-up). The choice is written to --validation-out ('cache_method').
+
 Usage:
     python train_registration.py \
         --fire-dir /content/data/FIRE_dataset \
@@ -58,6 +70,7 @@ if _REPO_ROOT not in sys.path:
 from fire_dataset import FIREDataset  # noqa: E402
 from longdr_dataset import LongDRScreeningDataset  # noqa: E402
 from tianjin_dataset import TianjinLongitudinalDataset  # noqa: E402
+from fundus_preprocess import load_fundus, map_points_from_crop, map_points_to_crop  # noqa: E402
 
 
 def denorm(x):
@@ -101,15 +114,36 @@ def _openable(dataset, path):
     return path if os.path.isabs(path) or os.path.isfile(path) else os.path.join(dataset.dataset_dir, path)
 
 
-def sift_affine(baseline_path, followup_path, size=512, min_matches=6, ratio=0.75):
-    """Classical registration: SIFT keypoints on the green channel of both images (resized to
-    size x size), Lowe ratio-test matches, RANSAC affine follow-up -> baseline
-    (cv2.estimateAffine2D). Returns the 2x3 matrix in [0, 1]-normalised image coordinates (so it
-    applies at any resolution), or None when too few inliers."""
+def plausible_affine(M, max_scale_dev=0.25, max_aniso=0.15, max_rot_deg=30.0, max_shift=0.25):
+    """A follow-up -> baseline affine in [0, 1] coordinates that a re-photographed eye can have:
+    near-uniform scale within 1/(1+d)..1+d, small shear, moderate rotation and shift."""
+    A, t = np.asarray(M)[:, :2], np.asarray(M)[:, 2]
+    sv = np.linalg.svd(A, compute_uv=False)
+    if sv.min() <= 0 or np.linalg.det(A) <= 0:
+        return False
+    if not (1 / (1 + max_scale_dev) <= sv.min() and sv.max() <= 1 + max_scale_dev):
+        return False
+    if sv.max() / sv.min() > 1 + max_aniso:
+        return False
+    if abs(np.degrees(np.arctan2(A[1, 0], A[0, 0]))) > max_rot_deg:
+        return False
+    centre_shift = A @ np.array([0.5, 0.5]) + t - 0.5
+    return bool(np.abs(centre_shift).max() <= max_shift)
+
+
+def sift_affine(baseline_path, followup_path, size=512, min_matches=6, ratio=0.75, min_inlier_frac=0.3,
+                retina_crop=None):
+    """Classical registration: SIFT keypoints on the green channel of both images (retina-cropped
+    like the loaders, then resized to size x size), Lowe ratio-test matches, RANSAC affine
+    follow-up -> baseline (cv2.estimateAffine2D). Returns the 2x3 matrix in [0, 1]-normalised
+    coordinates of the loaders' frame (so it applies at any image_size), or None when too few
+    inliers or the affine is implausible (plausible_affine)."""
     import cv2
 
     def gray(p):
-        return np.array(Image.open(p).convert("RGB").resize((size, size), Image.BILINEAR))[:, :, 1]
+        img, _box, _size = load_fundus(p, retina_crop)
+        g = np.array(img.resize((size, size), Image.BILINEAR))[:, :, 1]
+        return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)  # vessels stand out
 
     sift = cv2.SIFT_create()
     kb, db = sift.detectAndCompute(gray(baseline_path), None)
@@ -123,9 +157,9 @@ def sift_affine(baseline_path, followup_path, size=512, min_matches=6, ratio=0.7
     src = np.float32([kf[m.queryIdx].pt for m in good]) / size
     dst = np.float32([kb[m.trainIdx].pt for m in good]) / size
     M, inliers = cv2.estimateAffine2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0 / size)
-    if M is None or inliers is None or int(inliers.sum()) < min_matches:
+    if M is None or inliers is None or int(inliers.sum()) < max(min_matches, min_inlier_frac * len(good)):
         return None
-    return M
+    return M if plausible_affine(M) else None
 
 
 def warp_with_affine01(img_chw01, M):
@@ -153,19 +187,20 @@ def theta_to_baseline_to_followup(theta):
 
 
 def fire_control_points(fire_dir, baseline_path):
-    """(baseline_pts, followup_pts) in [0, 1] coordinates from FIRE's ground truth, or None."""
+    """(baseline_pts, followup_pts) in ORIGINAL pixels from FIRE's ground truth, or None."""
     pair = os.path.basename(baseline_path).rsplit("_", 1)[0]  # A01_1.jpg -> A01
     name = f"control_points_{pair}_1_2.txt"
     for root, _dirs, files in os.walk(fire_dir):
         if name in files:
             pts = np.loadtxt(os.path.join(root, name), ndmin=2)
-            w, h = Image.open(baseline_path).size
-            return pts[:, :2] / [w, h], pts[:, 2:4] / [w, h], max(w, h)
+            return pts[:, :2], pts[:, 2:4]
     return None
 
 
 def validate_on_fire(fire_ds, fire_dir, net, device, image_size, sift_size):
-    """Control-point error per method (see module docstring), in original FIRE pixels."""
+    """Control-point error per method (see module docstring), in original FIRE pixels. Each method
+    maps baseline points in the loaders' (cropped) frame to the follow-up's frame; the points are
+    moved into / out of each image's own retina crop, so the error is in original follow-up px."""
     methods = {"identity": [], "net": [], "sift": []}
     sift_failed = 0
     for i in range(len(fire_ds)):
@@ -173,14 +208,17 @@ def validate_on_fire(fire_ds, fire_dir, net, device, image_size, sift_size):
         gt = fire_control_points(fire_dir, b_path)
         if gt is None:
             continue
-        b01, f01, orig = gt
+        b_px, f_px = gt
+        _img, box_b, size_b = load_fundus(b_path, fire_ds.retina_crop)
+        _img, box_f, size_f = load_fundus(f_path, fire_ds.retina_crop)
+        b01 = map_points_to_crop(b_px, box_b, size_b)
         mappings = {"identity": lambda p: p}
         if net is not None:
             sample = fire_ds[i]
             with torch.no_grad():
                 _w, theta = net(sample["baseline"].unsqueeze(0).to(device), sample["follow_up"].unsqueeze(0).to(device))
             mappings["net"] = theta_to_baseline_to_followup(theta[0].cpu().numpy())
-        M = sift_affine(b_path, f_path, size=sift_size)
+        M = sift_affine(b_path, f_path, size=sift_size, retina_crop=fire_ds.retina_crop)
         if M is None:
             sift_failed += 1
             mappings["sift"] = mappings["identity"]
@@ -188,7 +226,8 @@ def validate_on_fire(fire_ds, fire_dir, net, device, image_size, sift_size):
             Minv = np.linalg.inv(np.vstack([M, [0, 0, 1]]))[:2]  # baseline -> follow-up
             mappings["sift"] = lambda p, Minv=Minv: np.c_[p, np.ones(len(p))] @ Minv.T
         for name, fn in mappings.items():
-            methods[name].append(float(np.linalg.norm((fn(b01) - f01) * orig, axis=1).mean()))
+            pred_px = map_points_from_crop(fn(b01), box_f, size_f)
+            methods[name].append(float(np.linalg.norm(pred_px - f_px, axis=1).mean()))
     thresholds = np.arange(0, 25.01, 0.5)
     out = {"n_pairs": len(methods["identity"]), "sift_failed_pairs": sift_failed, "units": "original FIRE px"}
     for name, errs in methods.items():
@@ -214,7 +253,7 @@ def build_datasets(config):
             print(f"⚠ Could not load FIRE: {e}")
     if config.longdr_dir:
         try:
-            ds = LongDRScreeningDataset(config.longdr_dir, image_size=config.image_size, use_normalized=True)
+            ds = LongDRScreeningDataset(config.longdr_dir, image_size=config.image_size)  # DRP_LONGDR_FOLDER
             if len(ds) > 0:
                 datasets.append(ds)
                 sources.append(("LongDRScreening", ds))
@@ -254,8 +293,8 @@ def train(config):
 
     net = AffineRegistrationNet().to(device)
     optimizer = optim.Adam(net.parameters(), lr=config.lr)
-    if config.method == "sift":
-        config.num_epochs = 0  # classical registration -- nothing to train
+    if config.method in ("sift", "identity"):
+        config.num_epochs = 0  # classical registration / none -- nothing to train
 
     print(f"\n[2/3] Training for {config.num_epochs} epochs (self-supervised photometric loss)...")
     start_time = time.time()
@@ -275,7 +314,7 @@ def train(config):
         elapsed = time.time() - start_time
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] | L1: {avg_loss:.4f} | Elapsed: {elapsed / 60:.1f}min")
 
-    if config.method == "net":
+    if config.method in ("net", "auto"):
         os.makedirs(os.path.dirname(config.checkpoint_out) or ".", exist_ok=True)
         torch.save(net.state_dict(), config.checkpoint_out)
         print(f"✓ Saved registration network to {config.checkpoint_out}")
@@ -284,8 +323,13 @@ def train(config):
     fire_ds = next((ds for name, ds in sources if name == "FIRE"), None)
     if config.validate_fire and fire_ds is not None:
         print("\n[validation] FIRE ground-truth control points (identity / net / sift)...")
-        val = validate_on_fire(fire_ds, config.fire_dir, net if config.method == "net" else None, device,
-                               config.image_size, config.sift_size)
+        val = validate_on_fire(fire_ds, config.fire_dir, net if config.method in ("net", "auto") else None,
+                               device, config.image_size, config.sift_size)
+        if config.method == "auto":
+            _cands = {m: val[m]["median_error"] for m in ("identity", "net", "sift") if m in val}
+            config.method = min(_cands, key=_cands.get)
+            print(f"  --method auto -> '{config.method}' (lowest median FIRE error: "
+                  + ", ".join(f"{m} {e:.1f} px" for m, e in _cands.items()) + ")")
         val["cache_method"] = config.method
         print(json.dumps(val, indent=2))
         if val["n_pairs"] == 0:
@@ -296,6 +340,9 @@ def train(config):
                 json.dump(val, f, indent=2)
             print(f"✓ Wrote {config.validation_out}")
 
+    if config.method == "auto":
+        print("  ⚠ --method auto needs FIRE's ground truth to choose -- none loaded, using the network")
+        config.method = "net"
     print(f"\n[3/3] Pre-warping every pair once ({config.method}) and writing the cache (keyed by (source, baseline_path))...")
     cache = {}
     n_fallback = 0
@@ -303,10 +350,12 @@ def train(config):
         for source_name, ds in sources:
             for i in range(len(ds)):
                 sample = ds[i]
-                if config.method == "sift":
+                if config.method == "identity":
+                    warped_uint8 = (denorm(sample["follow_up"].clone()).numpy() * 255).astype(np.uint8)
+                elif config.method == "sift":
                     M = sift_affine(_openable(ds, _get_baseline_path(ds, i)), _get_followup_path(ds, i),
-                                    size=config.sift_size)
-                    if M is None:  # too few matches: keep the raw follow-up (identity)
+                                    size=config.sift_size, retina_crop=ds.retina_crop)
+                    if M is None:  # too few matches / implausible: keep the raw follow-up (identity)
                         n_fallback += 1
                         M = np.array([[1.0, 0, 0], [0, 1.0, 0]])
                     warped_uint8 = warp_with_affine01(denorm(sample["follow_up"].clone()), M)
@@ -337,9 +386,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--checkpoint-out", default="./registration_net.ckpt")
     parser.add_argument("--cache-out", default="./registered_followups.pt")
-    parser.add_argument("--method", choices=["net", "sift"], default="net",
+    parser.add_argument("--method", choices=["net", "sift", "identity", "auto"], default="net",
                         help="net: the self-supervised affine network (default); sift: classical SIFT + "
-                             "RANSAC affine per pair (no training)")
+                             "RANSAC affine per pair (no training); identity: no warp; auto: whichever of "
+                             "the three has the lowest median error on FIRE's ground truth")
     parser.add_argument("--sift-size", type=int, default=512, help="Resolution SIFT keypoints are found at")
     parser.add_argument("--no-validate-fire", dest="validate_fire", action="store_false",
                         help="Skip the FIRE ground-truth control-point validation")

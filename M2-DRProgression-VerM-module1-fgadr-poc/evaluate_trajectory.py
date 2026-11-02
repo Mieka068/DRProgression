@@ -48,8 +48,6 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-from PIL import Image
-from torchvision import transforms
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
 from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
@@ -71,6 +69,8 @@ from apply_to_progression_data import (  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tianjin_dataset import _module1_image_id_candidates  # noqa: E402
+from fundus_preprocess import load_module2_image as _fp_load_module2_image  # noqa: E402
+from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa: E402
 from fire_dataset import FIREDataset  # noqa: E402
 from longdr_dataset import LongDRScreeningDataset  # noqa: E402
 from image_quality_metrics import compute_fid_kid_stats  # noqa: E402
@@ -84,28 +84,16 @@ def denorm(x):
 
 
 def load_module2_image(path, image_size):
-    """Loads an image in the SAME [-1,1] normalization convention Module 2's training/
-    inference code uses (not Module 3's ImageNet stats) -- this evaluates the Module 2
-    generator, not a Module 3 model."""
-    tfm = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ]
-    )
-    img = Image.open(path).convert("RGB")
-    return tfm(img).unsqueeze(0)
+    """[-1, 1] tensor of the image, retina-cropped like the training loaders (fundus_preprocess.py)."""
+    return _fp_load_module2_image(path, image_size)
 
 
-def load_mask(cache, baseline_path, image_size):
+def load_mask(cache, baseline_path, image_size, dataset_dir=None):
     for candidate_id in _module1_image_id_candidates(baseline_path):
         if candidate_id in cache:
-            mask_np = cache[candidate_id]["mask"]
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (image_size, image_size), Image.NEAREST
-            )
-            return torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0).unsqueeze(0)
+            # cropped with the image's own retina box -- needs the openable path (dataset_dir + relative)
+            return _fp_load_module2_mask(cache[candidate_id]["mask"],
+                                         os.path.join(dataset_dir or "", baseline_path), image_size)
     return torch.zeros(1, 1, image_size, image_size)
 
 
@@ -217,9 +205,25 @@ def evaluate(config):
 
     print("\n[1/4] Loading Tianjin survival dataset (source of real baseline+follow-up grade pairs)...")
     survival_dataset = TianjinSurvivalDataset(
-        config.tianjin_dir, module1_cache_path=config.tianjin_module1_cache, image_size=config.image_size
+        config.tianjin_dir, module1_cache_path=config.tianjin_module1_cache, image_size=config.image_size,
+        min_baseline_grade=config.min_baseline_grade,
     )
     manifest = survival_dataset.manifest
+    held_out_info = None
+    if config.exclude_train_from:
+        # Round 4 (item R4-2.5): the Generator trained on the quality-filtered Tianjin pairs of
+        # these patients -- evaluating on them would inflate every cascade number.
+        _split = json.load(open(config.exclude_train_from)).get("split") or {}
+        _train = set(str(p) for p in _split.get("train_tianjin_patients") or [])
+        if not _train:
+            raise SystemExit(f"{config.exclude_train_from} has no split.train_tianjin_patients -- it comes from "
+                             "a train_module2_poc.py run before round 4; re-train, or drop --exclude-train-from "
+                             "(and report the numbers as including training patients).")
+        before = len(manifest)
+        manifest = manifest[~manifest["patient_id"].astype(str).isin(_train)].reset_index(drop=True)
+        held_out_info = {"excluded_train_patients": len(_train), "pairs_before": before, "pairs_after": len(manifest)}
+        print(f"  --exclude-train-from: left out {len(_train)} Generator-training patients -> "
+              f"{before} -> {len(manifest)} pairs ({manifest['patient_id'].nunique()} unseen patients)")
     cache = torch.load(config.tianjin_module1_cache, weights_only=False)
 
     print("\n[2/4] Loading Generator checkpoint and Module 1 classifier/segmentation models...")
@@ -257,7 +261,7 @@ def evaluate(config):
         followup_path = os.path.join(config.tianjin_dir, row["followup_path"])
         baseline_img = load_module2_image(baseline_path, config.image_size).to(device)
         real_followup_img = load_module2_image(followup_path, config.image_size).to(device)
-        mask = load_mask(cache, row["baseline_path"], config.image_size)
+        mask = load_mask(cache, row["baseline_path"], config.image_size, config.tianjin_dir)
 
         trajectory = synthesize_trajectory(
             G,
@@ -298,7 +302,10 @@ def evaluate(config):
     )
 
     print("\n[4/4] Aggregating per-step metrics...")
-    results = {"quality": {}, "module1_consistency": {}}
+    results = {"quality": {}, "module1_consistency": {},
+               "evaluated_on": ("patients the Generator never trained on" if held_out_info
+                                else "ALL Tianjin pairs, including the Generator's training patients (optimistic)"),
+               "held_out": held_out_info, "min_baseline_grade": config.min_baseline_grade}
     for step_count in sorted(per_step_psnr.keys()):
         n = len(per_step_psnr[step_count])
         entry = {
@@ -395,7 +402,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--style-dim", type=int, default=None, help="Defaults to c_dim, matching Generator's own default"
     )
-    parser.add_argument("--min-n-for-fid", type=int, default=5)
+    parser.add_argument("--min-n-for-fid", type=int, default=50,
+                         help="FID only from this many pairs per step (biased below; was 5). KID from 10.")
     parser.add_argument("--fid-n-bootstrap", type=int, default=10,
                          help="Resamples (subsamples without replacement) for each step's FID range.")
     parser.add_argument(
@@ -413,6 +421,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--self-consistency-max-pairs", type=int, default=200,
                          help="Cap on pairs evaluated per self-consistency source (0 = no cap).")
+    parser.add_argument("--exclude-train-from", default=None,
+                         help="train_module2_poc.py's poc_results.json: leave out every Tianjin patient the "
+                              "Generator trained on (its split.train_tianjin_patients)")
+    parser.add_argument("--min-baseline-grade", type=int, default=0,
+                         help="1 = only eyes starting at >= mild NPDR (the manuscript's scope)")
     parser.add_argument("--out", default="./trajectory_eval_results.json")
     add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
     add_arch_arg(parser)  # must match the Generator checkpoint's run

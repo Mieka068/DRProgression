@@ -25,7 +25,7 @@ def image_sizes(root, max_images=None):
     sizes = []
     for dirpath, _dirs, files in os.walk(root):
         for f in sorted(files):
-            if not f.lower().endswith(IMAGE_EXTS) or "mask" in f.lower():
+            if not f.lower().endswith(IMAGE_EXTS) or "mask" in f.lower() or f.startswith("._"):
                 continue
             try:
                 with Image.open(os.path.join(dirpath, f)) as im:
