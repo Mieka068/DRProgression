@@ -213,8 +213,8 @@ four exist), the larger EyePACS cache, the unseen-patient evaluation. Caveat: ro
 mostly rewards copying the baseline (most held-out pairs don't progress) -- read the cascade/progression
 numbers, not only PSNR/FID.
 
-**Re-run order (round 5):** free Google Drive space (not round 3/4 folders) -> 04_05 (caches + laterality
-with the crop fix) -> 09 (continues round 3's pretraining at 128 px) -> 06 (read the SIFT failure rate
+**Re-run order (round 5):** free Google Drive space (not round 3/4 folders) -> 04_05 (its retina-crop check
+cell first, then caches + laterality with the crop fix) -> 09 (continues round 3's pretraining at 128 px) -> 06 (read the SIFT failure rate
 first; its last evaluation cell compares with round 3) -> 07 -> 08 -> 10. Compare with round 3 on the unseen-patient evaluation. Next, one at a time:
 `lambda_rec` 10 -> 5, then 256 px.
 
