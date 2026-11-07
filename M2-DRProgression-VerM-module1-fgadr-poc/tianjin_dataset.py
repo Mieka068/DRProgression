@@ -75,7 +75,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from fire_dataset import load_registration_cache
+from fire_dataset import load_registration_cache, registration_dropped, report_registration_drops
 from fundus_preprocess import crop_mask, load_fundus, mask_to_tensor, retina_crop_enabled
 
 EXCLUDED_GRADES = {6, 7}  # post-photocoagulation, ungradable
@@ -313,6 +313,11 @@ class TianjinLongitudinalDataset(Dataset):
         print(f"  Conditioning on the {condition_on} grade | {n_fu}/{len(manifest)} pairs have a follow-up "
               f"grade, {int(manifest['progressed'].sum())} progressed (follow-up > baseline)")
 
+        if self.registration_cache:
+            _n = len(manifest)
+            manifest = manifest[[not registration_dropped(self.registration_cache, self.SOURCE_NAME, b)
+                                 for b in manifest["baseline_path"]]]
+            report_registration_drops(self.SOURCE_NAME, _n, len(manifest))
         self.manifest = manifest.reset_index(drop=True)
         print(f"✓ Found {len(self.manifest)} pairs in Tianjin dataset "
               f"({self.manifest['dr_grade_raw'].notna().sum()} with real grade)")

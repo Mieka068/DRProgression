@@ -35,15 +35,37 @@ def longdr_folder():
     return os.environ.get("DRP_LONGDR_FOLDER", "FundusImagesColor")
 
 
+def main_fov_region(fov: np.ndarray) -> np.ndarray:
+    """Keep only the largest connected bright region of a field-of-view mask: the retina disc
+    (round 5). Tianjin's follow-up photos print '#2984', the date/time and 'R / Color' in the black
+    border; those characters are separate blobs, but stacked in the same columns they passed the
+    2 % row/column cut-off in retina_box() and stretched the box over them -- the retina then
+    filled only ~60 % of the frame, off-centre (and SIFT rejected the scale change needed to align
+    it). DRP_TEXT_SAFE_CROP=0 restores the earlier mask."""
+    if os.environ.get("DRP_TEXT_SAFE_CROP", "1").strip().lower() in ("0", "false", "no", "off"):
+        return fov
+    from scipy import ndimage
+    labels, n = ndimage.label(fov)
+    if n <= 1:
+        return fov
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+    return labels == int(sizes.argmax())
+
+
 def retina_box(img: Image.Image, threshold: int = 10, work_size: int = 512):
     """Square (left, top, right, bottom) box around the retina in img's pixel coordinates, or None
     if no clear field of view is found. Found on a <= work_size px copy (fast), then scaled back.
-    Same rule as module1/apply_to_progression_data.py's retina_box()."""
+    Same rule as module1/apply_to_progression_data.py's retina_box(). Only the largest bright
+    region counts as the retina, so text overlays in the border are ignored (main_fov_region)."""
     w, h = img.size
     scale = min(1.0, work_size / max(w, h))
     small = img if scale == 1.0 else img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
                                                 Image.BILINEAR)
     fov = np.array(small.convert("RGB"))[:, :, 1] > threshold  # green channel
+    if fov.sum() < 0.05 * fov.size:
+        return None
+    fov = main_fov_region(fov)
     if fov.sum() < 0.05 * fov.size:
         return None
     rows, cols = fov.sum(axis=1), fov.sum(axis=0)

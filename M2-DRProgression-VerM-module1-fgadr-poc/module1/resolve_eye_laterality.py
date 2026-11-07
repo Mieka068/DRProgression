@@ -54,6 +54,10 @@ import cv2
 import numpy as np
 import pandas as pd
 
+import sys  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from fundus_preprocess import main_fov_region  # noqa: E402
+
 
 def find_optic_disc_x_fraction(image_path, downscale=4, percentile=99.0, legacy=False):
     """
@@ -77,6 +81,8 @@ def find_optic_disc_x_fraction(image_path, downscale=4, percentile=99.0, legacy=
         return (max_loc[0] if len(xs) == 0 else float(np.mean(xs))) / small.shape[1]
 
     fov = (green > 10).astype(np.uint8)
+    # Round 5: only the retina disc, so Tianjin's text overlays don't widen the field of view.
+    fov = main_fov_region(fov > 0).astype(np.uint8)
     cols = fov.sum(axis=0)
     xs_fov = np.nonzero(cols > 0.02 * max(cols.max(), 1))[0]
     if fov.sum() < 0.05 * fov.size or len(xs_fov) < 2:

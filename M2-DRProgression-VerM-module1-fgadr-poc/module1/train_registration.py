@@ -346,8 +346,10 @@ def train(config):
     print(f"\n[3/3] Pre-warping every pair once ({config.method}) and writing the cache (keyed by (source, baseline_path))...")
     cache = {}
     n_fallback = 0
+    n_by_source = {}  # source -> [pairs, SIFT failures]
     with torch.no_grad():
         for source_name, ds in sources:
+            n_by_source[source_name] = [len(ds), 0]
             for i in range(len(ds)):
                 sample = ds[i]
                 if config.method == "identity":
@@ -355,8 +357,14 @@ def train(config):
                 elif config.method == "sift":
                     M = sift_affine(_openable(ds, _get_baseline_path(ds, i)), _get_followup_path(ds, i),
                                     size=config.sift_size, retina_crop=ds.retina_crop)
-                    if M is None:  # too few matches / implausible: keep the raw follow-up (identity)
+                    if M is None:  # too few matches / implausible
                         n_fallback += 1
+                        if not getattr(config, "keep_sift_failures", False):
+                            # Round 5: None marks the pair as dropped -- the datasets leave it out, so
+                            # aligned and unaligned targets are never mixed (round 4 kept 455 raw).
+                            cache[(source_name, _get_baseline_path(ds, i))] = None
+                            n_by_source[source_name][1] += 1
+                            continue
                         M = np.array([[1.0, 0, 0], [0, 1.0, 0]])
                     warped_uint8 = warp_with_affine01(denorm(sample["follow_up"].clone()), M)
                 else:
@@ -370,8 +378,25 @@ def train(config):
 
     os.makedirs(os.path.dirname(config.cache_out) or ".", exist_ok=True)
     torch.save(cache, config.cache_out)
-    print(f"✓ Wrote {len(cache)} pre-warped follow-up images to {config.cache_out}"
-          + (f" ({n_fallback} SIFT failures kept unregistered)" if n_fallback else ""))
+    n_warped = sum(v is not None for v in cache.values())
+    print(f"✓ Wrote {n_warped} pre-warped follow-up images to {config.cache_out}"
+          + (f" ({n_fallback} SIFT failures {'kept unregistered' if getattr(config, "keep_sift_failures", False) else 'dropped from training'})"
+             if n_fallback else ""))
+    if config.method == "sift":
+        total = sum(n for n, _f in n_by_source.values())
+        frac = n_fallback / max(total, 1)
+        print(f"  SIFT failure rate: {n_fallback}/{total} = {frac:.1%} ("
+              + ", ".join(f"{s} {f}/{n}" for s, (n, f) in n_by_source.items()) + ")")
+        if frac > 0.15:
+            print("  ⚠ more than 15 % of pairs failed SIFT -- consider --method identity for this round "
+                  "(round 3's behaviour: no warping) rather than training on what is left")
+        else:
+            print("  ✓ under 15 % failed -- training on the aligned pairs only")
+        report = {"method": "sift", "pairs": total, "sift_failed": n_fallback, "failure_rate": frac,
+                  "per_source": {s: {"pairs": n, "sift_failed": f} for s, (n, f) in n_by_source.items()},
+                  "failed_pairs": "kept unregistered" if getattr(config, "keep_sift_failures", False) else "dropped"}
+        with open(os.path.splitext(config.cache_out)[0] + "_sift_report.json", "w") as f:
+            json.dump(report, f, indent=2)
 
 
 if __name__ == "__main__":
@@ -391,6 +416,9 @@ if __name__ == "__main__":
                              "RANSAC affine per pair (no training); identity: no warp; auto: whichever of "
                              "the three has the lowest median error on FIRE's ground truth")
     parser.add_argument("--sift-size", type=int, default=512, help="Resolution SIFT keypoints are found at")
+    parser.add_argument("--keep-sift-failures", action="store_true",
+                        help="Keep pairs SIFT can't align as raw (unregistered) follow-ups, round 4's behaviour. "
+                             "Default (round 5): drop them from Module 2 training")
     parser.add_argument("--no-validate-fire", dest="validate_fire", action="store_false",
                         help="Skip the FIRE ground-truth control-point validation")
     parser.add_argument("--validation-out", default=None, help="JSON path for the FIRE validation numbers")

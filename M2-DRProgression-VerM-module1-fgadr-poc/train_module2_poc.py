@@ -500,7 +500,7 @@ def train(config: Config):
                 else "agreement with the target grade")
         print(f"  Best-epoch score: val L1 - {config.selection_alpha} x {what}, graded by "
               f"{config.selection_classifier_path}")
-        if config.grader_loss_path and os.path.abspath(config.grader_loss_path) == os.path.abspath(
+        if config.grader_loss_path and config.lambda_grader > 0 and os.path.abspath(config.grader_loss_path) == os.path.abspath(
                 config.selection_classifier_path):
             print("  ⚠ the selection grader is the grader in G's loss -- the selection score is then the number "
                   "G was optimised on; use the other grader (e.g. FGADR) for --selection-classifier-checkpoint")

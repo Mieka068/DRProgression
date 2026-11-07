@@ -17,7 +17,8 @@ import numpy as np
 from pathlib import Path
 import re
 
-from fire_dataset import load_registration_cache, module1_grade_onehot
+from fire_dataset import (load_registration_cache, module1_grade_onehot, registration_dropped,
+                          report_registration_drops)
 from fundus_preprocess import crop_mask, load_fundus, longdr_folder, mask_to_tensor, retina_crop_enabled
 
 
@@ -83,6 +84,11 @@ class LongDRScreeningDataset(Dataset):
         
         # Find all valid pairs
         self.pairs = self._find_pairs()
+        if self.registration_cache:
+            _n = len(self.pairs)
+            self.pairs = [p for p in self.pairs
+                          if not registration_dropped(self.registration_cache, self.SOURCE_NAME, p['baseline'])]
+            report_registration_drops(self.SOURCE_NAME, _n, len(self.pairs))
         
         print(f"✓ Found {len(self.pairs)} pairs in LongDRScreening ({folder_name})")
         

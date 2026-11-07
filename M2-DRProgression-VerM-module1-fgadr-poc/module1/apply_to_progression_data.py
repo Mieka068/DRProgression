@@ -44,6 +44,7 @@ from compute_lbs import compute_lbs, estimate_retinal_fov_mask
 import sys  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from drive_io import local_twin, push_to_drive, restore_from_drive  # noqa: E402
+from fundus_preprocess import main_fov_region  # noqa: E402
 
 # Classifier input normalisation must match the config the checkpoint was trained with:
 # fgadr_poc.yaml (default) or eyepacs_poc.yaml (DRG-Net's eyepacs_ce.yaml stats). Select with
@@ -143,6 +144,9 @@ def retina_box(rgb: np.ndarray, threshold: int = 10):
     border) are ignored. None if no clear field of view is found (the whole image is used then).
     """
     fov = estimate_retinal_fov_mask(rgb, threshold)
+    if fov.sum() < 0.05 * fov.size:
+        return None
+    fov = main_fov_region(fov)  # round 5: text overlays are separate blobs -- keep the retina disc only
     rows, cols = fov.sum(axis=1), fov.sum(axis=0)
     if fov.sum() < 0.05 * fov.size:
         return None

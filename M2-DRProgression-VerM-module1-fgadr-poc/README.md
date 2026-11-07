@@ -183,6 +183,35 @@ checks) -> 09 (EyePACS cache with the fine-tuned segmenters, 256 px pretraining 
 stage-control check) -> 06 -> 07 -> 08 -> 10. Every 256 px Module 2 checkpoint is new (the 128 px ones
 don't load at 256).
 
+# Round 5 -- round 3's Module 2 settings + data fixes (branch `R5-Round3Baseline-Fixes`)
+Round 4's Module 2 was worse than round 3's on the same 93 held-out pairs (PSNR 16.5 vs 24.0 dB, FID 176
+vs 119, 0 % grade agreement every epoch, warped/blurry outputs with green/yellow marks at the disc and
+fovea). Round 5 starts again from round 3's Module 2 setup and adds only the data fixes, so later
+changes can be tested one at a time. Outputs go to `_r5` Drive folders (`ROUND_TAG = '_r5'` in
+04_05-10); round 3's (no suffix) and round 4's (`_r4`) folders are never written to.
+
+| Change | Why | Earlier behaviour |
+|---|---|---|
+| Text-safe retina crop: only the largest bright region counts as the retina (`fundus_preprocess.main_fov_region`, used by both `retina_box()`s and `resolve_eye_laterality.py`) | Tianjin's follow-ups print the ID, date and "R / Color" in the border; stacked in the same columns they passed the 2 % cut-off and stretched the crop box, so the follow-up retina filled ~60 % of the frame, off-centre (and SIFT rejected the >1.25x scale needed to align it) | `DRP_TEXT_SAFE_CROP=0` |
+| SIFT pairs that fail are dropped from Module 2 training (cache value `None`, filtered in the FIRE/LongDR/Tianjin datasets); failure rate printed per source and saved as `registered_followups_sift_report.json` | Round 4 kept 455 of 917 failures unregistered, mixing aligned and unaligned targets. Over ~15 % failing: use `REGISTRATION_METHOD = 'identity'` (round 3's effective behaviour) | `train_registration.py --keep-sift-failures` |
+| nb 06: `REGISTRATION_METHOD = 'sift'` | Best on FIRE in round 4 (11.4 px vs 44.2 px unaligned; round 3's network = no warp) | `'auto'` |
+| 128 px (nb 06, 08, 09, 10) | Round 3's size; ~4x cheaper per epoch. 256 px only once 128 is clean | `MODULE2_IMAGE_SIZE = 'auto'` (256) |
+| No grader loss (`LAMBDA_GRADER = 0`, nb 06 + 09), no DiffAugment / drift penalty (nb 06) | The grader loss reached CE 0.01 = G learned to fool it (the coloured marks); DiffAugment/drift were round-4 additions, off to keep round 3's setup | `1.0`, `'color,translation,cutout'`, `0.001` |
+| Best epoch: val L1 - 0.1 x agreement with the target grade, graded by the EyePACS grader (`SELECTION_MODE = 'target'`) | Round 3's rule. Round 4's FGADR stage control stayed ~2 % all run (FGADR kappa on Tianjin ~0) | `'controllability'`, FGADR |
+| nb 06 evaluation with no grader in the loss: primary runs graded by EyePACS (kappa 0.44 on Tianjin), the third by FGADR (`trajectory_eval_results_fgadr_grader.json`) | The grader with real agreement on Tianjin is the useful one; still only unseen patients (`--exclude-train-from`) | FGADR primary |
+| nb 09: continues round 3's pretraining (copy of its `resume_state.pt` into the `_r5` folder) to 80 epochs; reuses round 4's 13k-image EyePACS cache (copied) | Round 3's pretraining was still improving at 40 epochs | `CONTINUE_ROUND3_PRETRAIN = False` / `REUSE_ROUND4_EYEPACS_CACHE = False` |
+| Laterality file per round from round 5 on (`module1_cache<RUN_TAG>/`), computed with `LATERALITY_DISC_LEFT_IS = 'OS'` (round 3's hand-checked value) | The crop fix changes the frame the optic disc is located in | shared `module1_cache<RUN_SUFFIX>/` |
+
+Kept from round 4: LongDR colour photos, retina crop, round-4 segmenters (`comb_ft_models_*` once all
+four exist), the larger EyePACS cache, the unseen-patient evaluation. Caveat: round 3's selection rule
+mostly rewards copying the baseline (most held-out pairs don't progress) -- read the cascade/progression
+numbers, not only PSNR/FID.
+
+**Re-run order (round 5):** free Google Drive space (not round 3/4 folders) -> 04_05 (caches + laterality
+with the crop fix) -> 09 (continues round 3's pretraining at 128 px) -> 06 (read the SIFT failure rate
+first) -> 07 -> 08 -> 10. Compare with round 3 on the unseen-patient evaluation. Next, one at a time:
+`lambda_rec` 10 -> 5, then 256 px.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

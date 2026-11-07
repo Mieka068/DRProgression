@@ -25,12 +25,25 @@ def load_registration_cache(path, image_size):
     """module1/train_registration.py's cache ({(source, baseline_path): CHW uint8}), checked to hold
     images at this image_size -- warps made at another size would be silently resized (item 4.3)."""
     cache = torch.load(path, weights_only=False)
-    first = next(iter(cache.values()), None)
+    first = next((v for v in cache.values() if v is not None), None)
     if first is not None and first.shape[-1] != image_size:
         raise ValueError(f"Registration cache {path} holds {first.shape[-1]} px images but image_size is "
                          f"{image_size} -- re-run module1/train_registration.py --image-size {image_size}.")
-    print(f"✓ Loaded registration cache: {len(cache)} pairs ({path})")
+    n_dropped = sum(v is None for v in cache.values())
+    print(f"✓ Loaded registration cache: {len(cache) - n_dropped} pairs ({path})"
+          + (f" -- {n_dropped} pairs SIFT couldn't align are left out of training" if n_dropped else ""))
     return cache
+
+
+def registration_dropped(cache, source_name, baseline_path):
+    """True when the registration cache marks this pair as dropped (a SIFT failure, value None; round 5).
+    A pair missing from the cache is NOT dropped -- it just uses its raw follow-up, as before."""
+    return bool(cache) and (source_name, baseline_path) in cache and cache[(source_name, baseline_path)] is None
+
+
+def report_registration_drops(source_name, n_before, n_after):
+    if n_after < n_before:
+        print(f"  {source_name}: left out {n_before - n_after} pairs SIFT couldn't align -> {n_after} pairs")
 
 
 class FIREDataset(Dataset):
@@ -93,6 +106,10 @@ class FIREDataset(Dataset):
 
         # Find all image pairs in the specified category
         self.pairs = self._find_pairs()
+        if self.registration_cache:
+            _n = len(self.pairs)
+            self.pairs = [p for p in self.pairs if not registration_dropped(self.registration_cache, self.SOURCE_NAME, p[0])]
+            report_registration_drops(self.SOURCE_NAME, _n, len(self.pairs))
 
         print(f"✓ Found {len(self.pairs)} pairs in FIRE Category {category}")
         
