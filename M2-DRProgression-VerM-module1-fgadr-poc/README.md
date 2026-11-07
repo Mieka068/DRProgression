@@ -203,6 +203,11 @@ changes can be tested one at a time. Outputs go to `_r5` Drive folders (`ROUND_T
 | nb 06 "Round 3 vs round 5" cell: round 3's best Generator and this round's through the same cascade evaluation on Tianjin patients NEITHER round could have trained on (`evaluate_trajectory.py --exclude-scope module2`, from the new `split.module2_tianjin_patients` in poc_results.json = every patient passing the pair-quality filter); round 3 also in its own frame (crop off). Tables + CSVs in `<run>/round3_comparison/` | Round 5's split differs from round 3's (SIFT drops change it), so round 5's "unseen" patients include some round 3 trained on | -- |
 | Laterality file per round from round 5 on (`module1_cache<RUN_TAG>/`), computed with `LATERALITY_DISC_LEFT_IS = 'OS'` (round 3's hand-checked value) | The crop fix changes the frame the optic disc is located in | shared `module1_cache<RUN_SUFFIX>/` |
 
+Crop check on the round-4 follow-up panels (old box vs text-safe box vs round 3's plain resize):
+`docs/round5_crop_check.png`. Module 3 keeps round 4's `FREEZE_BLOCKS = 8`: round 4's nb 07 run no longer
+over-fits (train/val NLL ~0.35 vs round 3's 0.07/0.34-0.73), and both rounds' test AUROC is at chance
+(0.551 vs 0.515 [0.38, 0.67], 20 test events; the grade-only baseline scores 0.44 on the same patients).
+
 Kept from round 4: LongDR colour photos, retina crop, round-4 segmenters (`comb_ft_models_*` once all
 four exist), the larger EyePACS cache, the unseen-patient evaluation. Caveat: round 3's selection rule
 mostly rewards copying the baseline (most held-out pairs don't progress) -- read the cascade/progression
