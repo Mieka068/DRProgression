@@ -244,6 +244,10 @@ class TianjinLongitudinalDataset(Dataset):
             before = len(manifest)
             manifest = manifest[manifest["quality"] >= min_pair_quality]
             print(f"  Quality filter (>= {min_pair_quality}): {before} -> {len(manifest)} pairs")
+        # Round 5: every patient that could reach Module 2 training, before the laterality / grade filters
+        # and the SIFT drop (all of which can differ between rounds) -- poc_results.json records them as
+        # split.module2_tianjin_patients, for a round-vs-round evaluation on patients NO round trained on.
+        self.candidate_patient_ids = sorted(set(manifest["patient_id"].astype(str).str.strip()))
 
         # Resolve which eye each manifest row is via module1/resolve_eye_laterality.py's
         # precomputed output -- required, since corrected_manifest.csv has no OD/OS marker.

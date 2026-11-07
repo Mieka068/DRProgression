@@ -214,15 +214,21 @@ def evaluate(config):
         # Round 4 (item R4-2.5): the Generator trained on the quality-filtered Tianjin pairs of
         # these patients -- evaluating on them would inflate every cascade number.
         _split = json.load(open(config.exclude_train_from)).get("split") or {}
-        _train = set(str(p) for p in _split.get("train_tianjin_patients") or [])
+        _key = "module2_tianjin_patients" if config.exclude_scope == "module2" else "train_tianjin_patients"
+        _train = set(str(p) for p in _split.get(_key) or [])
+        if config.exclude_scope == "module2" and not _train:
+            raise SystemExit(f"{config.exclude_train_from} has no split.module2_tianjin_patients -- it comes from a "
+                             "train_module2_poc.py run before round 5; pass round 5's poc_results.json.")
         if not _train:
             raise SystemExit(f"{config.exclude_train_from} has no split.train_tianjin_patients -- it comes from "
                              "a train_module2_poc.py run before round 4; re-train, or drop --exclude-train-from "
                              "(and report the numbers as including training patients).")
         before = len(manifest)
         manifest = manifest[~manifest["patient_id"].astype(str).isin(_train)].reset_index(drop=True)
-        held_out_info = {"excluded_train_patients": len(_train), "pairs_before": before, "pairs_after": len(manifest)}
-        print(f"  --exclude-train-from: left out {len(_train)} Generator-training patients -> "
+        held_out_info = {"excluded_train_patients": len(_train), "exclude_scope": config.exclude_scope,
+                         "pairs_before": before, "pairs_after": len(manifest)}
+        print(f"  --exclude-train-from ({config.exclude_scope}): left out {len(_train)} "
+              + ("Generator-training" if config.exclude_scope == "train" else "possible Module 2 training") + f" patients -> "
               f"{before} -> {len(manifest)} pairs ({manifest['patient_id'].nunique()} unseen patients)")
     cache = torch.load(config.tianjin_module1_cache, weights_only=False)
 
@@ -424,6 +430,11 @@ if __name__ == "__main__":
     parser.add_argument("--exclude-train-from", default=None,
                          help="train_module2_poc.py's poc_results.json: leave out every Tianjin patient the "
                               "Generator trained on (its split.train_tianjin_patients)")
+    parser.add_argument("--exclude-scope", choices=["train", "module2"], default="train",
+                         help="With --exclude-train-from: 'train' leaves out that run's training patients; "
+                              "'module2' leaves out every patient that could reach Module 2 training in any round "
+                              "(split.module2_tianjin_patients, round 5+) -- the same patients for every round's "
+                              "Generator, for round-vs-round comparisons")
     parser.add_argument("--min-baseline-grade", type=int, default=0,
                          help="1 = only eyes starting at >= mild NPDR (the manuscript's scope)")
     parser.add_argument("--out", default="./trajectory_eval_results.json")

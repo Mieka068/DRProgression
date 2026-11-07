@@ -265,7 +265,9 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
     train_idx, val_idx, n_val_groups, offset = [], [], 0, 0
     progressed = []
     train_tianjin_patients = set()
+    module2_tianjin_patients = set()  # round 5: train + val + filtered-out candidates (see tianjin_dataset.py)
     for ds in datasets:
+        module2_tianjin_patients.update(getattr(ds, "candidate_patient_ids", []))
         progressed += _progressed_flags(ds)
         groups = _group_ids(ds)
         uniq = sorted(set(groups))
@@ -306,7 +308,10 @@ def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
             "progress_fraction": progress_fraction if sampler is not None else None,
             # every Tianjin patient with a pair in training -- evaluate_trajectory.py
             # --exclude-train-from leaves them out, so the cascade metrics are on unseen patients
-            "train_tianjin_patients": sorted(train_tianjin_patients)}
+            "train_tianjin_patients": sorted(train_tianjin_patients),
+            # every Tianjin patient that could reach Module 2 training in ANY round (pair-quality filter only):
+            # evaluate_trajectory.py --exclude-scope module2 leaves them all out (round 3 vs round 5 comparison)
+            "module2_tianjin_patients": sorted(module2_tianjin_patients | train_tianjin_patients)}
     return train_loader, val_loader, info
 
 

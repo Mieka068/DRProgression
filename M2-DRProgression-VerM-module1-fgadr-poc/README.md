@@ -200,6 +200,7 @@ changes can be tested one at a time. Outputs go to `_r5` Drive folders (`ROUND_T
 | Best epoch: val L1 - 0.1 x agreement with the target grade, graded by the EyePACS grader (`SELECTION_MODE = 'target'`) | Round 3's rule. Round 4's FGADR stage control stayed ~2 % all run (FGADR kappa on Tianjin ~0) | `'controllability'`, FGADR |
 | nb 06 evaluation with no grader in the loss: primary runs graded by EyePACS (kappa 0.44 on Tianjin), the third by FGADR (`trajectory_eval_results_fgadr_grader.json`) | The grader with real agreement on Tianjin is the useful one; still only unseen patients (`--exclude-train-from`) | FGADR primary |
 | nb 09: continues round 3's pretraining (copy of its `resume_state.pt` into the `_r5` folder) to 80 epochs; reuses round 4's 13k-image EyePACS cache (copied) | Round 3's pretraining was still improving at 40 epochs | `CONTINUE_ROUND3_PRETRAIN = False` / `REUSE_ROUND4_EYEPACS_CACHE = False` |
+| nb 06 "Round 3 vs round 5" cell: round 3's best Generator and this round's through the same cascade evaluation on Tianjin patients NEITHER round could have trained on (`evaluate_trajectory.py --exclude-scope module2`, from the new `split.module2_tianjin_patients` in poc_results.json = every patient passing the pair-quality filter); round 3 also in its own frame (crop off). Tables + CSVs in `<run>/round3_comparison/` | Round 5's split differs from round 3's (SIFT drops change it), so round 5's "unseen" patients include some round 3 trained on | -- |
 | Laterality file per round from round 5 on (`module1_cache<RUN_TAG>/`), computed with `LATERALITY_DISC_LEFT_IS = 'OS'` (round 3's hand-checked value) | The crop fix changes the frame the optic disc is located in | shared `module1_cache<RUN_SUFFIX>/` |
 
 Kept from round 4: LongDR colour photos, retina crop, round-4 segmenters (`comb_ft_models_*` once all
@@ -209,7 +210,7 @@ numbers, not only PSNR/FID.
 
 **Re-run order (round 5):** free Google Drive space (not round 3/4 folders) -> 04_05 (caches + laterality
 with the crop fix) -> 09 (continues round 3's pretraining at 128 px) -> 06 (read the SIFT failure rate
-first) -> 07 -> 08 -> 10. Compare with round 3 on the unseen-patient evaluation. Next, one at a time:
+first; its last evaluation cell compares with round 3) -> 07 -> 08 -> 10. Compare with round 3 on the unseen-patient evaluation. Next, one at a time:
 `lambda_rec` 10 -> 5, then 256 px.
 
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
