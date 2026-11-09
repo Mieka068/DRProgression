@@ -65,7 +65,7 @@ def _module1_predict(image_tensor, classifier, seg_models, device, mask_size):
 
 
 def synthesize_trajectory(generator, classifier, seg_models, baseline_image, baseline_mask,
-                           start_stage, end_stage, c_dim, device):
+                           start_stage, end_stage, c_dim, device, fov_mask=None):
     """
     Generates a full stage-by-stage trajectory from start_stage to end_stage (see module
     docstring for the per-step loop).
@@ -85,6 +85,10 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
         end_stage: int, the final stage to synthesize up to (inclusive). Must be > start_stage.
         c_dim: number of stages (5 for ICDR 0-4), matching the Generator's own c_dim.
         device: torch device to run inference on.
+        fov_mask: optional [1, 1, H, W] {0,1} retina mask of the REAL baseline (round 6,
+            fov_mask.fov_mask). When given, every synthesized step is blacked out outside it, so
+            the retina keeps the baseline's circle through the whole cascade instead of drifting
+            or growing edge artifacts from step to step. None = the Generator's raw output.
 
     Returns:
         list of dicts, one per stage from start_stage (the real baseline) through end_stage,
@@ -108,6 +112,8 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
     mask_size = baseline_mask.shape[-1]
     baseline_image = baseline_image.to(device)
     baseline_mask = baseline_mask.to(device)
+    if fov_mask is not None:
+        fov_mask = fov_mask.to(device)
 
     trajectory = [
         {
@@ -126,6 +132,8 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
             c_target[0, stage] = 1.0
             x = torch.cat([current_image, current_mask], dim=1)
             synthesized = generator(x, c_target)
+            if fov_mask is not None:
+                synthesized = synthesized * fov_mask + (fov_mask - 1.0)  # black outside the baseline's retina
 
             predicted_grade, grade_probs, new_mask = _module1_predict(
                 synthesized, classifier, seg_models, device, mask_size

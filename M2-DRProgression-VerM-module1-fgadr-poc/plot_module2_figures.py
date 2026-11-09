@@ -116,9 +116,18 @@ def plot_loss_curves(poc_results_json: str, out_path: str):
     ax.plot(epochs, g_loss, label="G loss (adv + rec)")
     ax.plot(epochs, rec_loss, label="G reconstruction (L1) loss")
     val = {h["epoch"]: h["val_l1"] for h in results.get("val_history") or []}
+    kid_mode = results.get("selection_mode") == "kid"
     if val:
-        ax.plot(list(val), list(val.values()), marker="s", ms=3, label="held-out val L1 (best-epoch score)")
-    if results.get("best_epoch"):
+        ax.plot(list(val), list(val.values()), marker="s", ms=3,
+                label="held-out val L1" + ("" if kid_mode else " (best-epoch score)"))
+    kid = {h["epoch"]: h["val_kid"] for h in results.get("val_history") or [] if h.get("val_kid") is not None}
+    if kid:  # round 6: --selection-mode kid (epoch 0 = the starting Generator)
+        ax2 = ax.twinx()
+        ax2.plot(list(kid), list(kid.values()), color="tab:purple", marker="o", ms=3,
+                 label="held-out val KID (best-epoch score)")
+        ax2.set_ylabel("KID")
+        ax2.legend(loc="center right")
+    if results.get("best_epoch") is not None:
         ax.axvline(results["best_epoch"], color="grey", ls="--", label=f"best epoch ({results['best_epoch']})")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")

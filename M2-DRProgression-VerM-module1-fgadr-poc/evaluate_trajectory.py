@@ -74,6 +74,7 @@ from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa
 from fire_dataset import FIREDataset  # noqa: E402
 from longdr_dataset import LongDRScreeningDataset  # noqa: E402
 from image_quality_metrics import compute_fid_kid_stats  # noqa: E402
+from fov_mask import CopyBaselineGenerator, fov_mask  # noqa: E402
 
 SELF_CONSISTENCY_DATASETS = {"fire": FIREDataset, "longdr": LongDRScreeningDataset}
 SELF_CONSISTENCY_TAG = "self-consistency -- not validated against ground truth"
@@ -154,6 +155,7 @@ def evaluate_self_consistency(source_name, dataset_dir, G, classifier, seg_model
             trajectory = synthesize_trajectory(
                 G, classifier, seg_models, baseline, baseline_mask,
                 start_stage=baseline_stage, end_stage=target_stage, c_dim=config.c_dim, device=device,
+                fov_mask=fov_mask(baseline) if config.fov_mask else None,
             )
             synthesized = trajectory[-1]["image"]
 
@@ -234,13 +236,21 @@ def evaluate(config):
 
     print("\n[2/4] Loading Generator checkpoint and Module 1 classifier/segmentation models...")
     style_dim = config.style_dim or config.c_dim
-    G = Generator(
-        conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim,
-        **arch_kwargs(config.model_arch)[0]).to(device)
-    if not config.dry_run:
-        check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
-        load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
+    if config.copy_baseline:
+        # Round 6 control: every "synthesized" stage is the baseline photo unchanged. Same metrics,
+        # same Module 1 re-grading -- the floor a real Generator has to beat.
+        G = CopyBaselineGenerator().to(device)
+        print("  --copy-baseline: no Generator -- every stage is the baseline image unchanged (control)")
+    else:
+        G = Generator(
+            conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim,
+            **arch_kwargs(config.model_arch)[0]).to(device)
+        if not config.dry_run:
+            check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
+            load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
     G.eval()
+    if config.fov_mask and not config.copy_baseline:
+        print("  --fov-mask: every synthesized step is blacked out outside the baseline's retina circle")
     classifier, seg_models = load_module1_models(config, device)
 
     print(f"\n[3/4] Synthesizing trajectories for {len(manifest)} real pairs...")
@@ -279,6 +289,7 @@ def evaluate(config):
             end_stage=int(row["followup_icdr"]),
             c_dim=config.c_dim,
             device=device,
+            fov_mask=fov_mask(baseline_img) if config.fov_mask else None,
         )
         real_followup_stage = int(row["followup_icdr"])
         for step_idx, entry in enumerate(trajectory[1:], start=1):
@@ -311,7 +322,9 @@ def evaluate(config):
     results = {"quality": {}, "module1_consistency": {},
                "evaluated_on": ("patients the Generator never trained on" if held_out_info
                                 else "ALL Tianjin pairs, including the Generator's training patients (optimistic)"),
-               "held_out": held_out_info, "min_baseline_grade": config.min_baseline_grade}
+               "held_out": held_out_info, "min_baseline_grade": config.min_baseline_grade,
+               "generator": "copy-the-baseline control" if config.copy_baseline else config.generator_checkpoint,
+               "fov_mask": bool(config.fov_mask)}
     for step_count in sorted(per_step_psnr.keys()):
         n = len(per_step_psnr[step_count])
         entry = {
@@ -437,6 +450,10 @@ if __name__ == "__main__":
                               "Generator, for round-vs-round comparisons")
     parser.add_argument("--min-baseline-grade", type=int, default=0,
                          help="1 = only eyes starting at >= mild NPDR (the manuscript's scope)")
+    parser.add_argument("--copy-baseline", action="store_true",
+                         help="Round 6 control: no Generator, every stage = the baseline image unchanged")
+    parser.add_argument("--fov-mask", action="store_true",
+                         help="Round 6: black out each synthesized step outside the baseline's retina circle")
     parser.add_argument("--out", default="./trajectory_eval_results.json")
     add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
     add_arch_arg(parser)  # must match the Generator checkpoint's run
@@ -445,7 +462,7 @@ if __name__ == "__main__":
     apply_classifier_norm_args(args)
     apply_seg_inference_args(args)
 
-    if not args.dry_run and not args.generator_checkpoint:
+    if not args.dry_run and not args.copy_baseline and not args.generator_checkpoint:
         parser.error("--generator-checkpoint is required unless --dry-run is set")
     if not args.dry_run and not args.classifier_checkpoint:
         parser.error("--classifier-checkpoint is required unless --dry-run is set")

@@ -218,6 +218,27 @@ cell first, then caches + laterality with the crop fix) -> 09 (continues round 3
 first; its last evaluation cell compares with round 3) -> 07 -> 08 -> 10. Compare with round 3 on the unseen-patient evaluation. Next, one at a time:
 `lambda_rec` 10 -> 5, then 256 px.
 
+# Round 6 -- shape fixes + controls (branch `R6-ShapeFix-Controls`)
+Round 5's fine-tuning made its own pretrained Generator worse on the same unseen Tianjin patients (step 1:
+FID 64 -> 149, KID 0.027 -> 0.133, agreement 5.7 % -> 6.8 %), and its outputs turned square with edge bars
+that grew along the cascade. Cause: with the retina filling the frame (round-5 crop), an enlarging SIFT warp
+clips the follow-up's circle into a rounded square; the reconstruction L1 was unmasked and the critic saw
+those targets as real. Round 6 changes only Module 2's fine-tuning and evaluation. It READS round 5's Module 1
+caches, laterality file, SIFT cache, pretrained Generator and Module 3 as they are (`INPUT_ROUND_TAG = '_r5'`)
+and WRITES only to `_r6` folders (`ROUND_TAG`). Rounds 3-5 are never written to.
+
+| Change | Why | Earlier behaviour |
+|---|---|---|
+| `fov_mask.py` + `train_module2_poc.py --fov-mask`: G's output blacked out outside the baseline's retina circle; reconstruction L1 **and both critic inputs** restricted to baseline ∩ warped-follow-up retina | Nothing in training rewards clipped or black warp edges any more | unmasked |
+| `--fov-mask` in `evaluate_trajectory.py`, `visualize_trajectory.py`, `generate_progression.py` (`synthesize_trajectory(..., fov_mask=)`): every cascade step locked to the REAL baseline's circle | Edge artifacts can't build up step to step; the circle can't shrink | raw output |
+| nb 06: lr 1e-5 (G and D), 40 epochs / patience 10, pretrained critic (`--init-discriminator-mode full`; fall back to `reset-cls-head` if it won't load) | Don't wreck the pretrained Generator | 1e-4, 100 / 25, random critic |
+| `--selection-mode kid`: best epoch = lowest KID vs the held-out real follow-ups (fixed subsets/seed); the starting Generator is scored as **epoch 0**, so if nothing beats it `best-G.ckpt` is the pretrained Generator; the copy-the-baseline KID is printed once as a reference | KID is unbiased at ~70 images; the agreement tiebreak would never apply | val L1 - 0.1 x agreement |
+| `evaluate_trajectory.py --copy-baseline` and nb 06's five-row table on the same unseen patients (`--exclude-scope module2`): copy-the-baseline, round 3, round 5 pretrained, round 5 fine-tuned, round 6 -- all with `--fov-mask`, ending in a keep/drop-fine-tuning verdict. CSV in `<run>/five_way_comparison/` | A low FID/KID from copying only means "real photo" -- the floor every Generator must beat | round 3 vs round 5 cell |
+| nb 08/10: `GENERATOR = 'finetuned' / 'pretrained'` (separate output folders); nb 10 `MIN_START_STAGE = 0` | Figures with whichever Generator the verdict picks; the grade-0 demo photo isn't skipped | fine-tuned only; 1 |
+
+**Run order (round 6):** 06 -> 08 -> 10 (04_05, 09 and 07 not re-run). Not addressed yet: the ripple textures at
+cascade steps 3-4 (compare `GENERATOR = 'pretrained'`), LongDR's 41 % SIFT failure rate, `lambda_rec` 10 -> 5, 256 px.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

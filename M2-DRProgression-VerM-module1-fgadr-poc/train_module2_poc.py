@@ -94,6 +94,16 @@ change:
        mostly rewarded copying the baseline -- most held-out pairs do not progress.
      * split.train_tianjin_patients in poc_results.json lists every Tianjin patient with a training
        pair, for evaluate_trajectory.py --exclude-train-from (item R4-2.5).
+ 15. Round 6 (fov_mask.py has the details):
+     * --fov-mask: G's output is blacked out outside the baseline's retina circle; the
+       reconstruction L1 and BOTH critic inputs (real follow-up and fake) only see the region where
+       the baseline AND the SIFT-warped follow-up show retina. Round 5 trained against warped
+       targets whose circle was clipped into a rounded square, unmasked, and the critic saw those
+       targets as real -- G learned square, shifted edges.
+     * --selection-mode kid: best epoch = lowest KID between G's outputs and the held-out real
+       follow-ups (fixed subsets/seed). The starting Generator is scored as epoch 0 first; if no
+       epoch beats it, best-G.ckpt is the starting Generator unchanged. The KID of copying the
+       baseline is printed once as a reference (a low KID can just mean "looks like a real photo").
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -137,6 +147,7 @@ from combined_dataset import get_combined_loader, get_combined_train_val_loaders
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 from apply_to_progression_data import add_classifier_norm_args, apply_classifier_norm_args  # noqa: E402
 from gan_guidance import FrozenGrader, diff_augment  # noqa: E402
+from fov_mask import FovMaskedGenerator, apply_fov, fov_mask, masked_l1  # noqa: E402
 
 
 class Config:
@@ -173,6 +184,13 @@ class Config:
     lambda_grader = 1.0
     diffaugment = "color,translation,cutout"  # "" = off (point 14)
     lambda_drift = 0.001
+    # Round 6 (docstring point 15): retina masks. G's output is blacked out outside the baseline's
+    # retina circle; the reconstruction loss and BOTH critic inputs only see the region where the
+    # baseline AND the (SIFT-warped) follow-up show retina, so clipped/black warp edges are never
+    # rewarded. False = the earlier unmasked behaviour.
+    fov_mask = False
+    kid_subsets = 50  # KID subsets for --selection-mode kid (fixed seed, so epochs compare)
+    kid_seed = 1234
 
     # Model
     g_conv_dim = 64
@@ -252,21 +270,24 @@ def denorm(x):
 
 
 @torch.no_grad()
-def validation_l1(G, loader, device):
+def validation_l1(G, loader, device, fov=False):
     """Mean per-pixel L1 between G's synthesized follow-up and the real follow-up over every
     held-out pair -- the best-epoch selection score (lower is better), on the same [-1, 1]
     scale as the training reconstruction loss so the two curves compare directly. Also returns
-    PSNR from the same pass (images in [0, 1])."""
+    PSNR from the same pass (images in [0, 1]). fov (round 6): both measured only where the
+    baseline and the follow-up show retina, as the masked reconstruction loss is."""
     G.eval()
     l1_sum = mse_sum = 0.0
     n_px = 0
     for batch in loader:
-        x_real = torch.cat([batch["baseline"].to(device), batch["mask"].to(device)], dim=1)
+        baseline = batch["baseline"].to(device)
+        x_real = torch.cat([baseline, batch["mask"].to(device)], dim=1)
         fake = G(x_real, batch["target_grade"].to(device))
         real = batch["follow_up"].to(device)
-        l1_sum += float((fake - real).abs().sum())
-        mse_sum += float(((denorm(fake) - denorm(real)) ** 2).sum())
-        n_px += real.numel()
+        w = (fov_mask(baseline) * fov_mask(real)).expand_as(real) if fov else torch.ones_like(real)
+        l1_sum += float(((fake - real).abs() * w).sum())
+        mse_sum += float((((denorm(fake) - denorm(real)) ** 2) * w).sum())
+        n_px += float(w.sum())
     G.train()
     if not n_px:
         return None, None
@@ -326,7 +347,62 @@ def validation_controllability(G, loader, classifier, device, norm=None, c_dim=5
     return hits / n if n else None
 
 
-def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50, n_bootstrap=10):
+class ValKID:
+    """Round 6 best-epoch score (--selection-mode kid): KID between G's synthesized follow-ups and
+    the real follow-ups of the held-out pairs (lower is better). The real features are extracted
+    once; every epoch draws the same KID subsets (fixed seed, outside the training RNG), so
+    epochs compare on equal terms. With fov, fakes and reals are both masked to the region where
+    the baseline and the follow-up show retina -- the same view the critic gets.
+
+    KID, not FID: FID with ~70 images is badly biased; KID is unbiased at small n (its noise is
+    still real -- compare differences against the printed std)."""
+
+    def __init__(self, loader, device, fov=False, subsets=50, seed=1234):
+        from torchmetrics.image.kid import KernelInceptionDistance
+
+        self.loader, self.device, self.fov, self.seed = loader, device, fov, seed
+        n = sum(b["baseline"].size(0) for b in loader)
+        self.n = n
+        self.kid = KernelInceptionDistance(subset_size=max(2, min(50, n)), subsets=subsets,
+                                           reset_real_features=False, normalize=True).to(device)
+        with torch.no_grad():
+            for batch in loader:
+                real = batch["follow_up"].to(device)
+                if fov:
+                    real = apply_fov(real, fov_mask(batch["baseline"].to(device)) * fov_mask(real))
+                self.kid.update(denorm(real), real=True)
+
+    @torch.no_grad()
+    def score(self, make_fake):
+        """make_fake(batch) -> [B,3,H,W] in [-1, 1]. Returns (kid_mean, kid_std)."""
+        self.kid.reset()  # keeps the real features (reset_real_features=False)
+        for batch in self.loader:
+            fake = make_fake(batch)
+            if self.fov:
+                region = fov_mask(batch["baseline"].to(self.device)) * fov_mask(batch["follow_up"].to(self.device))
+                fake = apply_fov(fake, region)
+            self.kid.update(denorm(fake.clone()), real=False)
+        devices = [self.device] if self.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(self.seed)
+            mean, std = self.kid.compute()
+        return float(mean), float(std)
+
+    def score_generator(self, G):
+        G.eval()
+
+        def make_fake(batch):
+            x = torch.cat([batch["baseline"].to(self.device), batch["mask"].to(self.device)], dim=1)
+            return G(x, batch["target_grade"].to(self.device))
+        out = self.score(make_fake)
+        G.train()
+        return out
+
+    def score_copy_baseline(self):
+        return self.score(lambda batch: batch["baseline"].to(self.device))
+
+
+def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=50, n_bootstrap=10, fov=False):
     """
     FID/PSNR/SSIM between synthesized follow-ups and real follow-ups, over a handful of
     batches -- a small/short-run number, explicitly not a claim of matching DRForecastGAN's
@@ -365,6 +441,9 @@ def compute_poc_metrics(G, loader, device, n_batches, image_size, min_n_for_fid=
 
             x_real = torch.cat([baseline, mask], dim=1)
             fake = G(x_real, target_grade)
+            if fov:  # round 6: compare only where both the baseline and the follow-up show retina
+                region = fov_mask(baseline) * fov_mask(follow_up)
+                fake, follow_up = apply_fov(fake, region), apply_fov(follow_up, region)
 
             real_01 = denorm(follow_up)
             fake_01 = denorm(fake)
@@ -472,6 +551,12 @@ def train(config: Config):
     g_optimizer = optim.Adam(G.parameters(), lr=config.g_lr, betas=(config.beta1, config.beta2))
     d_optimizer = optim.Adam(D.parameters(), lr=config.d_lr, betas=(config.beta1, config.beta2))
     l1_loss = nn.L1Loss()
+    # Round 6: Gv = G with its output blacked out outside the input's retina circle; used for every
+    # output (training, validation, samples, metrics). Optimiser/state_dicts stay on the inner G.
+    Gv = FovMaskedGenerator(G) if config.fov_mask else G
+    if config.fov_mask:
+        print("  Retina masks ON: G output blacked out outside the baseline's circle; reconstruction loss and "
+              "both critic inputs restricted to baseline ∩ follow-up retina")
 
     print(f"\n[3/4] Training for {config.num_epochs} epochs (POC scale -- see module docstring)...")
     start_time = time.time()
@@ -498,8 +583,12 @@ def train(config: Config):
             selection_norm = CLASSIFIER_NORMS[config.selection_classifier_norm]
         what = ("stage control (one stage above baseline)" if config.selection_mode == "controllability"
                 else "agreement with the target grade")
-        print(f"  Best-epoch score: val L1 - {config.selection_alpha} x {what}, graded by "
-              f"{config.selection_classifier_path}")
+        if config.selection_mode == "kid":
+            print(f"  Module 1 agreement logged each epoch (graded by {config.selection_classifier_path}); "
+                  "not part of the --selection-mode kid score")
+        else:
+            print(f"  Best-epoch score: val L1 - {config.selection_alpha} x {what}, graded by "
+                  f"{config.selection_classifier_path}")
         if config.grader_loss_path and config.lambda_grader > 0 and os.path.abspath(config.grader_loss_path) == os.path.abspath(
                 config.selection_classifier_path):
             print("  ⚠ the selection grader is the grader in G's loss -- the selection score is then the number "
@@ -515,6 +604,27 @@ def train(config: Config):
 
     def aug(x):
         return diff_augment(x, config.diffaugment) if config.diffaugment else x
+
+    val_kid = None
+    if config.selection_mode == "kid" and val_loader is not None:
+        val_kid = ValKID(val_loader, device, fov=config.fov_mask, subsets=config.kid_subsets, seed=config.kid_seed)
+        copy_kid = val_kid.score_copy_baseline()
+        print(f"  Best-epoch score: KID vs the {val_kid.n} held-out real follow-ups (lower is better, "
+              f"{config.kid_subsets} fixed subsets)")
+        print(f"  Reference -- copying the baseline unchanged scores KID {copy_kid[0]:.4f} +/- {copy_kid[1]:.4f}; "
+              "an epoch near this may just be copying (check the copy-the-baseline row in notebook 06)")
+        if start_epoch == 0 and not stopped_at and best["G"] is None:
+            # Epoch 0 = the starting (pretrained) Generator. If no epoch beats it, best-G.ckpt IS it:
+            # the honest answer when fine-tuning doesn't help.
+            k0 = val_kid.score_generator(Gv)
+            l1_0, psnr_0 = validation_l1(Gv, val_loader, device, fov=config.fov_mask)
+            best = {"epoch": 0, "val_l1": l1_0, "score": k0[0], "kid_std": k0[1], "module1_agreement": None,
+                    "stage_control": None, "G": {k: v.detach().cpu().clone() for k, v in G.state_dict().items()}}
+            torch.save(best["G"], os.path.join(config.save_dir, "best-G.ckpt"))
+            val_history.append({"epoch": 0, "val_l1": l1_0, "val_psnr": psnr_0, "val_kid": k0[0],
+                                "val_kid_std": k0[1], "selection_score": k0[0]})
+            print(f"  epoch 0 (starting Generator): KID {k0[0]:.4f} +/- {k0[1]:.4f} | val L1 {l1_0:.4f} | "
+                  f"val PSNR {psnr_0:.2f} dB -> best so far")
     g_steps = loss_history[-1].get("g_steps", 0) if loss_history else 0
     batch_log = extra.get("batch_log", [])  # docstring point 12
     batch_log_path = os.path.join(config.save_dir, "batch_log.csv")
@@ -534,12 +644,18 @@ def train(config: Config):
             cls_real_ok = batch["grade_is_real"].to(device).bool() & (config.condition_on == "followup")
 
             x_real = torch.cat([baseline, mask], dim=1)
+            # Round 6: the region where BOTH the baseline and the warped follow-up show retina. The
+            # critic sees real and fake only inside it, so a clipped or black warp edge is never "real".
+            region = fov_mask(baseline) * fov_mask(follow_up) if config.fov_mask else None
+            real_d = apply_fov(follow_up, region) if region is not None else follow_up
 
-            real_aug = aug(follow_up)
+            real_aug = aug(real_d)
             out_real, cls_real = D(real_aug)
             d_loss_real = -torch.mean(out_real)
             with torch.no_grad():
-                fake = G(x_real, target_grade)
+                fake = Gv(x_real, target_grade)
+            if region is not None:
+                fake = apply_fov(fake, region)
             fake_aug = aug(fake)
             out_fake, _ = D(fake_aug)
             d_loss_fake = torch.mean(out_fake)
@@ -560,10 +676,11 @@ def train(config: Config):
                    None if d_cls is None else d_cls.item(), d_gnorm, gp_norm, None, None, None, None, None]
 
             if i % config.n_critic == 0:
-                fake = G(x_real, target_grade)
-                out_fake, cls_fake = D(aug(fake))
+                fake = Gv(x_real, target_grade)
+                fake_d = apply_fov(fake, region) if region is not None else fake
+                out_fake, cls_fake = D(aug(fake_d))
                 g_loss_adv = -torch.mean(out_fake)
-                g_loss_rec = l1_loss(fake, follow_up)
+                g_loss_rec = masked_l1(fake, follow_up, region) if region is not None else l1_loss(fake, follow_up)
                 g_loss = config.lambda_adv * g_loss_adv + config.lambda_rec * g_loss_rec
                 g_loss_cls = None
                 if config.lambda_cls > 0:
@@ -608,29 +725,35 @@ def train(config: Config):
             + f"G steps: {g_steps} | Elapsed: {elapsed / 60:.1f}min"
         )
         if val_loader is not None:
-            val_l1, val_psnr = validation_l1(G, val_loader, device)
-            agree = agree_real = control = None
+            val_l1, val_psnr = validation_l1(Gv, val_loader, device, fov=config.fov_mask)
+            agree = agree_real = control = kid = None
             score = val_l1
             if selection_classifier is not None:
-                agree, agree_real = validation_agreement(G, val_loader, selection_classifier, device, selection_norm)
-                control = validation_controllability(G, val_loader, selection_classifier, device, selection_norm,
+                agree, agree_real = validation_agreement(Gv, val_loader, selection_classifier, device, selection_norm)
+                control = validation_controllability(Gv, val_loader, selection_classifier, device, selection_norm,
                                                      config.c_dim)
                 signal = control if config.selection_mode == "controllability" else agree
                 score = val_l1 - config.selection_alpha * (signal or 0.0)
+            if val_kid is not None:
+                kid = val_kid.score_generator(Gv)
+                score = kid[0]
             val_history.append({"epoch": epoch + 1, "val_l1": val_l1, "val_psnr": val_psnr,
                                 "module1_agreement": agree, "module1_agreement_clinical": agree_real,
-                                "stage_control": control, "selection_score": score})
+                                "stage_control": control, "val_kid": kid[0] if kid else None,
+                                "val_kid_std": kid[1] if kid else None, "selection_score": score})
             is_best = score < best["score"]
             if is_best:
                 best = {"epoch": epoch + 1, "val_l1": val_l1, "score": score, "module1_agreement": agree,
-                        "stage_control": control,
+                        "stage_control": control, "kid_std": kid[1] if kid else None,
                         "G": {k: v.detach().cpu().clone() for k, v in G.state_dict().items()}}
                 torch.save(best["G"], os.path.join(config.save_dir, "best-G.ckpt"))
             print(f"  val L1 {val_l1:.4f} | val PSNR {val_psnr:.2f} dB"
                   + (f" | agreement {agree:.1%} | stage control {control if control is None else f'{control:.1%}'}"
-                     f" -> score {score:.4f}" if agree is not None else "")
+                     if agree is not None else "")
+                  + (f" | KID {kid[0]:.4f} +/- {kid[1]:.4f}" if kid else
+                     (f" -> score {score:.4f}" if agree is not None else ""))
                   + (" | ★ new best -> best-G.ckpt" if is_best else f" | best so far: epoch {best['epoch']}"))
-            if (config.early_stop_patience and best["epoch"]
+            if (config.early_stop_patience and best["epoch"] is not None
                     and epoch + 1 - best["epoch"] >= config.early_stop_patience):
                 stopped_at = epoch + 1
                 print(f"  Early stop: no better selection score for {config.early_stop_patience} epochs "
@@ -639,7 +762,7 @@ def train(config: Config):
         if (epoch + 1) % config.save_step == 0 or epoch == config.num_epochs - 1:
             G.eval()
             with torch.no_grad():
-                sample_fake = G(x_real, target_grade)
+                sample_fake = Gv(x_real, target_grade)
                 samples = torch.cat(
                     [denorm(baseline[:2]), denorm(sample_fake[:2]), denorm(follow_up[:2])], dim=3
                 )
@@ -667,6 +790,9 @@ def train(config: Config):
         G.load_state_dict(best["G"])
         print(f"\n✓ Best epoch: {best['epoch']} (val L1 {best['val_l1']:.4f}, score {best['score']:.4f}) -> "
               f"{best_g_path}; final-G.ckpt = last epoch ({stopped_at or config.num_epochs})")
+        if best["epoch"] == 0:
+            print("  ⚠ No fine-tuning epoch beat the starting Generator -- best-G.ckpt is the pretrained "
+                  "Generator unchanged (fine-tuning didn't help on this score)")
     metrics_loader = val_loader if val_loader is not None else loader
 
     print(f"\n[4/4] Computing POC metrics (FID/PSNR/SSIM on up to {config.eval_batches} batches of the "
@@ -674,8 +800,8 @@ def train(config: Config):
              "training loader -- not held out, see compute_poc_metrics' docstring") + ")...")
     try:
         metrics = compute_poc_metrics(
-            G, metrics_loader, device, config.eval_batches, config.image_size,
-            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap,
+            Gv, metrics_loader, device, config.eval_batches, config.image_size,
+            min_n_for_fid=config.min_n_for_fid, n_bootstrap=config.fid_n_bootstrap, fov=config.fov_mask,
         )
         if metrics["fid"] is not None:
             fid_range = metrics["fid_bootstrap_range"]
@@ -721,8 +847,11 @@ def train(config: Config):
         "progress_fraction": config.progress_fraction,
         "split": split_info,
         "best_epoch": best["epoch"],
-        "best_val_l1": best["val_l1"] if best["epoch"] else None,
-        "best_selection_score": best["score"] if best["epoch"] else None,
+        "best_val_l1": best["val_l1"] if best["epoch"] is not None else None,
+        "best_selection_score": best["score"] if best["epoch"] is not None else None,
+        "best_kid_std": best.get("kid_std"),
+        "fov_mask": config.fov_mask,
+        "copy_baseline_val_kid": list(copy_kid) if val_kid is not None else None,
         "best_module1_agreement": best.get("module1_agreement"),
         "best_stage_control": best.get("stage_control"),
         "selection_classifier": config.selection_classifier_path,
@@ -793,9 +922,15 @@ if __name__ == "__main__":
     parser.add_argument("--selection-alpha", type=float, default=Config.selection_alpha)
     parser.add_argument("--selection-classifier-norm", choices=["fgadr", "eyepacs"], default=None,
                          help="Normalisation of the selection grader (default: --classifier-norm)")
-    parser.add_argument("--selection-mode", choices=["controllability", "target"], default=Config.selection_mode,
+    parser.add_argument("--selection-mode", choices=["controllability", "target", "kid"], default=Config.selection_mode,
                          help="controllability: stage control one stage above baseline (default); target: "
-                              "agreement with the pair's own target grade (round 3)")
+                              "agreement with the pair's own target grade (round 3); kid (round 6): KID vs the "
+                              "held-out real follow-ups, with the starting Generator scored as epoch 0")
+    parser.add_argument("--fov-mask", action="store_true",
+                         help="Round 6: black out G's output outside the baseline's retina circle and restrict the "
+                              "reconstruction loss and both critic inputs to baseline ∩ follow-up retina")
+    parser.add_argument("--kid-subsets", type=int, default=Config.kid_subsets,
+                         help="KID subsets per epoch for --selection-mode kid")
     parser.add_argument("--grader-loss-checkpoint", default=None,
                          help="Frozen Module 1 grader in G's loss (docstring point 14); omit = off")
     parser.add_argument("--grader-loss-norm", choices=["fgadr", "eyepacs"], default=Config.grader_loss_norm)
@@ -883,6 +1018,8 @@ if __name__ == "__main__":
     cfg.lambda_grader = args.lambda_grader
     cfg.diffaugment = args.diffaugment
     cfg.lambda_drift = args.lambda_drift
+    cfg.fov_mask = args.fov_mask
+    cfg.kid_subsets = args.kid_subsets
     apply_classifier_norm_args(args)
     cfg.lambda_cls = args.lambda_cls
     cfg.g_lr, cfg.d_lr, cfg.n_critic = args.g_lr, args.d_lr, args.n_critic

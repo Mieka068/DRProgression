@@ -70,6 +70,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tianjin_dataset import _module1_image_id_candidates  # noqa: E402
 from fundus_preprocess import load_module2_image as _fp_load_module2_image  # noqa: E402
 from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa: E402
+from fov_mask import fov_mask  # noqa: E402
 
 STRATUM_TO_IDX = {"low": 0, "medium": 1, "high": 2}
 
@@ -272,6 +273,7 @@ def run(config):
             end_stage=end_stage,
             c_dim=config.c_dim,
             device=device,
+            fov_mask=fov_mask(baseline_img) if config.fov_mask else None,
         )
 
         module3_estimates = {}
@@ -320,6 +322,8 @@ if __name__ == "__main__":
     parser.add_argument("--end-stage", type=int, default=None,
                         help="Cascade every patient up to this stage (e.g. 4 = PDR). Omit to stop at "
                              "each patient's real follow-up grade (the original behaviour).")
+    parser.add_argument("--fov-mask", action="store_true",
+                        help="Round 6: black out each synthesized step outside the baseline's retina circle")
     parser.add_argument("--out-dir", default="./trajectory_figures/")
     add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
     add_arch_arg(parser)  # must match the Generator checkpoint's run
