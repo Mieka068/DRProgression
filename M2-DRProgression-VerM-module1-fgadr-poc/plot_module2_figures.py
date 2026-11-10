@@ -111,12 +111,17 @@ def plot_loss_curves(poc_results_json: str, out_path: str):
     g_loss = [h["g_loss"] for h in history]
     rec_loss = [h["rec_loss"] for h in history]
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    vh = results.get("val_history") or []
+    control_mode = results.get("selection_mode") == "control-kid"
+    if control_mode:  # round 7: a second panel with the per-epoch stage control
+        fig, (ax, axc) = plt.subplots(2, 1, figsize=(7, 7), sharex=True, gridspec_kw={"height_ratios": [3, 2]})
+    else:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(epochs, d_loss, label="D loss")
     ax.plot(epochs, g_loss, label="G loss (adv + rec)")
     ax.plot(epochs, rec_loss, label="G reconstruction (L1) loss")
     val = {h["epoch"]: h["val_l1"] for h in results.get("val_history") or []}
-    kid_mode = results.get("selection_mode") == "kid"
+    kid_mode = results.get("selection_mode") in ("kid", "control-kid")
     if val:
         ax.plot(list(val), list(val.values()), marker="s", ms=3,
                 label="held-out val L1" + ("" if kid_mode else " (best-epoch score)"))
@@ -124,12 +129,30 @@ def plot_loss_curves(poc_results_json: str, out_path: str):
     if kid:  # round 6: --selection-mode kid (epoch 0 = the starting Generator)
         ax2 = ax.twinx()
         ax2.plot(list(kid), list(kid.values()), color="tab:purple", marker="o", ms=3,
-                 label="held-out val KID (best-epoch score)")
+                 label="held-out val KID" + (" (best-epoch score)" if not control_mode else ""))
+        if control_mode and results.get("selection_kid_ceiling"):
+            ax2.axhline(results["selection_kid_ceiling"], color="tab:purple", ls=":", label="KID ceiling")
         ax2.set_ylabel("KID")
         ax2.legend(loc="center right")
     if results.get("best_epoch") is not None:
         ax.axvline(results["best_epoch"], color="grey", ls="--", label=f"best epoch ({results['best_epoch']})")
-    ax.set_xlabel("Epoch")
+    if control_mode:
+        for key, label in (("stage_control", "stage control (selection grader)"),
+                           ("check_stage_control", "stage control (check grader, not used to select)")):
+            pts = {h["epoch"]: h[key] for h in vh if h.get(key) is not None}
+            if pts:
+                axc.plot(list(pts), [100 * v for v in pts.values()], marker="o", ms=3, label=label)
+        if results.get("selection_min_control") is not None:
+            axc.axhline(100 * results["selection_min_control"], color="grey", ls=":", label="eligibility threshold")
+        if results.get("best_epoch") is not None:
+            axc.axvline(results["best_epoch"], color="grey", ls="--")
+        axc.set_ylim(-3, 103)
+        axc.set_ylabel("stage control (%)")
+        axc.set_xlabel("Epoch")
+        axc.legend(fontsize=8)
+        axc.grid(alpha=0.3)
+    else:
+        ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title(f"Module 2 training loss (n_epochs={results.get('num_epochs')}, "
                  f"POC-scale -- see train_module2_poc.py docstring)")

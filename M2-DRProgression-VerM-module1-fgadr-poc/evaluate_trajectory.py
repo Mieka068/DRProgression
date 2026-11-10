@@ -26,6 +26,21 @@ available at every step, since it only needs the synthesized image itself). This
 therefore reports one PSNR/SSIM comparison per pair, at that pair's own step_count bucket,
 plus a consistency flag at every intermediate step along the way.
 
+Round 7 additions (same JSON, new keys; nothing earlier changes):
+  * "final_step": per step_count bucket (and "all" pooled), graded on each pair's LAST image (the
+    one compared with the real follow-up): exact agreement with the real follow-up grade and
+    "grade went up" = the grader rates it higher than it rates the real baseline (relative to the
+    grader's own baseline reading, so a grader that over- or under-grades Tianjin overall doesn't
+    count). Wilson 95% intervals -- n is small. With --second-classifier-checkpoint the same
+    numbers from a second grader (round 7 trains G against the first one, so a gain only counts if
+    the second grader sees it too). Same pairs for every row, unlike module1_consistency (whose
+    step k pools every pair that passes through stage k).
+  * --real-followup: no Generator -- the "last image" is the REAL follow-up photo. Its agreement is
+    the ceiling for the agreement columns: how well each grader reads real Tianjin follow-ups.
+    No PSNR/SSIM/FID (it would be the image against itself).
+  * --fov-erode/--fov-feather/--color-match/--cascade-mode (fov_mask.add_cascade_args): the round 7
+    cascade clean-up and the "direct from the baseline" control.
+
 Usage (after a trained Module 2 checkpoint, a Tianjin module1 cache, and Module 1
 classifier/segmentation checkpoints all exist):
     python evaluate_trajectory.py \
@@ -51,7 +66,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
 from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
-from trajectory_inference import _module1_predict, synthesize_trajectory  # noqa: E402
+from trajectory_inference import _module1_predict, _tensor_to_pil, synthesize_trajectory  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module3"))
 from dataset import TianjinSurvivalDataset  # noqa: E402
@@ -59,12 +74,14 @@ from dataset import TianjinSurvivalDataset  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module1"))
 from apply_to_progression_data import (  # noqa: E402
     ALL_LESIONS,
+    CLASSIFIER_NORMS,
     add_classifier_norm_args,
     add_seg_inference_args,
     apply_classifier_norm_args,
     apply_seg_inference_args,
     load_classifier,
     load_segmentation_model,
+    predict_grade,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -74,7 +91,7 @@ from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa
 from fire_dataset import FIREDataset  # noqa: E402
 from longdr_dataset import LongDRScreeningDataset  # noqa: E402
 from image_quality_metrics import compute_fid_kid_stats  # noqa: E402
-from fov_mask import CopyBaselineGenerator, fov_mask  # noqa: E402
+from fov_mask import CopyBaselineGenerator, add_cascade_args, cascade_kwargs, check_cascade_args  # noqa: E402
 
 SELF_CONSISTENCY_DATASETS = {"fire": FIREDataset, "longdr": LongDRScreeningDataset}
 SELF_CONSISTENCY_TAG = "self-consistency -- not validated against ground truth"
@@ -82,6 +99,35 @@ SELF_CONSISTENCY_TAG = "self-consistency -- not validated against ground truth"
 
 def denorm(x):
     return ((x + 1) / 2).clamp_(0, 1)
+
+
+def wilson_interval(k, n, z=1.96):
+    """95% Wilson score interval for k successes out of n (sensible at small n and at 0 % / 100 %)."""
+    if not n:
+        return None
+    p = k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    lo = 0.0 if k == 0 else max(0.0, centre - half)  # exact at the ends (float error gives ~1e-17 otherwise)
+    hi = 1.0 if k == n else min(1.0, centre + half)
+    return [float(lo), float(hi)]
+
+
+def summarise_final_step(records, graders):
+    """records: per-pair dicts {grader: (baseline_grade, final_grade, followup_grade)} -> rates + CIs."""
+    out = {"n": len(records)}
+    for g in graders:
+        rows = [r[g] for r in records if g in r]
+        n = len(rows)
+        agree = sum(int(f == t) for _, f, t in rows)
+        up = sum(int(f > b) for b, f, _ in rows)
+        out[g] = {
+            "n": n,
+            "agree_rate": agree / n if n else None, "agree_ci95": wilson_interval(agree, n),
+            "went_up_rate": up / n if n else None, "went_up_ci95": wilson_interval(up, n),
+            "mean_grade_shift": float(np.mean([f - b for b, f, _ in rows])) if n else None,
+        }
+    return out
 
 
 def load_module2_image(path, image_size):
@@ -155,7 +201,7 @@ def evaluate_self_consistency(source_name, dataset_dir, G, classifier, seg_model
             trajectory = synthesize_trajectory(
                 G, classifier, seg_models, baseline, baseline_mask,
                 start_stage=baseline_stage, end_stage=target_stage, c_dim=config.c_dim, device=device,
-                fov_mask=fov_mask(baseline) if config.fov_mask else None,
+                **cascade_kwargs(baseline, config),
             )
             synthesized = trajectory[-1]["image"]
 
@@ -236,7 +282,11 @@ def evaluate(config):
 
     print("\n[2/4] Loading Generator checkpoint and Module 1 classifier/segmentation models...")
     style_dim = config.style_dim or config.c_dim
-    if config.copy_baseline:
+    if config.real_followup:
+        # Round 7 ceiling: no Generator -- each pair's last image is its REAL follow-up photo.
+        G = None
+        print("  --real-followup: no Generator -- grading the real follow-up photos (the agreement ceiling)")
+    elif config.copy_baseline:
         # Round 6 control: every "synthesized" stage is the baseline photo unchanged. Same metrics,
         # same Module 1 re-grading -- the floor a real Generator has to beat.
         G = CopyBaselineGenerator().to(device)
@@ -248,10 +298,29 @@ def evaluate(config):
         if not config.dry_run:
             check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
             load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
-    G.eval()
-    if config.fov_mask and not config.copy_baseline:
-        print("  --fov-mask: every synthesized step is blacked out outside the baseline's retina circle")
+    if G is not None:
+        G.eval()
+    if config.fov_mask and G is not None:
+        print("  --fov-mask: every synthesized step is blacked out outside the baseline's retina circle"
+              + (f" (pulled in {config.fov_erode} px, edge faded over {config.fov_feather} px)"
+                 if config.fov_erode or config.fov_feather else ""))
+    if config.color_match and G is not None:
+        print("  --color-match: every step's colours matched to the real baseline's")
+    if config.cascade_mode == "direct" and G is not None:
+        print("  --cascade-mode direct: every stage generated from the REAL baseline (control), not the previous step")
     classifier, seg_models = load_module1_models(config, device)
+    # Graders for the round 7 final-step numbers: "primary" = --classifier-checkpoint (also the cascade's
+    # re-grading grader), "second" = --second-classifier-checkpoint (optional).
+    graders = {"primary": (classifier, None)}
+    if config.second_classifier_checkpoint:
+        graders["second"] = (load_classifier(config.second_classifier_checkpoint, device=device, dry_run=config.dry_run),
+                             CLASSIFIER_NORMS[config.second_classifier_norm])
+        print(f"  second grader: {config.second_classifier_checkpoint} ({config.second_classifier_norm})")
+
+    def grade(name, img):
+        model, norm = graders[name]
+        mean, std = norm if norm else (None, None)
+        return int(predict_grade(model, _tensor_to_pil(img), mean=mean, std=std, device=device))
 
     print(f"\n[3/4] Synthesizing trajectories for {len(manifest)} real pairs...")
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -265,6 +334,7 @@ def evaluate(config):
     # (not just its argmax), label = whether this pair's real follow-up actually reached (>=)
     # that stage. roc_auc_score needs both classes present, so these are scored per-step below.
     consistency_scores_by_step = defaultdict(list)  # step index -> [(score, label)]
+    final_step_records = defaultdict(list)  # step_count -> [{grader: (baseline, final, follow-up grade)}]
     n_skipped_no_progression = 0
 
     for _, row in manifest.iterrows():
@@ -278,6 +348,12 @@ def evaluate(config):
         baseline_img = load_module2_image(baseline_path, config.image_size).to(device)
         real_followup_img = load_module2_image(followup_path, config.image_size).to(device)
         mask = load_mask(cache, row["baseline_path"], config.image_size, config.tianjin_dir)
+        real_followup_stage = int(row["followup_icdr"])
+
+        if G is None:  # --real-followup: grade the real photos only
+            final_step_records[step_count].append(
+                {g: (grade(g, baseline_img), grade(g, real_followup_img), real_followup_stage) for g in graders})
+            continue
 
         trajectory = synthesize_trajectory(
             G,
@@ -289,9 +365,8 @@ def evaluate(config):
             end_stage=int(row["followup_icdr"]),
             c_dim=config.c_dim,
             device=device,
-            fov_mask=fov_mask(baseline_img) if config.fov_mask else None,
+            **cascade_kwargs(baseline_img, config),
         )
-        real_followup_stage = int(row["followup_icdr"])
         for step_idx, entry in enumerate(trajectory[1:], start=1):
             if entry["consistency"] is not None:
                 consistency_by_step[step_idx].append(bool(entry["consistency"]))
@@ -302,6 +377,8 @@ def evaluate(config):
 
         final_stage, synthesized = trajectory[-1]["stage"], trajectory[-1]["image"]
         assert final_stage == int(row["followup_icdr"])
+        final_step_records[step_count].append(
+            {g: (grade(g, baseline_img), grade(g, synthesized), real_followup_stage) for g in graders})
 
         real_01 = denorm(real_followup_img)
         fake_01 = denorm(synthesized)
@@ -323,8 +400,13 @@ def evaluate(config):
                "evaluated_on": ("patients the Generator never trained on" if held_out_info
                                 else "ALL Tianjin pairs, including the Generator's training patients (optimistic)"),
                "held_out": held_out_info, "min_baseline_grade": config.min_baseline_grade,
-               "generator": "copy-the-baseline control" if config.copy_baseline else config.generator_checkpoint,
-               "fov_mask": bool(config.fov_mask)}
+               "generator": ("real follow-up photos (ceiling)" if config.real_followup else
+                             "copy-the-baseline control" if config.copy_baseline else config.generator_checkpoint),
+               "fov_mask": bool(config.fov_mask), "fov_erode": config.fov_erode, "fov_feather": config.fov_feather,
+               "color_match": bool(config.color_match), "cascade_mode": config.cascade_mode,
+               "graders": {"primary": config.classifier_checkpoint, "second": config.second_classifier_checkpoint,
+                           "second_norm": config.second_classifier_norm if config.second_classifier_checkpoint else None},
+               "final_step": {}}
     for step_count in sorted(per_step_psnr.keys()):
         n = len(per_step_psnr[step_count])
         entry = {
@@ -354,6 +436,14 @@ def evaluate(config):
             f"  step_count={step_count}: n={n}, PSNR={entry['mean_psnr']:.3f}, "
             f"SSIM={entry['mean_ssim']:.3f}, FID={entry['fid']}{fid_range_str}, KID={entry['kid_mean']}"
         )
+
+    # Round 7: final-step agreement / grade-went-up per step_count bucket and pooled, per grader.
+    all_records = [r for step in sorted(final_step_records) for r in final_step_records[step]]
+    for key, recs in [(f"step_{k}", final_step_records[k]) for k in sorted(final_step_records)] + [("all", all_records)]:
+        entry = results["final_step"][key] = summarise_final_step(recs, list(graders))
+        print(f"  final step [{key}] n={entry['n']}: " + " | ".join(
+            f"{g}: agrees with follow-up grade {entry[g]['agree_rate']:.1%}, grade went up {entry[g]['went_up_rate']:.1%}"
+            for g in graders if entry[g]["n"]))
 
     from sklearn.metrics import roc_auc_score
 
@@ -385,7 +475,9 @@ def evaluate(config):
               f"{rate:.1%} of the time (n={len(flags)}); AUC={auc_str} "
               "(DRForecastGAN reports 0.87 internal / 0.85 external for this comparison)")
 
-    if config.self_consistency_dirs:
+    if config.self_consistency_dirs and G is None:
+        print("\n[extra] Self-consistency eval skipped -- --real-followup has no Generator to evaluate")
+    elif config.self_consistency_dirs:
         print(f"\n[extra] Self-consistency eval ({SELF_CONSISTENCY_TAG}) for "
               f"{list(config.self_consistency_dirs.keys())}...")
         results["self_consistency"] = {"note": SELF_CONSISTENCY_TAG}
@@ -454,15 +546,25 @@ if __name__ == "__main__":
                          help="Round 6 control: no Generator, every stage = the baseline image unchanged")
     parser.add_argument("--fov-mask", action="store_true",
                          help="Round 6: black out each synthesized step outside the baseline's retina circle")
+    add_cascade_args(parser)  # round 7: --fov-erode/--fov-feather/--color-match/--cascade-mode
+    parser.add_argument("--real-followup", action="store_true",
+                         help="Round 7 ceiling: no Generator, grade each pair's REAL follow-up photo")
+    parser.add_argument("--second-classifier-checkpoint", default=None,
+                         help="Round 7: a second grader for the final-step agreement / grade-went-up numbers")
+    parser.add_argument("--second-classifier-norm", choices=list(CLASSIFIER_NORMS), default="fgadr",
+                         help="Normalisation of --second-classifier-checkpoint")
     parser.add_argument("--out", default="./trajectory_eval_results.json")
     add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
     add_arch_arg(parser)  # must match the Generator checkpoint's run
     add_seg_inference_args(parser)
     args = parser.parse_args()
+    check_cascade_args(parser, args)
+    if args.real_followup and args.copy_baseline:
+        parser.error("--real-followup and --copy-baseline are separate rows; pass one")
     apply_classifier_norm_args(args)
     apply_seg_inference_args(args)
 
-    if not args.dry_run and not args.copy_baseline and not args.generator_checkpoint:
+    if not args.dry_run and not args.copy_baseline and not args.real_followup and not args.generator_checkpoint:
         parser.error("--generator-checkpoint is required unless --dry-run is set")
     if not args.dry_run and not args.classifier_checkpoint:
         parser.error("--classifier-checkpoint is required unless --dry-run is set")

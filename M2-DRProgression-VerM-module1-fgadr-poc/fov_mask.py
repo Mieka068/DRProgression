@@ -13,6 +13,14 @@ The fixes built on this module:
   * FovMaskedGenerator(G)    -- G's output blacked out outside its INPUT's retina circle.
   * CopyBaselineGenerator()  -- the "copy the baseline" control: returns its input unchanged.
 
+Round 7 (cascade clean-up, inference only -- training is unchanged):
+  * shrink_soften(mask, erode_px, feather_px) -- pulls the baseline's retina mask in by a few
+    pixels and fades its edge, so the thin bright/coloured bars G draws along the circle's left
+    and right edges (round 6, nb 08/10) fall outside it.
+  * match_color(img, ref, region)             -- per-channel mean/std of img matched to ref inside
+    the retina, so cascade steps don't drift grey/desaturated step after step.
+  * finish_step(img, ref, fov, color)         -- what synthesize_trajectory does to every step.
+
 Images are in the Generator's [-1, 1] range throughout.
 """
 import torch
@@ -67,6 +75,50 @@ def masked_l1(a, b, region):
     return ((a - b).abs() * region).sum() / denom.clamp_min(1.0)
 
 
+def shrink_soften(mask, erode_px=0, feather_px=0):
+    """Round 7: mask [B,1,H,W] {0,1} -> pulled in by erode_px pixels, then a soft edge feather_px
+    wide that fades from 1 (inside) to 0 at the eroded edge -- it never reaches outside the eroded
+    circle. 0/0 = the mask unchanged (round 6). Pixels are at the Module 2 image size (128 px)."""
+    m = mask.float()
+    if erode_px > 0:
+        m = -F.max_pool2d(-m, 2 * erode_px + 1, stride=1, padding=erode_px)
+    if feather_px > 0:
+        inner = -F.max_pool2d(-m, 2 * feather_px + 1, stride=1, padding=feather_px)
+        m = F.avg_pool2d(inner, 2 * feather_px + 1, stride=1, padding=feather_px, count_include_pad=True)
+    return m.clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def match_color(img, ref, region, eps=1e-4):
+    """Round 7: per-channel mean/std of img matched to ref's inside region ([B,1,H,W], > 0.5 = in).
+    Global per channel, so local changes G makes (lesions) keep their contrast; only the overall
+    colour cast and saturation are pulled back to the real baseline. Pixels outside region are
+    left as they are (finish_step blacks them out). Images in [-1, 1]."""
+    r = (region > 0.5).float()
+    n = r.sum(dim=(2, 3), keepdim=True).clamp_min(1.0)
+
+    def stats(x):
+        mu = (x * r).sum(dim=(2, 3), keepdim=True) / n
+        sd = (((x - mu) ** 2) * r).sum(dim=(2, 3), keepdim=True).div(n).sqrt()
+        return mu, sd
+
+    mu_i, sd_i = stats(img)
+    mu_r, sd_r = stats(ref)
+    out = (img - mu_i) / (sd_i + eps) * sd_r + mu_r
+    return torch.where(r.bool().expand_as(img), out, img).clamp(-1.0, 1.0)
+
+
+def finish_step(img, ref, fov=None, color_match=False):
+    """Round 7: one synthesized cascade step -> colour-matched to the REAL baseline (ref; always the
+    baseline, never the previous step, so the error can't build up) and blacked out outside fov
+    (the baseline's possibly shrunk/softened retina mask). fov None and color_match False = raw G."""
+    if color_match:
+        img = match_color(img, ref, fov if fov is not None else fov_mask(ref))
+    if fov is not None:
+        img = apply_fov(img, fov)
+    return img
+
+
 class FovMaskedGenerator(nn.Module):
     """Wraps a Generator: same call signature G(x, c), output blacked out outside the retina
     circle of the input image (x[:, :3]). Parameters and state_dict stay those of the wrapped G
@@ -89,3 +141,36 @@ class CopyBaselineGenerator(nn.Module):
 
     def forward(self, x, c):
         return x[:, :3]
+
+
+def add_cascade_args(parser):
+    """Round 7 command-line options shared by evaluate_trajectory.py, visualize_trajectory.py and
+    generate_progression.py (all off by default = round 6). --fov-erode/--fov-feather need --fov-mask."""
+    parser.add_argument("--fov-erode", type=int, default=0,
+                        help="Round 7: pull the baseline's retina mask in by this many pixels (at --image-size)")
+    parser.add_argument("--fov-feather", type=int, default=0,
+                        help="Round 7: fade the mask's edge to black over this many pixels")
+    parser.add_argument("--color-match", action="store_true",
+                        help="Round 7: match every synthesized step's colours to the real baseline's")
+    parser.add_argument("--cascade-mode", choices=["cascade", "direct"], default="cascade",
+                        help="Round 7: 'direct' generates every stage from the real baseline (evaluation control)")
+
+
+def check_cascade_args(parser, args):
+    if (args.fov_erode or args.fov_feather) and not args.fov_mask:
+        parser.error("--fov-erode / --fov-feather need --fov-mask")
+
+
+def cascade_fov(baseline, config):
+    """The fov mask synthesize_trajectory gets for this baseline: None without --fov-mask, else the
+    baseline's retina mask, shrunk/softened by --fov-erode/--fov-feather (round 7)."""
+    if not getattr(config, "fov_mask", False):
+        return None
+    return shrink_soften(fov_mask(baseline), getattr(config, "fov_erode", 0), getattr(config, "fov_feather", 0))
+
+
+def cascade_kwargs(baseline, config):
+    """fov_mask / color_match / mode keyword arguments for synthesize_trajectory."""
+    return {"fov_mask": cascade_fov(baseline, config),
+            "color_match": bool(getattr(config, "color_match", False)),
+            "mode": getattr(config, "cascade_mode", "cascade")}

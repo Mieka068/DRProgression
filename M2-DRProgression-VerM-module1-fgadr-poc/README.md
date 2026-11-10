@@ -239,6 +239,27 @@ and WRITES only to `_r6` folders (`ROUND_TAG`). Rounds 3-5 are never written to.
 **Run order (round 6):** 06 -> 08 -> 10 (04_05, 09 and 07 not re-run). Not addressed yet: the ripple textures at
 cascade steps 3-4 (compare `GENERATOR = 'pretrained'`), LongDR's 41 % SIFT failure rate, `lambda_rec` 10 -> 5, 256 px.
 
+# Round 7 -- grade control + better evaluation (branch `R7-GradeControl-Eval`)
+Round 6 fixed the shape (step-1 FID 121 -> 65, KID 0.096 -> 0.029 vs round 5 fine-tuned) but the Generator ignores the
+requested grade: stage control 0.0 % in every epoch, best epoch 1 (essentially the pretrained Generator, KID tied with
+it), and it doesn't beat copying the baseline (nb 06 verdict "NOT PROGRESSING YET"). The cascade still drifts grey/blurry
+and grows thin bars at the circle's left/right edges. Round 7 again READS round 5's inputs (`INPUT_ROUND_TAG = '_r5'`)
+and WRITES only to `_r7` folders; 04_05, 09 and 07 are not re-run.
+
+| Change | Why | Earlier behaviour |
+|---|---|---|
+| nb 06: `LAMBDA_GRADER = 0.5` (frozen EyePACS grader back in G's loss), `LAMBDA_REC = 5` (new `--lambda-rec`), patience 15 | Nothing pushed G to change the grade; a strong L1 on mostly non-progressing pairs teaches copying. Half of round 4's weight: round 4 (1.0, lr 1e-4, random critic) fooled the loss grader 100 % at FID 266 | 0.0; 10 (fixed); 10 |
+| `train_module2_poc.py --selection-mode control-kid`: eligible epochs need stage control >= `--selection-min-control` (0.2) AND KID <= `--selection-kid-slack` (2.0) x the pretrained Generator's (epoch 0); lowest KID among them; none -> best-G.ckpt = pretrained, said in the log. Stage control graded by the EyePACS grader; FGADR's logged each epoch (`--selection-check-classifier-checkpoint`). Loss plot gets a stage-control panel | KID alone rewards copying the baseline (round 6 picked epoch 1); the KID ceiling stops round 4's artefact epochs from winning. FGADR can't gate (kappa ~0 on Tianjin; round 4's FGADR stage control ~2 % all run) | `kid` |
+| `evaluate_trajectory.py`: `final_step` block -- per pair's last image, exact agreement with the follow-up grade and **grade went up** (vs the grader's own reading of the real baseline), Wilson 95 % intervals, per step and pooled; `--second-classifier-checkpoint` (same numbers from FGADR); `--real-followup` (the ceiling row: grades the real follow-up photos) | Shows whether a grader can see real progression at all, and whether a gain is seen by a grader G wasn't trained against | exact agreement, one grader |
+| nb 06 round-7 table (`<run>/round7_comparison/`): copy, real follow-up, round 5 pretrained, round 6, round 7, round 7 direct -- both graders; verdict separates "progressing", "loss grader only (artefacts)", "unconfirmed (FGADR blind)", "images degrade" | Round 7 trains against EyePACS, so EyePACS alone is optimistic | five-row table, one grader |
+| `fov_mask.shrink_soften` / `match_color` / `--fov-erode 4 --fov-feather 3 --color-match` in evaluate/visualize/generate (nb 06/08/10); `--cascade-mode direct` (every stage from the real baseline) as a comparison row | Edge bars and grey drift along the cascade; direct vs cascade shows whether feeding G's output back in adds the blur | hard baseline mask, no colour match |
+
+**Run order (round 7):** 06 -> 08 -> 10. Watch in nb 06: (1) the training log's stage control rising above 0 % (and
+whether FGADR's check value follows); (2) the round-7 table's grade-up / agreement on both graders vs copy and the
+pretrained row, read against the real-follow-up ceiling; (3) KID near the pretrained Generator's. If every epoch says
+`not eligible (KID > ceiling)`, lower `LAMBDA_GRADER` to 0.3. Not addressed yet: residual Generator output (needs a new
+nb 09 pretraining), 256 px, LongDR's SIFT failure rate.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

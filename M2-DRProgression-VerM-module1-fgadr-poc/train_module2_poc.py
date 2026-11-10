@@ -104,6 +104,19 @@ change:
        follow-ups (fixed subsets/seed). The starting Generator is scored as epoch 0 first; if no
        epoch beats it, best-G.ckpt is the starting Generator unchanged. The KID of copying the
        baseline is printed once as a reference (a low KID can just mean "looks like a real photo").
+ 16. Round 7 (grade control):
+     * --selection-mode control-kid: an epoch can only become best-G.ckpt if (a) its stage control
+       (docstring point 14, graded by --selection-classifier-checkpoint) is >= --selection-min-control
+       AND (b) its KID is <= --selection-kid-slack x the starting Generator's KID (epoch 0). Among the
+       epochs that pass both, the lowest KID wins. Epoch 0 is scored too; if no epoch passes,
+       best-G.ckpt stays the starting Generator and the log says so. (a) stops KID-only selection
+       from picking a Generator that just copies the baseline (round 6: stage control 0 % every
+       epoch); (b) stops the grader loss from winning with artefacts the grader reads as lesions
+       (round 4: the loss grader agreed 100 % at FID 266).
+     * --selection-check-classifier-checkpoint: a second grader whose stage control is LOGGED each
+       epoch (not used for selection) -- when the selection grader is also the one in G's loss, this
+       shows whether the gain is seen by a grader G was not trained against.
+     * --lambda-rec on the command line (was fixed at 10).
 
 Usage (Colab, after Module 1 checkpoints + cache files exist):
     python train_module2_poc.py \
@@ -191,6 +204,11 @@ class Config:
     fov_mask = False
     kid_subsets = 50  # KID subsets for --selection-mode kid (fixed seed, so epochs compare)
     kid_seed = 1234
+    # Round 7 (docstring point 16): --selection-mode control-kid
+    selection_min_control = 0.2
+    selection_kid_slack = 2.0
+    selection_check_classifier_path = None
+    selection_check_classifier_norm = None
 
     # Model
     g_conv_dim = 64
@@ -583,7 +601,11 @@ def train(config: Config):
             selection_norm = CLASSIFIER_NORMS[config.selection_classifier_norm]
         what = ("stage control (one stage above baseline)" if config.selection_mode == "controllability"
                 else "agreement with the target grade")
-        if config.selection_mode == "kid":
+        if config.selection_mode == "control-kid":
+            print(f"  Best-epoch rule: stage control >= {config.selection_min_control:.0%} (graded by "
+                  f"{config.selection_classifier_path}) AND KID <= {config.selection_kid_slack} x the starting "
+                  "Generator's; lowest KID among those. None pass -> best-G.ckpt = the starting Generator")
+        elif config.selection_mode == "kid":
             print(f"  Module 1 agreement logged each epoch (graded by {config.selection_classifier_path}); "
                   "not part of the --selection-mode kid score")
         else:
@@ -591,8 +613,20 @@ def train(config: Config):
                   f"{config.selection_classifier_path}")
         if config.grader_loss_path and config.lambda_grader > 0 and os.path.abspath(config.grader_loss_path) == os.path.abspath(
                 config.selection_classifier_path):
-            print("  ⚠ the selection grader is the grader in G's loss -- the selection score is then the number "
-                  "G was optimised on; use the other grader (e.g. FGADR) for --selection-classifier-checkpoint")
+            if config.selection_mode == "control-kid":
+                print("  ⚠ the stage-control grader is also the grader in G's loss: G can raise it with artefacts. "
+                      "The KID ceiling is the guard; read the check grader's stage control and nb 06's second-grader "
+                      "columns before trusting a gain")
+            else:
+                print("  ⚠ the selection grader is the grader in G's loss -- the selection score is then the number "
+                      "G was optimised on; use the other grader (e.g. FGADR) for --selection-classifier-checkpoint")
+    check_classifier = check_norm = None
+    if config.selection_check_classifier_path and val_loader is not None:
+        from apply_to_progression_data import CLASSIFIER_NORMS, load_classifier
+        check_classifier = load_classifier(config.selection_check_classifier_path, device=device)
+        if config.selection_check_classifier_norm:
+            check_norm = CLASSIFIER_NORMS[config.selection_check_classifier_norm]
+        print(f"  Check grader (logged, not used for selection): {config.selection_check_classifier_path}")
     grader = None
     if config.grader_loss_path and config.lambda_grader > 0:
         grader = FrozenGrader(config.grader_loss_path, norm=config.grader_loss_norm,
@@ -606,7 +640,16 @@ def train(config: Config):
         return diff_augment(x, config.diffaugment) if config.diffaugment else x
 
     val_kid = None
-    if config.selection_mode == "kid" and val_loader is not None:
+    kid_modes = ("kid", "control-kid")
+    if config.selection_mode == "control-kid" and selection_classifier is None:
+        raise SystemExit("--selection-mode control-kid needs --selection-classifier-checkpoint and --val-fraction > 0")
+
+    def kid_ceiling():
+        """control-kid: slack x the starting Generator's KID (epoch 0, kept in val_history across resumes)."""
+        k0 = next((h.get("val_kid") for h in val_history if h.get("epoch") == 0), None)
+        return None if k0 is None else config.selection_kid_slack * k0
+
+    if config.selection_mode in kid_modes and val_loader is not None:
         val_kid = ValKID(val_loader, device, fov=config.fov_mask, subsets=config.kid_subsets, seed=config.kid_seed)
         copy_kid = val_kid.score_copy_baseline()
         print(f"  Best-epoch score: KID vs the {val_kid.n} held-out real follow-ups (lower is better, "
@@ -618,13 +661,27 @@ def train(config: Config):
             # the honest answer when fine-tuning doesn't help.
             k0 = val_kid.score_generator(Gv)
             l1_0, psnr_0 = validation_l1(Gv, val_loader, device, fov=config.fov_mask)
-            best = {"epoch": 0, "val_l1": l1_0, "score": k0[0], "kid_std": k0[1], "module1_agreement": None,
-                    "stage_control": None, "G": {k: v.detach().cpu().clone() for k, v in G.state_dict().items()}}
+            score_0, control_0, check_0 = k0[0], None, None
+            if config.selection_mode == "control-kid":
+                control_0 = validation_controllability(Gv, val_loader, selection_classifier, device, selection_norm,
+                                                       config.c_dim)
+                if check_classifier is not None:
+                    check_0 = validation_controllability(Gv, val_loader, check_classifier, device, check_norm,
+                                                         config.c_dim)
+                # epoch 0 always stays the fallback, but only counts as "passing" with enough stage control
+                score_0 = k0[0] if (control_0 or 0.0) >= config.selection_min_control else float("inf")
+            best = {"epoch": 0, "val_l1": l1_0, "score": score_0, "kid_std": k0[1], "module1_agreement": None,
+                    "stage_control": control_0, "G": {k: v.detach().cpu().clone() for k, v in G.state_dict().items()}}
             torch.save(best["G"], os.path.join(config.save_dir, "best-G.ckpt"))
             val_history.append({"epoch": 0, "val_l1": l1_0, "val_psnr": psnr_0, "val_kid": k0[0],
-                                "val_kid_std": k0[1], "selection_score": k0[0]})
+                                "val_kid_std": k0[1], "stage_control": control_0, "check_stage_control": check_0,
+                                "selection_score": None if score_0 == float("inf") else score_0})
             print(f"  epoch 0 (starting Generator): KID {k0[0]:.4f} +/- {k0[1]:.4f} | val L1 {l1_0:.4f} | "
-                  f"val PSNR {psnr_0:.2f} dB -> best so far")
+                  f"val PSNR {psnr_0:.2f} dB"
+                  + (f" | stage control {control_0:.1%}" if control_0 is not None else "")
+                  + (f" | check grader stage control {check_0:.1%}" if check_0 is not None else "")
+                  + (f" -> KID ceiling {kid_ceiling():.4f}" if config.selection_mode == "control-kid" else "")
+                  + " -> best so far (fallback)")
     g_steps = loss_history[-1].get("g_steps", 0) if loss_history else 0
     batch_log = extra.get("batch_log", [])  # docstring point 12
     batch_log_path = os.path.join(config.save_dir, "batch_log.csv")
@@ -726,7 +783,7 @@ def train(config: Config):
         )
         if val_loader is not None:
             val_l1, val_psnr = validation_l1(Gv, val_loader, device, fov=config.fov_mask)
-            agree = agree_real = control = kid = None
+            agree = agree_real = control = kid = check_control = None
             score = val_l1
             if selection_classifier is not None:
                 agree, agree_real = validation_agreement(Gv, val_loader, selection_classifier, device, selection_norm)
@@ -734,13 +791,27 @@ def train(config: Config):
                                                      config.c_dim)
                 signal = control if config.selection_mode == "controllability" else agree
                 score = val_l1 - config.selection_alpha * (signal or 0.0)
+            if check_classifier is not None:
+                check_control = validation_controllability(Gv, val_loader, check_classifier, device, check_norm,
+                                                           config.c_dim)
+            gate = ""
             if val_kid is not None:
                 kid = val_kid.score_generator(Gv)
                 score = kid[0]
+                if config.selection_mode == "control-kid":
+                    ceiling = kid_ceiling()
+                    ok_control = (control or 0.0) >= config.selection_min_control
+                    ok_kid = ceiling is None or kid[0] <= ceiling
+                    if not (ok_control and ok_kid):
+                        score = float("inf")  # can't become best-G.ckpt
+                        gate = " | not eligible (" + ", ".join(
+                            ([f"stage control < {config.selection_min_control:.0%}"] if not ok_control else [])
+                            + ([f"KID > ceiling {ceiling:.4f}"] if not ok_kid else [])) + ")"
             val_history.append({"epoch": epoch + 1, "val_l1": val_l1, "val_psnr": val_psnr,
                                 "module1_agreement": agree, "module1_agreement_clinical": agree_real,
-                                "stage_control": control, "val_kid": kid[0] if kid else None,
-                                "val_kid_std": kid[1] if kid else None, "selection_score": score})
+                                "stage_control": control, "check_stage_control": check_control,
+                                "val_kid": kid[0] if kid else None, "val_kid_std": kid[1] if kid else None,
+                                "selection_score": None if score == float("inf") else score})
             is_best = score < best["score"]
             if is_best:
                 best = {"epoch": epoch + 1, "val_l1": val_l1, "score": score, "module1_agreement": agree,
@@ -750,7 +821,8 @@ def train(config: Config):
             print(f"  val L1 {val_l1:.4f} | val PSNR {val_psnr:.2f} dB"
                   + (f" | agreement {agree:.1%} | stage control {control if control is None else f'{control:.1%}'}"
                      if agree is not None else "")
-                  + (f" | KID {kid[0]:.4f} +/- {kid[1]:.4f}" if kid else
+                  + (f" | check grader stage control {check_control:.1%}" if check_control is not None else "")
+                  + (f" | KID {kid[0]:.4f} +/- {kid[1]:.4f}{gate}" if kid else
                      (f" -> score {score:.4f}" if agree is not None else ""))
                   + (" | ★ new best -> best-G.ckpt" if is_best else f" | best so far: epoch {best['epoch']}"))
             if (config.early_stop_patience and best["epoch"] is not None
@@ -788,9 +860,14 @@ def train(config: Config):
         best_g_path = os.path.join(config.save_dir, "best-G.ckpt")
         torch.save(best["G"], best_g_path)  # rewritten here too in case this runtime is a resumed one
         G.load_state_dict(best["G"])
-        print(f"\n✓ Best epoch: {best['epoch']} (val L1 {best['val_l1']:.4f}, score {best['score']:.4f}) -> "
+        _sc = "not eligible -- fallback" if best["score"] == float("inf") else f"{best['score']:.4f}"
+        print(f"\n✓ Best epoch: {best['epoch']} (val L1 {best['val_l1']:.4f}, score {_sc}) -> "
               f"{best_g_path}; final-G.ckpt = last epoch ({stopped_at or config.num_epochs})")
-        if best["epoch"] == 0:
+        if best["epoch"] == 0 and config.selection_mode == "control-kid" and best["score"] == float("inf"):
+            print(f"  ⚠ No epoch reached stage control >= {config.selection_min_control:.0%} within the KID ceiling -- "
+                  "best-G.ckpt is the starting Generator unchanged. The grader loss did not give grade control "
+                  "here; see the per-epoch stage control above.")
+        elif best["epoch"] == 0:
             print("  ⚠ No fine-tuning epoch beat the starting Generator -- best-G.ckpt is the pretrained "
                   "Generator unchanged (fine-tuning didn't help on this score)")
     metrics_loader = val_loader if val_loader is not None else loader
@@ -848,7 +925,14 @@ def train(config: Config):
         "split": split_info,
         "best_epoch": best["epoch"],
         "best_val_l1": best["val_l1"] if best["epoch"] is not None else None,
-        "best_selection_score": best["score"] if best["epoch"] is not None else None,
+        "best_selection_score": (best["score"] if best["epoch"] is not None and best["score"] != float("inf")
+                                 else None),
+        "best_passed_selection_gate": (best["score"] != float("inf")) if best["epoch"] is not None else None,
+        "selection_min_control": config.selection_min_control if config.selection_mode == "control-kid" else None,
+        "selection_kid_slack": config.selection_kid_slack if config.selection_mode == "control-kid" else None,
+        "selection_kid_ceiling": kid_ceiling() if config.selection_mode == "control-kid" else None,
+        "selection_check_classifier": config.selection_check_classifier_path,
+        "lambda_rec": config.lambda_rec,
         "best_kid_std": best.get("kid_std"),
         "fov_mask": config.fov_mask,
         "copy_baseline_val_kid": list(copy_kid) if val_kid is not None else None,
@@ -922,10 +1006,23 @@ if __name__ == "__main__":
     parser.add_argument("--selection-alpha", type=float, default=Config.selection_alpha)
     parser.add_argument("--selection-classifier-norm", choices=["fgadr", "eyepacs"], default=None,
                          help="Normalisation of the selection grader (default: --classifier-norm)")
-    parser.add_argument("--selection-mode", choices=["controllability", "target", "kid"], default=Config.selection_mode,
+    parser.add_argument("--selection-mode", choices=["controllability", "target", "kid", "control-kid"],
+                         default=Config.selection_mode,
                          help="controllability: stage control one stage above baseline (default); target: "
                               "agreement with the pair's own target grade (round 3); kid (round 6): KID vs the "
-                              "held-out real follow-ups, with the starting Generator scored as epoch 0")
+                              "held-out real follow-ups, with the starting Generator scored as epoch 0; "
+                              "control-kid (round 7): lowest KID among epochs with stage control >= "
+                              "--selection-min-control and KID <= --selection-kid-slack x epoch 0's")
+    parser.add_argument("--selection-min-control", type=float, default=Config.selection_min_control,
+                         help="control-kid: minimum stage control (0-1) for an epoch to be eligible")
+    parser.add_argument("--selection-kid-slack", type=float, default=Config.selection_kid_slack,
+                         help="control-kid: eligible only if KID <= this x the starting Generator's KID")
+    parser.add_argument("--selection-check-classifier-checkpoint", default=None,
+                         help="Round 7: second grader whose stage control is logged each epoch (not used to select)")
+    parser.add_argument("--selection-check-classifier-norm", choices=["fgadr", "eyepacs"], default=None,
+                         help="Normalisation of the check grader (default: --classifier-norm)")
+    parser.add_argument("--lambda-rec", type=float, default=Config.lambda_rec,
+                         help="Reconstruction (L1 to the real follow-up) weight; round 7 = 5 (was fixed at 10)")
     parser.add_argument("--fov-mask", action="store_true",
                          help="Round 6: black out G's output outside the baseline's retina circle and restrict the "
                               "reconstruction loss and both critic inputs to baseline ∩ follow-up retina")
@@ -1020,6 +1117,11 @@ if __name__ == "__main__":
     cfg.lambda_drift = args.lambda_drift
     cfg.fov_mask = args.fov_mask
     cfg.kid_subsets = args.kid_subsets
+    cfg.selection_min_control = args.selection_min_control
+    cfg.selection_kid_slack = args.selection_kid_slack
+    cfg.selection_check_classifier_path = args.selection_check_classifier_checkpoint
+    cfg.selection_check_classifier_norm = args.selection_check_classifier_norm
+    cfg.lambda_rec = args.lambda_rec
     apply_classifier_norm_args(args)
     cfg.lambda_cls = args.lambda_cls
     cfg.g_lr, cfg.d_lr, cfg.n_critic = args.g_lr, args.d_lr, args.n_critic

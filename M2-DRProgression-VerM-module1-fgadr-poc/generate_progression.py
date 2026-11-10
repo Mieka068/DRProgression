@@ -55,7 +55,7 @@ from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, l
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
 from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa: E402
-from fov_mask import fov_mask  # noqa: E402
+from fov_mask import add_cascade_args, cascade_kwargs, check_cascade_args  # noqa: E402
 from visualize_trajectory import (  # noqa: E402
     denorm,
     estimate_module3_progression,
@@ -124,7 +124,7 @@ def run_one(path, G, classifier, seg_models, module3, thresholds, config, device
     else:
         trajectory = synthesize_trajectory(G, classifier, seg_models, image, mask, start_stage=start,
                                            end_stage=config.end_stage, c_dim=config.c_dim, device=device,
-                                           fov_mask=fov_mask(image) if config.fov_mask else None)
+                                           **cascade_kwargs(image, config))  # rounds 6/7
 
     # 3) Save per-stage images, strip figure, JSON.
     steps = []
@@ -211,6 +211,7 @@ if __name__ == "__main__":
     p.add_argument("--end-stage", type=int, default=4, help="Last stage to synthesize (default 4 = PDR)")
     p.add_argument("--fov-mask", action="store_true",
                    help="Round 6: black out each synthesized step outside the input's retina circle")
+    add_cascade_args(p)  # round 7: --fov-erode/--fov-feather/--color-match/--cascade-mode
     p.add_argument("--min-start-stage", type=int, default=0,
                    help="Skip inputs whose start stage is below this (1 = the thesis scope, >= mild NPDR)")
     p.add_argument("--module3-checkpoint", default=None)
@@ -226,6 +227,7 @@ if __name__ == "__main__":
     add_arch_arg(p)  # must match the Generator checkpoint's run
     add_seg_inference_args(p)
     args = p.parse_args()
+    check_cascade_args(p, args)
     apply_classifier_norm_args(args)
     apply_seg_inference_args(args)
 
