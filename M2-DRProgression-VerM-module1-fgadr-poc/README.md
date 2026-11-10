@@ -260,6 +260,16 @@ pretrained row, read against the real-follow-up ceiling; (3) KID near the pretra
 `not eligible (KID > ceiling)`, lower `LAMBDA_GRADER` to 0.3. Not addressed yet: residual Generator output (needs a new
 nb 09 pretraining), 256 px, LongDR's SIFT failure rate.
 
+**Round 7 evaluation fix (same run, no retraining).** The first round-7 evaluation had two bugs: (1)
+`shrink_soften` counted the area outside the frame as retina, so where the retina-cropped circle touches the frame
+(top, bottom, left, right) the mask wasn't pulled in -- four bumps on every synthesized image, and every row's KID
+~4-5x round 6's (copy-the-baseline 0.023 -> 0.102); (2) "grade went up" compared the masked final image with the
+RAW baseline, so the masking alone moved EyePACS's grade up for 40 % of copied baselines (more than the real
+follow-ups' 18 %). Fixed: erosion pads with background; the baseline is graded through the same masking/colour
+match (`evaluate_trajectory.py` `eval_version` 2). Notebook 06 recomputes any comparison JSON with an older
+`eval_version` automatically. **Re-run:** nb 06 Run all (training resumes, sees it early-stopped and goes straight
+to evaluation), then 08 and 10.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

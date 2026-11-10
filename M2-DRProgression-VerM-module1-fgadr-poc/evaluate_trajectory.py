@@ -31,7 +31,10 @@ Round 7 additions (same JSON, new keys; nothing earlier changes):
     one compared with the real follow-up): exact agreement with the real follow-up grade and
     "grade went up" = the grader rates it higher than it rates the real baseline (relative to the
     grader's own baseline reading, so a grader that over- or under-grades Tianjin overall doesn't
-    count). Wilson 95% intervals -- n is small. With --second-classifier-checkpoint the same
+    count). The baseline is graded after the SAME retina masking / colour match as the synthesized
+    image (finish_step), so the masking itself can't make the grade "go up" (eval_version 2; v1 graded
+    the raw baseline and the masked rim alone moved EyePACS's grade up for 40 % of copied baselines);
+    the real-follow-up row compares the two raw photos. Wilson 95% intervals -- n is small. With --second-classifier-checkpoint the same
     numbers from a second grader (round 7 trains G against the first one, so a gain only counts if
     the second grader sees it too). Same pairs for every row, unlike module1_consistency (whose
     step k pools every pair that passes through stage k).
@@ -91,7 +94,12 @@ from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa
 from fire_dataset import FIREDataset  # noqa: E402
 from longdr_dataset import LongDRScreeningDataset  # noqa: E402
 from image_quality_metrics import compute_fid_kid_stats  # noqa: E402
-from fov_mask import CopyBaselineGenerator, add_cascade_args, cascade_kwargs, check_cascade_args  # noqa: E402
+from fov_mask import CopyBaselineGenerator, add_cascade_args, cascade_kwargs, check_cascade_args, finish_step  # noqa: E402
+
+# Bumped whenever this script's numbers change for the same inputs, so notebook 06 recomputes stale rows.
+# 2 = round 7 fix: retina-mask edge where the circle touches the frame, and the baseline graded with the
+#     same masking / colour match as the final image ("grade went up" like for like).
+EVAL_VERSION = 2
 
 SELF_CONSISTENCY_DATASETS = {"fire": FIREDataset, "longdr": LongDRScreeningDataset}
 SELF_CONSISTENCY_TAG = "self-consistency -- not validated against ground truth"
@@ -377,8 +385,11 @@ def evaluate(config):
 
         final_stage, synthesized = trajectory[-1]["stage"], trajectory[-1]["image"]
         assert final_stage == int(row["followup_icdr"])
+        # baseline graded through the same masking / colour match as every synthesized step (like for like)
+        _kw = cascade_kwargs(baseline_img, config)
+        baseline_seen = finish_step(baseline_img, baseline_img, _kw["fov_mask"], _kw["color_match"])
         final_step_records[step_count].append(
-            {g: (grade(g, baseline_img), grade(g, synthesized), real_followup_stage) for g in graders})
+            {g: (grade(g, baseline_seen), grade(g, synthesized), real_followup_stage) for g in graders})
 
         real_01 = denorm(real_followup_img)
         fake_01 = denorm(synthesized)
@@ -396,7 +407,7 @@ def evaluate(config):
     )
 
     print("\n[4/4] Aggregating per-step metrics...")
-    results = {"quality": {}, "module1_consistency": {},
+    results = {"eval_version": EVAL_VERSION, "quality": {}, "module1_consistency": {},
                "evaluated_on": ("patients the Generator never trained on" if held_out_info
                                 else "ALL Tianjin pairs, including the Generator's training patients (optimistic)"),
                "held_out": held_out_info, "min_baseline_grade": config.min_baseline_grade,

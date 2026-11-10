@@ -81,11 +81,19 @@ def shrink_soften(mask, erode_px=0, feather_px=0):
     circle. 0/0 = the mask unchanged (round 6). Pixels are at the Module 2 image size (128 px)."""
     m = mask.float()
     if erode_px > 0:
-        m = -F.max_pool2d(-m, 2 * erode_px + 1, stride=1, padding=erode_px)
+        m = _erode_bg_border(m, erode_px)
     if feather_px > 0:
-        inner = -F.max_pool2d(-m, 2 * feather_px + 1, stride=1, padding=feather_px)
+        inner = _erode_bg_border(m, feather_px)
         m = F.avg_pool2d(inner, 2 * feather_px + 1, stride=1, padding=feather_px, count_include_pad=True)
     return m.clamp(0.0, 1.0)
+
+
+def _erode_bg_border(m, r):
+    """Erodes by r px with everything OUTSIDE the frame counted as background. (max_pool2d's own padding
+    is -inf, which made the frame edge count as retina: where the retina-cropped circle touches the frame
+    -- top, bottom, left, right -- the mask wasn't pulled in at all, leaving four bumps; round 7 bug.)"""
+    padded = F.pad(m, (r, r, r, r), value=0.0)
+    return -F.max_pool2d(-padded, 2 * r + 1, stride=1, padding=0)
 
 
 @torch.no_grad()
