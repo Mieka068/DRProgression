@@ -270,6 +270,13 @@ match (`evaluate_trajectory.py` `eval_version` 2). Notebook 06 recomputes any co
 `eval_version` automatically. **Re-run:** nb 06 Run all (training resumes, sees it early-stopped and goes straight
 to evaluation), then 08 and 10.
 
+**Round 7 re-run settings.** `FOV_ERODE, FOV_FEATHER = 0, 0` in nb 06/08/10: 4/3 made the eye ~12 % narrower with a
+dimmed rim (0/0 = the baseline's full circle, as in round 6; colour match stays on). nb 08/10 `GENERATOR = 'round6'`
+(new, now the default): round 6's sharper fine-tuned Generator through round 7's colour match, output folders
+`..._r7_round6G`; `'finetuned'` = round 7's Generator. nb 06's comparison recomputes any row whose JSON has a different
+mask/colour setting, so its round-6 row is that same combination. Open fresh copies of 06, 08 and 10 from this branch
+in Colab -- notebook cells come from the copy you open, only the scripts come from the clone.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|
