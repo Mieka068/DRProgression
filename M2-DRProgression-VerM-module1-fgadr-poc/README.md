@@ -277,6 +277,15 @@ dimmed rim (0/0 = the baseline's full circle, as in round 6; colour match stays 
 mask/colour setting, so its round-6 row is that same combination. Open fresh copies of 06, 08 and 10 from this branch
 in Colab -- notebook cells come from the copy you open, only the scripts come from the clone.
 
+**Before round 8 -- grader resolution check (notebook 12).** Round 7's real-follow-up row showed EyePACS reads only 18 % of
+real progressed eyes as worse at 128 px, and round 5's notebook 04_05 found 256 px recovers only part of what 128 px loses
+for single photos (kappa vs clinical grades: full 0.586, 256 px 0.506, 128 px 0.463). Notebook 12 measures what Module 2
+needs -- seeing the CHANGE: "grade went up" on progressed minus on stable eyes, at 128 / 256 / full. Run it before
+deciding on 256 px (~20 h of notebook 09 pretraining). Round 7's re-run results: round 6's Generator + colour match is
+the most realistic so far (step-1 KID 0.025 vs round 6's 0.029, pretrained 0.031, copy 0.022) but no Generator shows
+real progression; round 7's grader loss games EyePACS (grade up 45 % vs 18 % for real follow-ups, FGADR flat, KID 0.045);
+direct-from-baseline beats the cascade at step 2 (KID 0.034 vs 0.058).
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|
@@ -291,6 +300,7 @@ in Colab -- notebook cells come from the copy you open, only the scripts come fr
 | 09 | `09_eyepacs_module1_and_module2_pretrain_colab` | **new** -- EyePACS: Module 1 grading pickle (+ optional classifier training); Module 1 cache over an EyePACS subset; stage biomarker profiles; Module 2 non-longitudinal pretraining | 02, 03, EyePACS zip on Drive |
 | 11 | `11_module1_drgnet_replication_colab` | **new** -- DRG-Net's own Module 1 runs, one model per dataset as in their repo: grading on FGADR (released split), IDRiD, EyePACS; lesion segmentation on FGADR and IDRiD (100 ep each by default; DRG-Net used 1500 / 2500), plus DDR (our addition, 100 ep, official train / val / test; `module1/dataprep/prepare_ddr_segmentation.py`) and FGADR + DDR combined (100 ep; `prepare_combined_segmentation.py`) -- the pipeline's lesion models; every model scored on the FGADR / DDR / IDRiD test sets; resumes from Drive checkpoints after a disconnect; test-set metrics summary | dataset zips on Drive (IDRiD "A. Segmentation" for IDRiD seg; a zip with DDR in its name for DDR seg) |
 | 10 | `10_generate_progression_to_pdr_colab` | **new** -- any fundus image(s) -> Module 1 grade -> cascade to stage 4 (PDR), saves per-stage images/figure/JSON | 02, 03, 06 (07 optional) |
+| 12 | `12_grader_resolution_check_colab` | **new (before round 8)** -- grades REAL Tianjin baseline + follow-up pairs at 128 px, 256 px and full resolution (EyePACS + FGADR; `evaluate_trajectory.py --real-followup --include-stable [--real-followup-native]`): how often the grade goes up on progressed vs stable eyes, and whether 256 px is worth notebook 09's 256 px pretraining. No Generator, ~20-30 min | round 5's Tianjin Module 1 cache + laterality file, notebook 11's graders |
 
 **`MODULE1_SOURCE`** (first code cell of 04_05 and 06-10) picks which Module 1 models the pipeline
 uses. Use the same value in every notebook; each value writes to its own folders, so switching never

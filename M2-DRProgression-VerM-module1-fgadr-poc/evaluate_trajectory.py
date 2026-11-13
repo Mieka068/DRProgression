@@ -43,6 +43,11 @@ Round 7 additions (same JSON, new keys; nothing earlier changes):
     No PSNR/SSIM/FID (it would be the image against itself).
   * --fov-erode/--fov-feather/--color-match/--cascade-mode (fov_mask.add_cascade_args): the round 7
     cascade clean-up and the "direct from the baseline" control.
+  * Grader resolution check (notebook 12), with --real-followup only: --include-stable also grades
+    the pairs that did NOT progress (bucket "step_0", left out of "all"), so a grader's "grade went up"
+    on progressed eyes can be read against its false-alarm rate on stable ones; --real-followup-native
+    grades the original photo files (the grader's own 512 px preprocessing) instead of the
+    --image-size tensors -- the full-resolution reference.
 
 Usage (after a trained Module 2 checkpoint, a Tianjin module1 cache, and Module 1
 classifier/segmentation checkpoints all exist):
@@ -326,9 +331,11 @@ def evaluate(config):
         print(f"  second grader: {config.second_classifier_checkpoint} ({config.second_classifier_norm})")
 
     def grade(name, img):
+        """img: a [-1, 1] tensor (graded as the Module 2-sized image), or a file path (graded from the photo)."""
         model, norm = graders[name]
         mean, std = norm if norm else (None, None)
-        return int(predict_grade(model, _tensor_to_pil(img), mean=mean, std=std, device=device))
+        src = img if isinstance(img, str) else _tensor_to_pil(img)
+        return int(predict_grade(model, src, mean=mean, std=std, device=device))
 
     print(f"\n[3/4] Synthesizing trajectories for {len(manifest)} real pairs...")
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -347,7 +354,8 @@ def evaluate(config):
 
     for _, row in manifest.iterrows():
         step_count = int(row["followup_icdr"]) - int(row["baseline_icdr"])
-        if step_count <= 0:
+        keep_stable = G is None and config.include_stable and step_count == 0
+        if step_count <= 0 and not keep_stable:
             n_skipped_no_progression += 1
             continue  # the cascade evaluates progression, not regression/no-change
 
@@ -359,8 +367,10 @@ def evaluate(config):
         real_followup_stage = int(row["followup_icdr"])
 
         if G is None:  # --real-followup: grade the real photos only
+            b_src, f_src = ((baseline_path, followup_path) if config.real_followup_native
+                            else (baseline_img, real_followup_img))
             final_step_records[step_count].append(
-                {g: (grade(g, baseline_img), grade(g, real_followup_img), real_followup_stage) for g in graders})
+                {g: (grade(g, b_src), grade(g, f_src), real_followup_stage) for g in graders})
             continue
 
         trajectory = synthesize_trajectory(
@@ -402,8 +412,9 @@ def evaluate(config):
         per_step_images[step_count]["fake"].append(fake_01.cpu())
 
     print(
-        f"  Skipped {n_skipped_no_progression} pairs with no real progression (step_count <= 0) "
-        "-- the cascade evaluates progression, not regression/no-change."
+        f"  Skipped {n_skipped_no_progression} pairs with no real progression (step_count <= 0"
+        + (", stable pairs kept as step_0" if config.include_stable and config.real_followup else "")
+        + ") -- the cascade evaluates progression, not regression/no-change."
     )
 
     print("\n[4/4] Aggregating per-step metrics...")
@@ -415,6 +426,8 @@ def evaluate(config):
                              "copy-the-baseline control" if config.copy_baseline else config.generator_checkpoint),
                "fov_mask": bool(config.fov_mask), "fov_erode": config.fov_erode, "fov_feather": config.fov_feather,
                "color_match": bool(config.color_match), "cascade_mode": config.cascade_mode,
+               "image_size": config.image_size, "include_stable": bool(config.include_stable),
+               "real_followup_native": bool(config.real_followup_native),
                "graders": {"primary": config.classifier_checkpoint, "second": config.second_classifier_checkpoint,
                            "second_norm": config.second_classifier_norm if config.second_classifier_checkpoint else None},
                "final_step": {}}
@@ -449,7 +462,7 @@ def evaluate(config):
         )
 
     # Round 7: final-step agreement / grade-went-up per step_count bucket and pooled, per grader.
-    all_records = [r for step in sorted(final_step_records) for r in final_step_records[step]]
+    all_records = [r for step in sorted(final_step_records) if step > 0 for r in final_step_records[step]]
     for key, recs in [(f"step_{k}", final_step_records[k]) for k in sorted(final_step_records)] + [("all", all_records)]:
         entry = results["final_step"][key] = summarise_final_step(recs, list(graders))
         print(f"  final step [{key}] n={entry['n']}: " + " | ".join(
@@ -560,6 +573,10 @@ if __name__ == "__main__":
     add_cascade_args(parser)  # round 7: --fov-erode/--fov-feather/--color-match/--cascade-mode
     parser.add_argument("--real-followup", action="store_true",
                          help="Round 7 ceiling: no Generator, grade each pair's REAL follow-up photo")
+    parser.add_argument("--include-stable", action="store_true",
+                         help="With --real-followup: also grade pairs that did not progress (bucket step_0, not in 'all')")
+    parser.add_argument("--real-followup-native", action="store_true",
+                         help="With --real-followup: grade the original photo files instead of --image-size images")
     parser.add_argument("--second-classifier-checkpoint", default=None,
                          help="Round 7: a second grader for the final-step agreement / grade-went-up numbers")
     parser.add_argument("--second-classifier-norm", choices=list(CLASSIFIER_NORMS), default="fgadr",
@@ -572,6 +589,8 @@ if __name__ == "__main__":
     check_cascade_args(parser, args)
     if args.real_followup and args.copy_baseline:
         parser.error("--real-followup and --copy-baseline are separate rows; pass one")
+    if (args.include_stable or args.real_followup_native) and not args.real_followup:
+        parser.error("--include-stable / --real-followup-native only apply with --real-followup")
     apply_classifier_norm_args(args)
     apply_seg_inference_args(args)
 
