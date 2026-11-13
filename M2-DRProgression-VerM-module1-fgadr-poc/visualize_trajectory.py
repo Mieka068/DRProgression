@@ -21,6 +21,9 @@ Usage (after notebooks 06 AND 07 have both produced trained checkpoints):
         --module3-thresholds-json ./module3_runs_poc/poc_results.json \
         --num-patients 4 --out-dir ./trajectory_figures/
 
+--end-stage 4 cascades every selected patient up to PDR instead of stopping at their real
+follow-up grade (for any-image inference without a Tianjin pair, see generate_progression.py).
+
 Omitting --module3-checkpoint still works -- figures render with the Module 1/2 content only
 (image + stage label + Module 1 consistency check), no progression-probability caption.
 
@@ -42,10 +45,9 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from PIL import Image  # noqa: E402
-from torchvision import transforms  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
-from base_model import Generator  # noqa: E402
+from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module3"))
@@ -53,11 +55,22 @@ from dataset import IMAGENET_MEAN, IMAGENET_STD, TianjinSurvivalDataset  # noqa:
 from model import EfficientNetWeibullSurvival  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module1"))
-from apply_to_progression_data import ALL_LESIONS, load_classifier, load_segmentation_model  # noqa: E402
+from apply_to_progression_data import (  # noqa: E402
+    ALL_LESIONS,
+    add_classifier_norm_args,
+    add_seg_inference_args,
+    apply_classifier_norm_args,
+    apply_seg_inference_args,
+    load_classifier,
+    load_segmentation_model,
+)
 from compute_lbs import classify_lbs_stratum, compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tianjin_dataset import _module1_image_id_candidates  # noqa: E402
+from fundus_preprocess import load_module2_image as _fp_load_module2_image  # noqa: E402
+from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa: E402
+from fov_mask import add_cascade_args, cascade_kwargs, check_cascade_args  # noqa: E402
 
 STRATUM_TO_IDX = {"low": 0, "medium": 1, "high": 2}
 
@@ -67,27 +80,16 @@ def denorm(x):
 
 
 def load_module2_image(path, image_size):
-    """Loads an image in Module 2's [-1,1] normalization convention (not Module 3's ImageNet
-    stats) -- this feeds the Generator, matching train_module2_poc.py/evaluate_trajectory.py."""
-    tfm = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ]
-    )
-    img = Image.open(path).convert("RGB")
-    return tfm(img).unsqueeze(0)
+    """[-1, 1] tensor of the image, retina-cropped like the training loaders (fundus_preprocess.py)."""
+    return _fp_load_module2_image(path, image_size)
 
 
-def load_mask(cache, baseline_path, image_size):
+def load_mask(cache, baseline_path, image_size, dataset_dir=None):
     for candidate_id in _module1_image_id_candidates(baseline_path):
         if candidate_id in cache:
-            mask_np = cache[candidate_id]["mask"]
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (image_size, image_size), Image.NEAREST
-            )
-            return torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0).unsqueeze(0)
+            # cropped with the image's own retina box -- needs the openable path (dataset_dir + relative)
+            return _fp_load_module2_mask(cache[candidate_id]["mask"],
+                                         os.path.join(dataset_dir or "", baseline_path), image_size)
     return torch.zeros(1, 1, image_size, image_size)
 
 
@@ -194,10 +196,16 @@ def run(config):
 
     print("\n[1/4] Loading Tianjin survival dataset (source of real progression pairs)...")
     survival_dataset = TianjinSurvivalDataset(
-        config.tianjin_dir, module1_cache_path=config.tianjin_module1_cache, image_size=config.image_size
+        config.tianjin_dir, module1_cache_path=config.tianjin_module1_cache, image_size=config.image_size,
+        min_baseline_grade=config.min_baseline_grade,
     )
     manifest = survival_dataset.manifest
     cache = torch.load(config.tianjin_module1_cache, weights_only=False)
+    if config.exclude_train_from:  # round 4: show patients the Generator never trained on
+        _train = set(str(p) for p in (json.load(open(config.exclude_train_from)).get("split") or {})
+                     .get("train_tianjin_patients") or [])
+        manifest = manifest[~manifest["patient_id"].astype(str).isin(_train)]
+        print(f"  --exclude-train-from: {len(_train)} Generator-training patients left out")
 
     progressing = manifest[manifest["followup_icdr"] > manifest["baseline_icdr"]]
     if len(progressing) == 0:
@@ -209,10 +217,11 @@ def run(config):
     print("\n[2/4] Loading Generator checkpoint and Module 1 classifier/segmentation models...")
     style_dim = config.style_dim or config.c_dim
     G = Generator(
-        conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim
-    ).to(device)
+        conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num, style_dim=style_dim,
+        **arch_kwargs(config.model_arch)[0]).to(device)
     if not config.dry_run:
-        G.load_state_dict(torch.load(config.generator_checkpoint, map_location=device))
+        check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
+        load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
     G.eval()
     classifier, seg_models = load_module1_models(config, device)
 
@@ -245,18 +254,26 @@ def run(config):
     for _, row in selected.iterrows():
         baseline_path = os.path.join(config.tianjin_dir, row["baseline_path"])
         baseline_img = load_module2_image(baseline_path, config.image_size).to(device)
-        mask = load_mask(cache, row["baseline_path"], config.image_size)
+        mask = load_mask(cache, row["baseline_path"], config.image_size, config.tianjin_dir)
 
+        start_stage = int(row["baseline_icdr"])
+        # Default: stop at this patient's real follow-up grade. --end-stage 4 instead projects
+        # every patient forward to PDR (stages beyond the real follow-up have no ground truth).
+        end_stage = config.end_stage if config.end_stage is not None else int(row["followup_icdr"])
+        if end_stage <= start_stage:
+            print(f"  Skipping patient {row['patient_id']}: baseline stage {start_stage} >= end stage {end_stage}")
+            continue
         trajectory = synthesize_trajectory(
             G,
             classifier,
             seg_models,
             baseline_img,
             mask,
-            start_stage=int(row["baseline_icdr"]),
-            end_stage=int(row["followup_icdr"]),
+            start_stage=start_stage,
+            end_stage=end_stage,
             c_dim=config.c_dim,
             device=device,
+            **cascade_kwargs(baseline_img, config),  # rounds 6/7: retina mask, colour match, mode
         )
 
         module3_estimates = {}
@@ -266,8 +283,11 @@ def run(config):
                     module3_model, entry["image"], entry["mask"], entry["stage"], thresholds_by_grade, device
                 )
 
-        out_path = os.path.join(config.out_dir, f"patient_{row['patient_id']}.png")
-        render_patient_figure(row["patient_id"], trajectory, module3_estimates, out_path)
+        # One figure per EYE: a patient can have both eyes in the manifest, and a patient-only
+        # filename made the second eye silently overwrite the first.
+        eye = row["eye"] if "eye" in row and isinstance(row["eye"], str) and row["eye"] in ("OD", "OS") else f"row{_}"
+        out_path = os.path.join(config.out_dir, f"patient_{row['patient_id']}_{eye}.png")
+        render_patient_figure(f"{row['patient_id']} ({eye})", trajectory, module3_estimates, out_path)
         print(f"  ✓ Saved {out_path}")
 
     print(f"\n✓ Wrote {len(selected)} figure(s) to {config.out_dir}")
@@ -295,8 +315,24 @@ if __name__ == "__main__":
     parser.add_argument("--g-repeat-num", type=int, default=6)
     parser.add_argument("--style-dim", type=int, default=None, help="Defaults to c_dim, matching Generator's own default")
     parser.add_argument("--num-patients", type=int, default=4)
+    parser.add_argument("--exclude-train-from", default=None,
+                        help="train_module2_poc.py's poc_results.json: only patients the Generator never trained on")
+    parser.add_argument("--min-baseline-grade", type=int, default=0,
+                        help="1 = only eyes starting at >= mild NPDR (the thesis scope)")
+    parser.add_argument("--end-stage", type=int, default=None,
+                        help="Cascade every patient up to this stage (e.g. 4 = PDR). Omit to stop at "
+                             "each patient's real follow-up grade (the original behaviour).")
+    parser.add_argument("--fov-mask", action="store_true",
+                        help="Round 6: black out each synthesized step outside the baseline's retina circle")
+    add_cascade_args(parser)  # round 7: --fov-erode/--fov-feather/--color-match/--cascade-mode
     parser.add_argument("--out-dir", default="./trajectory_figures/")
+    add_classifier_norm_args(parser)  # --classifier-norm eyepacs for an EyePACS-trained grader
+    add_arch_arg(parser)  # must match the Generator checkpoint's run
+    add_seg_inference_args(parser)
     args = parser.parse_args()
+    check_cascade_args(parser, args)
+    apply_classifier_norm_args(args)
+    apply_seg_inference_args(args)
 
     if not args.dry_run and not args.generator_checkpoint:
         parser.error("--generator-checkpoint is required unless --dry-run is set")

@@ -12,6 +12,14 @@ Each cascade step is a 4-part loop, not a bare repeated generator call:
      check: does the synthesized image read as the target stage to Module 1's own grader?
      Logged, not used to alter generation.
   4. Feed the new image + new mask into the next iteration.
+
+Round 7 options (all off by default = round 6's behaviour):
+  * color_match=True: every step's colours are matched to the REAL baseline (fov_mask.match_color)
+    before it is masked and fed forward -- stops the grey drift along the cascade.
+  * fov_mask may be a shrunk/softened mask (fov_mask.shrink_soften) -- hides the edge bars.
+  * mode="direct": every stage is generated straight from the real baseline (+ its real lesion
+    mask) instead of from the previous synthesized step. An evaluation control: if direct looks
+    clearly better than the cascade, the blur comes from feeding G's own outputs back in.
 """
 import os
 import sys
@@ -23,6 +31,9 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "module1"))
 from apply_to_progression_data import process_image  # noqa: E402
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from fov_mask import finish_step  # noqa: E402
 
 
 def _tensor_to_pil(image_tensor):
@@ -65,7 +76,8 @@ def _module1_predict(image_tensor, classifier, seg_models, device, mask_size):
 
 
 def synthesize_trajectory(generator, classifier, seg_models, baseline_image, baseline_mask,
-                           start_stage, end_stage, c_dim, device):
+                           start_stage, end_stage, c_dim, device, fov_mask=None,
+                           color_match=False, mode="cascade"):
     """
     Generates a full stage-by-stage trajectory from start_stage to end_stage (see module
     docstring for the per-step loop).
@@ -85,6 +97,15 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
         end_stage: int, the final stage to synthesize up to (inclusive). Must be > start_stage.
         c_dim: number of stages (5 for ICDR 0-4), matching the Generator's own c_dim.
         device: torch device to run inference on.
+        fov_mask: optional [1, 1, H, W] {0,1} retina mask of the REAL baseline (round 6,
+            fov_mask.fov_mask). When given, every synthesized step is blacked out outside it, so
+            the retina keeps the baseline's circle through the whole cascade instead of drifting
+            or growing edge artifacts from step to step. None = the Generator's raw output.
+            Round 7: may be soft (values in [0, 1], fov_mask.shrink_soften) -- the edge fades to black.
+        color_match: round 7 -- match every step's per-channel colour statistics to the real
+            baseline's (inside the retina) before masking and feeding it forward.
+        mode: "cascade" (default) feeds each synthesized step into the next; "direct" (round 7
+            control) generates every stage from the real baseline image + mask instead.
 
     Returns:
         list of dicts, one per stage from start_stage (the real baseline) through end_stage,
@@ -103,11 +124,15 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
         )
     if end_stage >= c_dim:
         raise ValueError(f"end_stage ({end_stage}) must be < c_dim ({c_dim}).")
+    if mode not in ("cascade", "direct"):
+        raise ValueError(f"mode must be 'cascade' or 'direct', got {mode!r}")
 
     generator.eval()
     mask_size = baseline_mask.shape[-1]
     baseline_image = baseline_image.to(device)
     baseline_mask = baseline_mask.to(device)
+    if fov_mask is not None:
+        fov_mask = fov_mask.to(device)
 
     trajectory = [
         {
@@ -126,6 +151,8 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
             c_target[0, stage] = 1.0
             x = torch.cat([current_image, current_mask], dim=1)
             synthesized = generator(x, c_target)
+            # colour-matched to the real baseline (round 7, optional), black outside its retina (round 6)
+            synthesized = finish_step(synthesized, baseline_image, fov_mask, color_match)
 
             predicted_grade, grade_probs, new_mask = _module1_predict(
                 synthesized, classifier, seg_models, device, mask_size
@@ -140,7 +167,9 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
                 "consistency": consistent,
                 "grade_probs": grade_probs,
             })
-            current_image, current_mask = synthesized, new_mask
+            if mode == "cascade":
+                current_image, current_mask = synthesized, new_mask
+            # mode == "direct": current_* stay the real baseline image and mask
 
     return trajectory
 

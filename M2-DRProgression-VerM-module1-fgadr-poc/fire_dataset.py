@@ -11,6 +11,40 @@ from PIL import Image
 import numpy as np
 from pathlib import Path
 
+from fundus_preprocess import crop_mask, load_fundus, mask_to_tensor, retina_crop_enabled
+
+
+def module1_grade_onehot(module1_output, num_stages=5, placeholder=2):
+    """One-hot of a Module 1 cache entry's predicted grade; the Stage-2 placeholder if None."""
+    onehot = torch.zeros(num_stages)
+    onehot[int(module1_output['grade']) if module1_output is not None else placeholder] = 1.0
+    return onehot
+
+
+def load_registration_cache(path, image_size):
+    """module1/train_registration.py's cache ({(source, baseline_path): CHW uint8}), checked to hold
+    images at this image_size -- warps made at another size would be silently resized (item 4.3)."""
+    cache = torch.load(path, weights_only=False)
+    first = next((v for v in cache.values() if v is not None), None)
+    if first is not None and first.shape[-1] != image_size:
+        raise ValueError(f"Registration cache {path} holds {first.shape[-1]} px images but image_size is "
+                         f"{image_size} -- re-run module1/train_registration.py --image-size {image_size}.")
+    n_dropped = sum(v is None for v in cache.values())
+    print(f"✓ Loaded registration cache: {len(cache) - n_dropped} pairs ({path})"
+          + (f" -- {n_dropped} pairs SIFT couldn't align are left out of training" if n_dropped else ""))
+    return cache
+
+
+def registration_dropped(cache, source_name, baseline_path):
+    """True when the registration cache marks this pair as dropped (a SIFT failure, value None; round 5).
+    A pair missing from the cache is NOT dropped -- it just uses its raw follow-up, as before."""
+    return bool(cache) and (source_name, baseline_path) in cache and cache[(source_name, baseline_path)] is None
+
+
+def report_registration_drops(source_name, n_before, n_after):
+    if n_after < n_before:
+        print(f"  {source_name}: left out {n_before - n_after} pairs SIFT couldn't align -> {n_after} pairs")
+
 
 class FIREDataset(Dataset):
     """
@@ -27,7 +61,7 @@ class FIREDataset(Dataset):
     SOURCE_NAME = "FIRE"
 
     def __init__(self, fire_dir, image_size=128, category='A', module1_cache_path=None,
-                 registration_cache_path=None):
+                 registration_cache_path=None, condition_on='followup', retina_crop=None):
         """
         Args:
             fire_dir: Path to FIRE_dataset folder
@@ -45,10 +79,21 @@ class FIREDataset(Dataset):
                 baseline-aligned follow-up image is used instead of the raw one. Falls back to
                 the raw follow-up image for any pair not in the cache (or if no cache_path is
                 given at all).
+            condition_on: 'followup' (default, CODE_FIXES item 2.2) -- target_grade = Module 1's
+                predicted grade of the FOLLOW-UP image (the stage the Generator must produce; the
+                cache holds both visits), falling back to the baseline's and then to the Stage-2
+                placeholder if missing; 'baseline' -- the earlier behaviour, Module 1's grade of
+                the baseline image. Either way it is a predicted grade, so grade_is_real=False.
+            retina_crop: crop each image to its square retina box before resizing
+                (fundus_preprocess.py); None = DRP_RETINA_CROP (on by default).
         """
+        if condition_on not in ('followup', 'baseline'):
+            raise ValueError(f"condition_on must be 'followup' or 'baseline', not {condition_on!r}")
+        self.condition_on = condition_on
         self.fire_dir = fire_dir
         self.image_size = image_size
         self.category = category
+        self.retina_crop = retina_crop_enabled() if retina_crop is None else retina_crop
 
         self.module1_cache = None
         if module1_cache_path:
@@ -57,11 +102,14 @@ class FIREDataset(Dataset):
 
         self.registration_cache = None
         if registration_cache_path:
-            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
-            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
+            self.registration_cache = load_registration_cache(registration_cache_path, image_size)
 
         # Find all image pairs in the specified category
         self.pairs = self._find_pairs()
+        if self.registration_cache:
+            _n = len(self.pairs)
+            self.pairs = [p for p in self.pairs if not registration_dropped(self.registration_cache, self.SOURCE_NAME, p[0])]
+            report_registration_drops(self.SOURCE_NAME, _n, len(self.pairs))
 
         print(f"✓ Found {len(self.pairs)} pairs in FIRE Category {category}")
         
@@ -130,16 +178,17 @@ class FIREDataset(Dataset):
         """Returns (baseline_image, follow_up_image, dummy_mask, target_grade)"""
         img1_path, img2_path = self.pairs[idx]
         
-        # Load images
-        img1 = Image.open(img1_path).convert('RGB')
+        # Load images (cropped to the retina, fundus_preprocess.py)
+        img1, box1, size1 = load_fundus(img1_path, self.retina_crop)
 
         # Use the pre-registered (baseline-aligned) follow-up image if a registration cache
         # was supplied and has an entry for this pair, else fall back to the raw follow-up image.
+        # The cached warp is already in the loader's (cropped, image_size) frame.
         warped = self.registration_cache.get((self.SOURCE_NAME, img1_path)) if self.registration_cache else None
         if warped is not None:
             img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
         else:
-            img2 = Image.open(img2_path).convert('RGB')
+            img2, _box2, _size2 = load_fundus(img2_path, self.retina_crop)
 
         img1 = self.transform(img1)
         img2 = self.transform(img2)
@@ -149,31 +198,26 @@ class FIREDataset(Dataset):
         # otherwise -- FIRE has no ground-truth grade/mask of its own either way.
         image_id = Path(img1_path).stem
         module1_output = self.module1_cache.get(image_id) if self.module1_cache else None
+        followup_output = self.module1_cache.get(Path(img2_path).stem) if self.module1_cache else None
 
         if module1_output is not None:
-            mask_np = module1_output['mask']
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (self.image_size, self.image_size), Image.NEAREST
-            )
-            mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
-
-            target_grade = torch.zeros(5)
-            target_grade[int(module1_output['grade'])] = 1.0
+            mask = mask_to_tensor(crop_mask(module1_output['mask'], box1, size1), self.image_size)
         else:
             # FIRE doesn't have lesion masks, so use empty mask
             # In real training, you'd run Module 1 to generate masks
             mask = torch.zeros(1, self.image_size, self.image_size)
 
-            # FIRE doesn't have severity labels, so use random grade for conditioning
-            # In real training, Module 1 would assign labels
-            target_grade = torch.zeros(5)  # 5 stages
-            target_grade[2] = 1.0  # Default to Stage 2 (Moderate)
+        # FIRE has no severity labels: Module 1's predicted grades, else the Stage-2 placeholder.
+        source_grade = module1_grade_onehot(module1_output)
+        target_grade = module1_grade_onehot(
+            followup_output if self.condition_on == 'followup' and followup_output is not None else module1_output)
 
         return {
             'baseline': img1,
             'follow_up': img2,
             'mask': mask,
             'target_grade': target_grade,
+            'source_grade': source_grade,
             # Matches LongDRScreeningDataset's return keys so ConcatDataset batches that mix
             # samples from both datasets collate correctly (default_collate requires every
             # sample dict in a batch to have the same keys) -- see combined_dataset.py.

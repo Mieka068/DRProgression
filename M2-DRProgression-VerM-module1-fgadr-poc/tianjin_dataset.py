@@ -23,6 +23,19 @@ Expected directory layout, rooted at `dataset_dir`:
     Organized_Data of Patients.xlsx
     corrected_manifest.csv
 
+Conditioning (CODE_FIXES item 2.1): `target_grade` is the stage the Generator is asked to produce.
+At inference (DRForestGAN-v2/trajectory_inference.py) that is the stage of the NEXT image, so by
+default (condition_on="followup") target_grade is the eye's grade on the "2 year follow-up" sheet
+-- what the real follow-up image shows -- as in DRForecastGAN's own solver.py, which conditions on
+the target label. The baseline grade is returned as `source_grade`, and `progressed`
+(follow-up > baseline) feeds combined_dataset.py's oversampling (item 2.4). condition_on="baseline"
+is the earlier behaviour (target_grade = the baseline grade, i.e. "the eye's current stage").
+Rows with a follow-up grade of 6/7 (after laser / missing) are dropped like baseline 6/7; a row with
+no follow-up grade at all keeps its baseline grade as target with grade_is_real=False.
+
+Stage 0 (item 7.2): min_baseline_grade=1 keeps only eyes that start at >= mild NPDR (the
+manuscript's scope); the default 0 keeps every baseline grade.
+
 Grade scale: the grade column's embedded legend reads "1=No Apparent Retinopathy; 2=Mild
 NPDR; 3=Moderate NPDR; 4=Severe NPDR; 5=PDR; 6=After laser; 7=Missing" -- a 1-indexed ICDR
 5-stage ordering, mapped to ICDR 0-4 by subtracting 1. Grades 6 (post-photocoagulation) and 7
@@ -62,6 +75,9 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from fire_dataset import load_registration_cache, registration_dropped, report_registration_drops
+from fundus_preprocess import crop_mask, load_fundus, mask_to_tensor, retina_crop_enabled
+
 EXCLUDED_GRADES = {6, 7}  # post-photocoagulation, ungradable
 NUM_STAGES = 5  # ICDR 0-4, matching target_grade elsewhere in this repo
 BASELINE_SUBDIR = "baseline fundus images"
@@ -71,6 +87,13 @@ FOLLOWUP_SUBDIR = "2 year follow-up fundus images"
 def tianjin_grade_to_icdr(raw_grade: int) -> int:
     """ETDRS-labeled 1-5 -> ICDR 0-4, by subtracting 1."""
     return raw_grade - 1
+
+
+def _to_icdr(raw_grade):
+    """Raw xlsx grade -> ICDR 0-4 (float, so NaN can pass through); NaN/excluded -> NaN."""
+    if pd.isna(raw_grade) or int(raw_grade) in EXCLUDED_GRADES:
+        return np.nan
+    return float(np.clip(tianjin_grade_to_icdr(int(raw_grade)), 0, NUM_STAGES - 1))
 
 
 def _normalize_colname(name: str) -> str:
@@ -157,6 +180,9 @@ class TianjinLongitudinalDataset(Dataset):
         min_pair_quality=None,
         module1_cache_path=None,
         registration_cache_path=None,
+        condition_on="followup",
+        min_baseline_grade=0,
+        retina_crop=None,
     ):
         """
         Args:
@@ -178,9 +204,20 @@ class TianjinLongitudinalDataset(Dataset):
                 module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
                 Substitutes a pre-registered follow-up image when present, otherwise the raw
                 follow-up image is used.
+            condition_on: "followup" (default) -- target_grade = the follow-up grade (the stage
+                the Generator must produce); "baseline" -- the earlier behaviour, target_grade =
+                the baseline grade. See the module docstring.
+            min_baseline_grade: drop eye-pairs whose baseline ICDR grade is below this (1 =
+                exclude Stage 0 baselines, item 7.2). 0 keeps every grade.
+            retina_crop: crop to the square retina box before resizing (fundus_preprocess.py;
+                Tianjin's 3:2 photos were squashed into ovals); None = DRP_RETINA_CROP (on).
         """
+        if condition_on not in ("followup", "baseline"):
+            raise ValueError(f"condition_on must be 'followup' or 'baseline', not {condition_on!r}")
+        self.condition_on = condition_on
         self.dataset_dir = dataset_dir
         self.image_size = image_size
+        self.retina_crop = retina_crop_enabled() if retina_crop is None else retina_crop
 
         self.module1_cache = None
         if module1_cache_path:
@@ -189,8 +226,7 @@ class TianjinLongitudinalDataset(Dataset):
 
         self.registration_cache = None
         if registration_cache_path:
-            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
-            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
+            self.registration_cache = load_registration_cache(registration_cache_path, image_size)
 
         manifest_path = os.path.join(dataset_dir, "corrected_manifest.csv")
         if not os.path.isfile(manifest_path):
@@ -208,6 +244,10 @@ class TianjinLongitudinalDataset(Dataset):
             before = len(manifest)
             manifest = manifest[manifest["quality"] >= min_pair_quality]
             print(f"  Quality filter (>= {min_pair_quality}): {before} -> {len(manifest)} pairs")
+        # Round 5: every patient that could reach Module 2 training, before the laterality / grade filters
+        # and the SIFT drop (all of which can differ between rounds) -- poc_results.json records them as
+        # split.module2_tianjin_patients, for a round-vs-round evaluation on patients NO round trained on.
+        self.candidate_patient_ids = sorted(set(manifest["patient_id"].astype(str).str.strip()))
 
         # Resolve which eye each manifest row is via module1/resolve_eye_laterality.py's
         # precomputed output -- required, since corrected_manifest.csv has no OD/OS marker.
@@ -226,17 +266,24 @@ class TianjinLongitudinalDataset(Dataset):
 
         grades = self._load_grades(dataset_dir)
         manifest = manifest.merge(grades, on="patient_id", how="left")
+        if "followup_od_grade_raw" not in manifest:
+            if condition_on == "followup":
+                raise KeyError("condition_on='followup' needs the '2 year follow-up' sheet of Organized_Data of "
+                               "Patients.xlsx (none found) -- or pass condition_on='baseline'.")
+            for c in ("followup_od_grade_raw", "followup_os_grade_raw", "followup_worse_eye_grade_raw"):
+                manifest[c] = np.nan
 
         def _pick_grade(row):
             if row["eye"] == "OD":
-                return row["od_grade_raw"], True
+                return row["od_grade_raw"], row["followup_od_grade_raw"], True
             if row["eye"] == "OS":
-                return row["os_grade_raw"], True
-            return row["worse_eye_grade_raw"], False
+                return row["os_grade_raw"], row["followup_os_grade_raw"], True
+            return row["worse_eye_grade_raw"], row["followup_worse_eye_grade_raw"], False
 
         picked = manifest.apply(_pick_grade, axis=1, result_type="expand")
         manifest["dr_grade_raw"] = picked[0]
-        manifest["grade_is_eye_specific"] = picked[1]
+        manifest["dr_grade_followup_raw"] = picked[1]
+        manifest["grade_is_eye_specific"] = picked[2]
         n_eye_specific = int(manifest["grade_is_eye_specific"].sum())
         print(f"  Eye-specific grade resolved for {n_eye_specific}/{len(manifest)} rows "
               f"({len(manifest) - n_eye_specific} fell back to the worse-eye summary)")
@@ -253,8 +300,28 @@ class TianjinLongitudinalDataset(Dataset):
         # placeholder-Stage-2 treatment as FIRE/LongDR.
         before = len(manifest)
         manifest = manifest[~manifest["dr_grade_raw"].isin(EXCLUDED_GRADES)]
-        print(f"  Excluded grades {EXCLUDED_GRADES}: {before} -> {len(manifest)} pairs")
+        if condition_on == "followup":
+            manifest = manifest[~manifest["dr_grade_followup_raw"].isin(EXCLUDED_GRADES)]
+        print(f"  Excluded grades {EXCLUDED_GRADES} (baseline"
+              + (" or follow-up" if condition_on == "followup" else "") + f"): {before} -> {len(manifest)} pairs")
 
+        base_icdr = manifest["dr_grade_raw"].map(_to_icdr)
+        fu_icdr = manifest["dr_grade_followup_raw"].map(_to_icdr)
+        manifest["progressed"] = (fu_icdr > base_icdr).fillna(False).astype(bool)
+        if min_baseline_grade > 0:
+            before = len(manifest)
+            keep = base_icdr >= min_baseline_grade  # NaN (no baseline grade) -> dropped too
+            manifest = manifest[keep]
+            print(f"  Baseline grade >= {min_baseline_grade} (min_baseline_grade): {before} -> {len(manifest)} pairs")
+        n_fu = int(manifest["dr_grade_followup_raw"].notna().sum())
+        print(f"  Conditioning on the {condition_on} grade | {n_fu}/{len(manifest)} pairs have a follow-up "
+              f"grade, {int(manifest['progressed'].sum())} progressed (follow-up > baseline)")
+
+        if self.registration_cache:
+            _n = len(manifest)
+            manifest = manifest[[not registration_dropped(self.registration_cache, self.SOURCE_NAME, b)
+                                 for b in manifest["baseline_path"]]]
+            report_registration_drops(self.SOURCE_NAME, _n, len(manifest))
         self.manifest = manifest.reset_index(drop=True)
         print(f"✓ Found {len(self.manifest)} pairs in Tianjin dataset "
               f"({self.manifest['dr_grade_raw'].notna().sum()} with real grade)")
@@ -273,7 +340,9 @@ class TianjinLongitudinalDataset(Dataset):
         Reads the Baseline sheet of Organized_Data of Patients.xlsx and returns a
         (patient_id, os_grade_raw, od_grade_raw, worse_eye_grade_raw) frame -- one row per
         patient, since the xlsx has separate per-eye grade columns rather than one flat "DR
-        grade" column. Per-eye selection for a specific manifest row happens in __init__,
+        grade" column. If the workbook has a follow-up sheet (name containing "follow"), its
+        grades are merged in as followup_os/od/worse_eye_grade_raw (same column matching as
+        module3/dataset.py). Per-eye selection for a specific manifest row happens in __init__,
         using the resolved 'eye' column from module1/resolve_eye_laterality.py's
         laterality_resolved.csv.
 
@@ -293,6 +362,18 @@ class TianjinLongitudinalDataset(Dataset):
                 f"No sheet name containing 'baseline' found in {xlsx_path}. Actual sheets: "
                 f"{xl.sheet_names}."
             )
+        base = TianjinLongitudinalDataset._parse_grade_sheet(xl, sheet_name, "")
+        fu_sheet = next((s for s in xl.sheet_names if "follow" in _normalize_colname(s)), None)
+        if fu_sheet is None:
+            print(f"  No follow-up sheet in {xlsx_path} (sheets: {xl.sheet_names})")
+            return base
+        return base.merge(TianjinLongitudinalDataset._parse_grade_sheet(xl, fu_sheet, "followup_"),
+                          on="patient_id", how="left")
+
+    @staticmethod
+    def _parse_grade_sheet(xl, sheet_name, prefix) -> pd.DataFrame:
+        """One sheet -> (patient_id, <prefix>os_grade_raw, <prefix>od_grade_raw,
+        <prefix>worse_eye_grade_raw), one row per patient."""
         df = xl.parse(sheet_name)
 
         try:
@@ -310,16 +391,12 @@ class TianjinLongitudinalDataset(Dataset):
         print(f"  Reading grades from sheet '{sheet_name}': patient_id <- '{id_col}', "
               f"OS <- '{os_col}', OD <- '{od_col}', worse-eye <- '{worse_col}'")
 
-        df = df.rename(columns={
-            id_col: "patient_id", os_col: "os_grade_raw", od_col: "od_grade_raw",
-            worse_col: "worse_eye_grade_raw",
-        })
+        cols = [prefix + c for c in ("os_grade_raw", "od_grade_raw", "worse_eye_grade_raw")]
+        df = df.rename(columns={id_col: "patient_id", os_col: cols[0], od_col: cols[1], worse_col: cols[2]})
         df["patient_id"] = df["patient_id"].astype(str).str.strip()
-        for c in ("os_grade_raw", "od_grade_raw", "worse_eye_grade_raw"):
+        for c in cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df[["patient_id", "os_grade_raw", "od_grade_raw", "worse_eye_grade_raw"]].drop_duplicates(
-            subset="patient_id"
-        )
+        return df[["patient_id"] + cols].drop_duplicates(subset="patient_id")
 
     def __len__(self):
         return len(self.manifest)
@@ -331,7 +408,7 @@ class TianjinLongitudinalDataset(Dataset):
         followup_path = os.path.join(self.dataset_dir, row["followup_path"])
 
         try:
-            img1 = Image.open(baseline_path).convert("RGB")
+            img1, box1, size1 = load_fundus(baseline_path, self.retina_crop)
             warped = (
                 self.registration_cache.get((self.SOURCE_NAME, row["baseline_path"]))
                 if self.registration_cache
@@ -340,7 +417,7 @@ class TianjinLongitudinalDataset(Dataset):
             if warped is not None:
                 img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
             else:
-                img2 = Image.open(followup_path).convert("RGB")
+                img2, _box2, _size2 = load_fundus(followup_path, self.retina_crop)
         except Exception:
             return self.__getitem__((idx + 1) % len(self.manifest))
 
@@ -355,23 +432,24 @@ class TianjinLongitudinalDataset(Dataset):
                     break
 
         if module1_output is not None:
-            mask_np = module1_output["mask"]
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (self.image_size, self.image_size), Image.NEAREST
-            )
-            mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
+            mask = mask_to_tensor(crop_mask(module1_output["mask"], box1, size1), self.image_size)
         else:
             mask = torch.zeros(1, self.image_size, self.image_size)
 
-        raw_grade = row["dr_grade_raw"]
+        base_icdr = _to_icdr(row["dr_grade_raw"])
+        fu_icdr = _to_icdr(row["dr_grade_followup_raw"])
+        source_grade = torch.zeros(NUM_STAGES)
+        source_grade[2 if pd.isna(base_icdr) else int(base_icdr)] = 1.0  # Stage-2 placeholder if ungraded
+        # target = the stage the Generator must produce (follow-up grade by default, see docstring).
+        target_icdr = fu_icdr if self.condition_on == "followup" else base_icdr
+        grade_is_real = pd.notna(target_icdr)
+        if not grade_is_real and self.condition_on == "followup":
+            target_icdr = base_icdr  # no follow-up grade: most eyes don't change in 2 years
         target_grade = torch.zeros(NUM_STAGES)
-        if pd.notna(raw_grade):
-            icdr_grade = int(np.clip(tianjin_grade_to_icdr(int(raw_grade)), 0, NUM_STAGES - 1))
-            target_grade[icdr_grade] = 1.0
-            grade_is_real = True
+        if pd.notna(target_icdr):
+            target_grade[int(target_icdr)] = 1.0
         else:
             target_grade[2] = 1.0  # same Stage-2 placeholder convention as FIRE/LongDR
-            grade_is_real = False
 
         return {
             "baseline": img1,
@@ -380,7 +458,9 @@ class TianjinLongitudinalDataset(Dataset):
             "target_grade": target_grade,
             "source": "Tianjin",
             "eye_id": row["patient_id"],
-            "grade_is_real": grade_is_real,
+            "grade_is_real": bool(grade_is_real),
+            "source_grade": source_grade,
+            "progressed": bool(row["progressed"]),
             "patient_id": row["patient_id"],
             "pair_quality": float(row["quality"]) if "quality" in row and pd.notna(row["quality"]) else -1.0,
             "grade_is_eye_specific": bool(row["grade_is_eye_specific"]) if "grade_is_eye_specific" in row else False,
@@ -393,17 +473,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", default="./retinal-dr-longitudinal")
     parser.add_argument("--min-quality", type=float, default=None)
+    parser.add_argument("--condition-on", choices=["followup", "baseline"], default="followup")
+    parser.add_argument("--min-baseline-grade", type=int, default=0)
     args = parser.parse_args()
 
     print("=" * 70)
     print("Testing Tianjin Longitudinal Data Loader")
     print("=" * 70)
 
-    dataset = TianjinLongitudinalDataset(args.dataset_dir, image_size=128, min_pair_quality=args.min_quality)
+    dataset = TianjinLongitudinalDataset(args.dataset_dir, image_size=128, min_pair_quality=args.min_quality,
+                                         condition_on=args.condition_on, min_baseline_grade=args.min_baseline_grade)
     print(f"\nTotal pairs: {len(dataset)}")
     sample = dataset[0]
     print(f"  Baseline shape: {sample['baseline'].shape}")
     print(f"  Follow-up shape: {sample['follow_up'].shape}")
-    print(f"  Target grade: {sample['target_grade']} (real={sample['grade_is_real']})")
+    print(f"  Target grade: {sample['target_grade']} (real={sample['grade_is_real']}), "
+          f"source grade: {sample['source_grade']}, progressed: {sample['progressed']}")
     print(f"  Patient ID: {sample['patient_id']}")
     print("\n✓ Tianjin loader working!")

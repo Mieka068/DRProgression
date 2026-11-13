@@ -11,13 +11,24 @@ own (assumed feature=2048) numbers away for stability, which is the wrong trade.
 
   1. Always compute FID at feature=2048 (comparable to DRForecastGAN's own reported numbers),
      never fall back to feature=64 to make it look more stable.
-  2. Report a bootstrap-resampled FID range alongside the point estimate: resample the eval
-     set with replacement n_bootstrap times and take the 2.5th/97.5th percentile of the
-     resulting FID values. A wide range is itself an honest, reportable finding at POC scale,
-     not something to hide by only reporting the point estimate.
+  2. Report a resampled FID range alongside the point estimate (2.5th/97.5th percentile over
+     n_bootstrap resamples). A wide range is itself an honest, reportable finding at POC scale,
+     not something to hide by only reporting the point estimate. Default (CODE_FIXES item 5.5):
+     SUBSAMPLING without replacement (subsample_fraction of the images, real and fake
+     separately). The earlier with-replacement bootstrap duplicates images, which shrinks the
+     sample's diversity and inflates FID, so its range could sit entirely above the point
+     estimate (e.g. 233.7 vs [235.8, 243.2]). Subsampled FID still runs a little high (fewer
+     images), so read the range as the spread at subsample_fraction x N, not a confidence
+     interval for the point estimate; KID +/- std is the sample-size-robust number.
+     fid_range_method says which was used; range_method="bootstrap" is the earlier behaviour.
   3. Report Kernel Inception Distance (KID) as a supplementary, sample-size-robust (unbiased
      at any N) complement -- NOT a substitute for the FID comparison, since DRForecastGAN's
      paper reports FID, not KID.
+
+  4. Round 4 (item R4-2.6): separate gates. FID needs n >= min_n_for_fid (50) -- at n = 38 the
+     round-3 step-2 point estimate (224.8) even fell outside its own subsample range (228.7-237.7).
+     KID, unbiased at any n, is computed from n >= min_n_for_kid (10) and is the PRIMARY number to
+     report ('primary_metric' says so); always report n_samples next to either.
 
 Used by both train_module2_poc.py (single-step POC metrics) and evaluate_trajectory.py
 (per-cascade-step and self-consistency metrics), so this same honest-uncertainty treatment
@@ -27,7 +38,8 @@ import numpy as np
 
 
 def compute_fid_kid_stats(real_imgs, fake_imgs, device, feature=2048, min_n_for_fid=50,
-                           n_bootstrap=10, kid_subset_size=None, bootstrap_seed=0):
+                           n_bootstrap=10, kid_subset_size=None, bootstrap_seed=0,
+                           range_method="subsample", subsample_fraction=0.8, min_n_for_kid=10):
     """
     real_imgs, fake_imgs: lists of [1,3,H,W] CPU or device tensors in [0,1] range (already
     denormalized). FID/KID are unpaired distributional comparisons -- real_imgs[i] need not
@@ -38,8 +50,9 @@ def compute_fid_kid_stats(real_imgs, fake_imgs, device, feature=2048, min_n_for_
       fid: float or None (point estimate on the full set; None if n_samples < min_n_for_fid,
         or torchmetrics/torch-fidelity isn't installed)
       fid_bootstrap_range: [low, high] or None (2.5th/97.5th percentile FID across
-        n_bootstrap with-replacement resamples of the full set; None under the same gates as
-        fid, or if fewer than 2 resamples computed without error)
+        n_bootstrap resamples -- subsamples without replacement by default, see point 2 above;
+        None under the same gates as fid, or if fewer than 2 resamples computed without error)
+      fid_range_method: "subsample (<fraction>, without replacement)" or "bootstrap (with replacement)"
       kid_mean, kid_std: float or None (torchmetrics' own KID mean/std estimate across its
         internal subsets; None under the same n_samples gate, or on any KID-specific failure)
       note: str or None, explains any None fields
@@ -47,15 +60,21 @@ def compute_fid_kid_stats(real_imgs, fake_imgs, device, feature=2048, min_n_for_
     n_samples = min(len(real_imgs), len(fake_imgs))
     result = {
         "n_samples": n_samples, "fid": None, "fid_bootstrap_range": None,
-        "kid_mean": None, "kid_std": None, "note": None,
+        "fid_range_method": (f"subsample ({subsample_fraction:g}, without replacement)"
+                             if range_method == "subsample" else "bootstrap (with replacement)"),
+        "kid_mean": None, "kid_std": None, "note": None, "primary_metric": "kid",
     }
-    if n_samples < min_n_for_fid:
+    if n_samples < min(min_n_for_fid, min_n_for_kid):
         result["note"] = (
-            f"n_samples ({n_samples}) < min_n_for_fid ({min_n_for_fid}) -- FID/KID are "
+            f"n_samples ({n_samples}) < {min(min_n_for_fid, min_n_for_kid)} -- FID/KID are "
             "distributional metrics unreliable on this few samples, omitted rather than "
             "reported misleadingly."
         )
         return result
+    do_fid = n_samples >= min_n_for_fid
+    if not do_fid:
+        result["note"] = (f"n_samples ({n_samples}) < min_n_for_fid ({min_n_for_fid}) -- FID omitted "
+                          "(biased at small n); KID reported.")
 
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
@@ -71,13 +90,18 @@ def compute_fid_kid_stats(real_imgs, fake_imgs, device, feature=2048, min_n_for_
             m.update(img.to(device), real=False)
         return float(m.compute())
 
-    result["fid"] = _fid_on(real_imgs, fake_imgs)
+    if do_fid:
+        result["fid"] = _fid_on(real_imgs, fake_imgs)
 
     rng = np.random.default_rng(bootstrap_seed)
     bootstrap_vals = []
-    for _ in range(n_bootstrap):
-        real_idx = rng.integers(0, len(real_imgs), size=len(real_imgs))
-        fake_idx = rng.integers(0, len(fake_imgs), size=len(fake_imgs))
+    for _ in range(n_bootstrap if do_fid else 0):
+        if range_method == "subsample":
+            real_idx = rng.choice(len(real_imgs), size=max(2, int(len(real_imgs) * subsample_fraction)), replace=False)
+            fake_idx = rng.choice(len(fake_imgs), size=max(2, int(len(fake_imgs) * subsample_fraction)), replace=False)
+        else:
+            real_idx = rng.integers(0, len(real_imgs), size=len(real_imgs))
+            fake_idx = rng.integers(0, len(fake_imgs), size=len(fake_imgs))
         try:
             bootstrap_vals.append(_fid_on([real_imgs[i] for i in real_idx], [fake_imgs[i] for i in fake_idx]))
         except Exception:

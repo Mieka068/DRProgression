@@ -17,6 +17,10 @@ import numpy as np
 from pathlib import Path
 import re
 
+from fire_dataset import (load_registration_cache, module1_grade_onehot, registration_dropped,
+                          report_registration_drops)
+from fundus_preprocess import crop_mask, load_fundus, longdr_folder, mask_to_tensor, retina_crop_enabled
+
 
 class LongDRScreeningDataset(Dataset):
     """
@@ -30,13 +34,19 @@ class LongDRScreeningDataset(Dataset):
     
     SOURCE_NAME = "LongDRScreening"
 
-    def __init__(self, dataset_dir, image_size=128, use_normalized=True, module1_cache_path=None,
-                 registration_cache_path=None):
+    def __init__(self, dataset_dir, image_size=128, use_normalized=None, module1_cache_path=None,
+                 registration_cache_path=None, condition_on='followup', retina_crop=None):
         """
         Args:
             dataset_dir: Path to LongDRScreening_20150209 folder
             image_size: Resize images to this size
-            use_normalized: Use FundusImagesNormalized (recommended) or FundusImagesColor
+            use_normalized: True = FundusImagesNormalized (the earlier runs), False =
+                FundusImagesColor, None (default) = DRP_LONGDR_FOLDER (fundus_preprocess.py;
+                FundusImagesColor unless set). Round 4 (item R4-1.1): Module 1's lesion segmenters,
+                trained on raw colour photos, marked ~10-30 % of a normal retina as lesion on the
+                contrast-normalised images, and the normalised colours differed from every other
+                source's -- use the colour images, and the SAME folder for the Module 1 cache.
+            retina_crop: crop to the square retina box before resizing; None = DRP_RETINA_CROP.
             module1_cache_path: Optional path to a cache produced by
                 module1/apply_to_progression_data.py ({image_id: {grade, mask, lbs}}), keyed
                 as "<eye_folder>__<baseline_filename_stem>" to match that script's recursive
@@ -44,9 +54,15 @@ class LongDRScreeningDataset(Dataset):
             registration_cache_path: Optional path to a cache produced by
                 module1/train_registration.py ({(source, baseline_path): warped_followup_uint8}).
                 Same fallback behavior as FIREDataset -- see its docstring.
+            condition_on: 'followup' (default) / 'baseline' -- which visit's Module 1 grade is
+                target_grade, as in FIREDataset (see its docstring).
         """
+        if condition_on not in ('followup', 'baseline'):
+            raise ValueError(f"condition_on must be 'followup' or 'baseline', not {condition_on!r}")
+        self.condition_on = condition_on
         self.dataset_dir = dataset_dir
         self.image_size = image_size
+        self.retina_crop = retina_crop_enabled() if retina_crop is None else retina_crop
 
         self.module1_cache = None
         if module1_cache_path:
@@ -55,11 +71,12 @@ class LongDRScreeningDataset(Dataset):
 
         self.registration_cache = None
         if registration_cache_path:
-            self.registration_cache = torch.load(registration_cache_path, weights_only=False)
-            print(f"✓ Loaded registration cache: {len(self.registration_cache)} pairs ({registration_cache_path})")
+            self.registration_cache = load_registration_cache(registration_cache_path, image_size)
 
         # Choose which folder to use
-        folder_name = 'FundusImagesNormalized' if use_normalized else 'FundusImagesColor'
+        folder_name = (longdr_folder() if use_normalized is None
+                       else 'FundusImagesNormalized' if use_normalized else 'FundusImagesColor')
+        self.folder_name = folder_name
         self.images_dir = os.path.join(dataset_dir, folder_name)
         
         if not os.path.exists(self.images_dir):
@@ -67,6 +84,11 @@ class LongDRScreeningDataset(Dataset):
         
         # Find all valid pairs
         self.pairs = self._find_pairs()
+        if self.registration_cache:
+            _n = len(self.pairs)
+            self.pairs = [p for p in self.pairs
+                          if not registration_dropped(self.registration_cache, self.SOURCE_NAME, p['baseline'])]
+            report_registration_drops(self.SOURCE_NAME, _n, len(self.pairs))
         
         print(f"✓ Found {len(self.pairs)} pairs in LongDRScreening ({folder_name})")
         
@@ -126,13 +148,13 @@ class LongDRScreeningDataset(Dataset):
         
         # Load images
         try:
-            img1 = Image.open(pair['baseline']).convert('RGB')
+            img1, box1, size1 = load_fundus(pair['baseline'], self.retina_crop)
             warped = self.registration_cache.get((self.SOURCE_NAME, pair['baseline'])) if self.registration_cache else None
             if warped is not None:
-                # Pre-registered (baseline-aligned) follow-up image.
+                # Pre-registered (baseline-aligned) follow-up image, already in the loader's frame.
                 img2 = Image.fromarray(np.transpose(warped, (1, 2, 0)))  # CHW uint8 -> HWC for PIL
             else:
-                img2 = Image.open(pair['follow_up']).convert('RGB')
+                img2, _box2, _size2 = load_fundus(pair['follow_up'], self.retina_crop)
         except Exception as e:
             # If image fails to load, return next valid pair
             return self.__getitem__((idx + 1) % len(self.pairs))
@@ -145,31 +167,28 @@ class LongDRScreeningDataset(Dataset):
         # identical pattern.
         image_id = f"{pair['eye']}__{Path(pair['baseline']).stem}"
         module1_output = self.module1_cache.get(image_id) if self.module1_cache else None
+        followup_id = f"{pair['eye']}__{Path(pair['follow_up']).stem}"
+        followup_output = self.module1_cache.get(followup_id) if self.module1_cache else None
 
         if module1_output is not None:
-            mask_np = module1_output['mask']
-            mask_img = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(
-                (self.image_size, self.image_size), Image.NEAREST
-            )
-            mask = torch.from_numpy(np.array(mask_img) > 0).float().unsqueeze(0)
-
-            target_grade = torch.zeros(5)
-            target_grade[int(module1_output['grade'])] = 1.0
+            mask = mask_to_tensor(crop_mask(module1_output['mask'], box1, size1), self.image_size)
         else:
             # RODREP doesn't have lesion masks
             # In real training, run Module 1 to generate masks
             mask = torch.zeros(1, self.image_size, self.image_size)
 
-            # RODREP doesn't have severity stage labels
-            # Default to Stage 2 for conditioning
-            target_grade = torch.zeros(5)
-            target_grade[2] = 1.0
+        # RODREP has no severity stage labels: Module 1's predicted grades, else the Stage-2
+        # placeholder (see FIREDataset).
+        source_grade = module1_grade_onehot(module1_output)
+        target_grade = module1_grade_onehot(
+            followup_output if self.condition_on == 'followup' and followup_output is not None else module1_output)
 
         return {
             'baseline': img1,
             'follow_up': img2,
             'mask': mask,
             'target_grade': target_grade,
+            'source_grade': source_grade,
             'source': 'LongDRScreening',
             'eye_id': pair['eye']
         }

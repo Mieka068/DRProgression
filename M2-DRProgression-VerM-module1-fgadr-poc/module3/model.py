@@ -23,13 +23,21 @@ NUM_STAGES = 5  # ICDR 0-4, matching baseline_grade_icdr in module3/dataset.py
 
 class EfficientNetWeibullSurvival(nn.Module):
     def __init__(self, pretrained=True, lbs_embedding_dim=8, grade_embedding_dim=8,
-                 hidden_dim=128, dropout=0.3):
+                 hidden_dim=128, dropout=0.3, freeze_blocks=0):
+        """freeze_blocks (CODE_FIXES item 6.2): keep the first N of EfficientNet-B4's 9 feature
+        blocks (0 = stem, 1-7 = MBConv stages, 8 = head conv) at their ImageNet weights -- no
+        gradient, BatchNorm in eval mode -- so the few hundred Tianjin eyes only tune the later,
+        more task-specific blocks. 0 = fine-tune everything (the earlier behaviour)."""
         super().__init__()
         weights = EfficientNet_B4_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = efficientnet_b4(weights=weights)
         backbone_out_features = backbone.classifier[1].in_features
         backbone.classifier = nn.Identity()
         self.backbone = backbone
+        self.freeze_blocks = freeze_blocks
+        for block in self.backbone.features[:freeze_blocks]:
+            for prm in block.parameters():
+                prm.requires_grad_(False)
 
         self.lbs_embedding = nn.Embedding(NUM_LBS_STRATA, lbs_embedding_dim)
         self.grade_embedding = nn.Embedding(NUM_STAGES, grade_embedding_dim)
@@ -40,6 +48,12 @@ class EfficientNetWeibullSurvival(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 2),  # [pre_shape, pre_scale] -- squashed positive below
         )
+
+    def train(self, mode=True):
+        super().train(mode)
+        for block in self.backbone.features[:self.freeze_blocks]:
+            block.eval()  # frozen blocks keep their ImageNet BatchNorm statistics
+        return self
 
     def forward(self, image, lbs_stratum_idx, baseline_grade_icdr):
         features = self.backbone(image)

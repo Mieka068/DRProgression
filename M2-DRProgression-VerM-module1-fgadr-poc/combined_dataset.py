@@ -15,7 +15,17 @@ is real image-pair volume and photographic diversity for the adversarial/reconst
 losses, not genuine stage-transition supervision. Because of this, FIRE/LongDR pairs cannot be
 scored against a real follow-up grade the way Tianjin's can (see evaluate_trajectory.py's
 --self-consistency-dirs option for the metric this file's sources use instead).
+
+Conditioning (CODE_FIXES items 2.1/2.2): by default (condition_on='followup') every source's
+target_grade is the FOLLOW-UP visit's grade -- the stage the Generator is asked to produce, which is
+what the stage input means at inference (trajectory_inference.py): Tianjin's clinical follow-up
+grade, Module 1's predicted grade of the FIRE/LongDR follow-up image (the Stage-2 placeholder only
+where that is missing). Each sample also carries source_grade (the baseline's) and progressed
+(Tianjin: follow-up > baseline; FIRE/LongDR: False). condition_on='baseline' restores the earlier
+"current stage" conditioning.
 """
+
+import os
 
 import torch
 from torch.utils.data import Dataset, ConcatDataset
@@ -53,8 +63,10 @@ class AugmentedPairDataset(Dataset):
         follow_up = sample['follow_up']
         
         if self.augment:
-            # Apply same random augmentation to both images
-            baseline, follow_up = self._sync_augment(baseline, follow_up)
+            # Apply same random augmentation to both images -- and to the lesion mask, which is
+            # the baseline's: before round 4 the mask stayed unflipped/unrotated while the images
+            # moved, so the lesion channel pointed at the wrong places on ~3/4 of the samples.
+            baseline, follow_up, sample['mask'] = self._sync_augment(baseline, follow_up, sample['mask'])
         
         sample['baseline'] = baseline
         sample['follow_up'] = follow_up
@@ -68,13 +80,15 @@ class AugmentedPairDataset(Dataset):
         # Tianjin sample. Default them here so every sample this dataset yields has the same
         # shape regardless of source.
         sample.setdefault('grade_is_real', False)
+        sample.setdefault('source_grade', sample['target_grade'].clone())
+        sample.setdefault('progressed', False)
         sample.setdefault('patient_id', sample.get('eye_id', 'n/a'))
         sample.setdefault('pair_quality', -1.0)
         sample.setdefault('grade_is_eye_specific', False)
 
         return sample
     
-    def _sync_augment(self, img1, img2):
+    def _sync_augment(self, img1, img2, mask=None):
         """
         Apply same augmentation to both images to preserve pair correspondence.
         
@@ -94,14 +108,19 @@ class AugmentedPairDataset(Dataset):
         if random.random() > 0.5:
             img1 = torch.flip(img1, dims=[2])
             img2 = torch.flip(img2, dims=[2])
+            if mask is not None:
+                mask = torch.flip(mask, dims=[2])
         
         # Small random rotation (±15 degrees) - SAFE
         if random.random() > 0.5:
             angle = random.uniform(-15, 15)
             # Rotate using affine transformation
             from torchvision.transforms.functional import rotate
-            img1 = rotate(img1, angle)
-            img2 = rotate(img2, angle)
+            # fill=-1: black in the [-1, 1] range (the default 0 would be mid-grey corners)
+            img1 = rotate(img1, angle, fill=-1.0)
+            img2 = rotate(img2, angle, fill=-1.0)
+            if mask is not None:
+                mask = rotate(mask, angle)
         
         # Mild brightness variation (mimics camera differences) - SAFE
         if random.random() > 0.5:
@@ -109,7 +128,191 @@ class AugmentedPairDataset(Dataset):
             img1 = (img1 * brightness).clamp(-1, 1)
             img2 = (img2 * brightness).clamp(-1, 1)
         
-        return img1, img2
+        return img1, img2, mask
+
+
+def _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
+                  longdr_module1_cache_path, tianjin_module1_cache_path, tianjin_min_pair_quality,
+                  registration_cache_path, condition_on='followup', tianjin_min_baseline_grade=0):
+    """The per-source datasets get_combined_loader / get_combined_train_val_loaders concatenate.
+    condition_on: 'followup' (default) = target_grade is the follow-up visit's grade (Tianjin: real
+    clinical grade; FIRE/LongDR: Module 1's prediction), 'baseline' = the earlier behaviour."""
+    datasets = []
+
+    # Try to load FIRE
+    try:
+        fire = FIREDataset(fire_dir, image_size=image_size, category='A',
+                            module1_cache_path=fire_module1_cache_path,
+                            registration_cache_path=registration_cache_path,
+                            condition_on=condition_on)
+        if len(fire) > 0:
+            datasets.append(fire)
+            print(f"✓ FIRE: {len(fire)} pairs")
+    except Exception as e:
+        print(f"⚠ Could not load FIRE: {e}")
+
+    # Try to load LongDRScreening
+    try:
+        longdr = LongDRScreeningDataset(longdr_dir, image_size=image_size,  # folder: DRP_LONGDR_FOLDER
+                                         module1_cache_path=longdr_module1_cache_path,
+                                         registration_cache_path=registration_cache_path,
+                                         condition_on=condition_on)
+        if len(longdr) > 0:
+            datasets.append(longdr)
+            print(f"✓ LongDRScreening: {len(longdr)} pairs")
+    except Exception as e:
+        print(f"⚠ Could not load LongDRScreening: {e}")
+
+    # Try to load Tianjin (only if a directory was given -- keeps this backward compatible
+    # with callers that don't know about Tianjin yet)
+    if tianjin_dir:
+        try:
+            tianjin = TianjinLongitudinalDataset(
+                tianjin_dir, image_size=image_size,
+                min_pair_quality=tianjin_min_pair_quality,
+                module1_cache_path=tianjin_module1_cache_path,
+                registration_cache_path=registration_cache_path,
+                condition_on=condition_on,
+                min_baseline_grade=tianjin_min_baseline_grade,
+            )
+            if len(tianjin) > 0:
+                datasets.append(tianjin)
+                print(f"✓ Tianjin: {len(tianjin)} pairs")
+        except Exception as e:
+            print(f"⚠ Could not load Tianjin: {e}")
+
+    if not datasets:
+        raise RuntimeError("No datasets loaded!")
+    return datasets
+
+
+def _group_ids(ds):
+    """One id per pair naming the eye/patient it comes from, so a train/val split never puts
+    pairs of the same eye (LongDR: up to 4 per eye) or patient (Tianjin: both eyes) on both
+    sides. Read from each dataset's pair index -- no image loading."""
+    if isinstance(ds, FIREDataset):
+        return [f"fire:{os.path.basename(p[0]).rsplit('_', 1)[0]}" for p in ds.pairs]
+    if isinstance(ds, LongDRScreeningDataset):
+        return [f"longdr:{p['eye']}" for p in ds.pairs]
+    if isinstance(ds, TianjinLongitudinalDataset):
+        return [f"tianjin:{pid}" for pid in ds.manifest["patient_id"]]
+    return [f"{type(ds).__name__}:{i}" for i in range(len(ds))]
+
+
+def _progressed_flags(ds):
+    """Per pair: did the eye progress between the visits? Tianjin: its clinical follow-up grade >
+    baseline grade (tianjin_dataset.py's `progressed`); FIRE/LongDR: False (no real grades)."""
+    if isinstance(ds, TianjinLongitudinalDataset) and "progressed" in ds.manifest:
+        return ds.manifest["progressed"].astype(bool).tolist()
+    return [False] * len(ds)
+
+
+def progression_weights(flags, progress_fraction):
+    """
+    Per-pair sampling weights so progressing pairs make up ~progress_fraction of the draws:
+    rest pairs weigh 1, progressing pairs w_prog = p * n_rest / ((1 - p) * n_prog). None when
+    there is nothing to reweight (p <= 0, or no progressing / no other pairs).
+    """
+    flags = np.asarray(flags, dtype=bool)
+    n_prog, n_rest = int(flags.sum()), int((~flags).sum())
+    p = progress_fraction
+    if not p or p <= 0 or n_prog == 0 or n_rest == 0:
+        return None
+    if p >= 1:
+        raise ValueError(f"progress_fraction must be < 1, got {p}")
+    w_prog = p * n_rest / ((1 - p) * n_prog)
+    return np.where(flags, w_prog, 1.0)
+
+
+def get_combined_train_val_loaders(fire_dir='./FIRE_dataset',
+                                   longdr_dir='./LongDRScreening_20150209',
+                                   tianjin_dir=None,
+                                   image_size=128,
+                                   batch_size=4,
+                                   augment=True,
+                                   num_workers=0,
+                                   fire_module1_cache_path=None,
+                                   longdr_module1_cache_path=None,
+                                   tianjin_module1_cache_path=None,
+                                   tianjin_min_pair_quality=None,
+                                   registration_cache_path=None,
+                                   val_fraction=0.1,
+                                   seed=0,
+                                   condition_on='followup',
+                                   tianjin_min_baseline_grade=0,
+                                   progress_fraction=0.3):
+    """
+    Same sources as get_combined_loader, split into train / held-out val by eye/patient
+    (_group_ids), val_fraction of each source's groups going to val. Only train is augmented.
+    The split depends only on `seed` and the data, so a resumed run gets the same split.
+
+    progress_fraction (CODE_FIXES item 2.4): the training loader draws pairs with a
+    WeightedRandomSampler (with replacement) so that ~this fraction of samples are pairs whose eye
+    progressed (Tianjin, _progressed_flags) -- they are rare, and they are the ones that show the
+    Generator a stage change. 0 / None = the earlier uniform shuffle. Val stays unweighted.
+
+    Returns (train_loader, val_loader, info) with info = {num_pairs, n_train_pairs, n_val_pairs,
+    n_val_groups, n_train_progressed, progress_fraction}.
+    """
+    from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+
+    datasets = _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
+                             longdr_module1_cache_path, tianjin_module1_cache_path,
+                             tianjin_min_pair_quality, registration_cache_path, condition_on,
+                             tianjin_min_baseline_grade)
+    combined = ConcatDataset(datasets)
+    rng = np.random.RandomState(seed)
+    train_idx, val_idx, n_val_groups, offset = [], [], 0, 0
+    progressed = []
+    train_tianjin_patients = set()
+    module2_tianjin_patients = set()  # round 5: train + val + filtered-out candidates (see tianjin_dataset.py)
+    for ds in datasets:
+        module2_tianjin_patients.update(getattr(ds, "candidate_patient_ids", []))
+        progressed += _progressed_flags(ds)
+        groups = _group_ids(ds)
+        uniq = sorted(set(groups))
+        rng.shuffle(uniq)
+        n_val = int(round(len(uniq) * val_fraction)) if len(uniq) > 1 else 0
+        val_groups = set(uniq[:n_val])
+        n_val_groups += n_val
+        for i, g in enumerate(groups):
+            (val_idx if g in val_groups else train_idx).append(offset + i)
+            if g not in val_groups and g.startswith("tianjin:"):
+                train_tianjin_patients.add(g[len("tianjin:"):])
+        offset += len(ds)
+
+    train_set = AugmentedPairDataset(Subset(combined, train_idx), image_size=image_size, augment=augment)
+    val_set = AugmentedPairDataset(Subset(combined, val_idx), image_size=image_size, augment=False)
+    print(f"✓ Split by eye/patient: {len(train_idx)} train pairs / {len(val_idx)} held-out val pairs "
+          f"({n_val_groups} val eyes/patients)")
+    train_prog = [progressed[i] for i in train_idx]
+    weights = progression_weights(train_prog, progress_fraction)
+    if weights is None:
+        sampler = None
+        if progress_fraction:
+            print(f"  progress_fraction={progress_fraction}: {sum(train_prog)} progressing train pairs -- "
+                  "nothing to reweight, uniform shuffle")
+    else:
+        # AugmentedPairDataset is augment-x longer than the subset (idx % n), so repeat the weights.
+        n = len(train_idx)
+        aug_weights = torch.as_tensor(np.resize(weights, len(train_set)), dtype=torch.double)
+        sampler = WeightedRandomSampler(aug_weights, num_samples=len(train_set), replacement=True)
+        print(f"✓ Oversampling progressing pairs: {sum(train_prog)}/{n} train pairs progressed, weight "
+              f"{weights.max():.2f} each -> ~{progress_fraction:.0%} of training samples")
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=sampler is None, sampler=sampler,
+                              num_workers=num_workers, drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                            drop_last=False)
+    info = {"num_pairs": len(combined), "n_train_pairs": len(train_idx), "n_val_pairs": len(val_idx),
+            "n_val_groups": n_val_groups, "n_train_progressed": int(sum(train_prog)),
+            "progress_fraction": progress_fraction if sampler is not None else None,
+            # every Tianjin patient with a pair in training -- evaluate_trajectory.py
+            # --exclude-train-from leaves them out, so the cascade metrics are on unseen patients
+            "train_tianjin_patients": sorted(train_tianjin_patients),
+            # every Tianjin patient that could reach Module 2 training in ANY round (pair-quality filter only):
+            # evaluate_trajectory.py --exclude-scope module2 leaves them all out (round 3 vs round 5 comparison)
+            "module2_tianjin_patients": sorted(module2_tianjin_patients | train_tianjin_patients)}
+    return train_loader, val_loader, info
 
 
 def get_combined_loader(fire_dir='./FIRE_dataset',
@@ -123,7 +326,9 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
                         longdr_module1_cache_path=None,
                         tianjin_module1_cache_path=None,
                         tianjin_min_pair_quality=None,
-                        registration_cache_path=None):
+                        registration_cache_path=None,
+                        condition_on='followup',
+                        tianjin_min_baseline_grade=0):
     """
     Get a DataLoader combining FIRE + LongDRScreening + (optionally) Tianjin, with augmentation.
 
@@ -151,49 +356,11 @@ def get_combined_loader(fire_dir='./FIRE_dataset',
     """
     from torch.utils.data import DataLoader
 
-    datasets = []
+    datasets = _load_sources(fire_dir, longdr_dir, tianjin_dir, image_size, fire_module1_cache_path,
+                             longdr_module1_cache_path, tianjin_module1_cache_path,
+                             tianjin_min_pair_quality, registration_cache_path, condition_on,
+                             tianjin_min_baseline_grade)
 
-    # Try to load FIRE
-    try:
-        fire = FIREDataset(fire_dir, image_size=image_size, category='A',
-                            module1_cache_path=fire_module1_cache_path,
-                            registration_cache_path=registration_cache_path)
-        if len(fire) > 0:
-            datasets.append(fire)
-            print(f"✓ FIRE: {len(fire)} pairs")
-    except Exception as e:
-        print(f"⚠ Could not load FIRE: {e}")
-
-    # Try to load LongDRScreening
-    try:
-        longdr = LongDRScreeningDataset(longdr_dir, image_size=image_size, use_normalized=True,
-                                         module1_cache_path=longdr_module1_cache_path,
-                                         registration_cache_path=registration_cache_path)
-        if len(longdr) > 0:
-            datasets.append(longdr)
-            print(f"✓ LongDRScreening: {len(longdr)} pairs")
-    except Exception as e:
-        print(f"⚠ Could not load LongDRScreening: {e}")
-
-    # Try to load Tianjin (only if a directory was given -- keeps this backward compatible
-    # with callers that don't know about Tianjin yet)
-    if tianjin_dir:
-        try:
-            tianjin = TianjinLongitudinalDataset(
-                tianjin_dir, image_size=image_size,
-                min_pair_quality=tianjin_min_pair_quality,
-                module1_cache_path=tianjin_module1_cache_path,
-                registration_cache_path=registration_cache_path,
-            )
-            if len(tianjin) > 0:
-                datasets.append(tianjin)
-                print(f"✓ Tianjin: {len(tianjin)} pairs")
-        except Exception as e:
-            print(f"⚠ Could not load Tianjin: {e}")
-
-    if not datasets:
-        raise RuntimeError("No datasets loaded!")
-    
     # Combine datasets
     combined = ConcatDataset(datasets)
     print(f"✓ Combined: {len(combined)} pairs")
