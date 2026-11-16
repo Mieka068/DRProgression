@@ -286,6 +286,36 @@ the most realistic so far (step-1 KID 0.025 vs round 6's 0.029, pretrained 0.031
 real progression; round 7's grader loss games EyePACS (grade up 45 % vs 18 % for real follow-ups, FGADR flat, KID 0.045);
 direct-from-baseline beats the cascade at step 2 (KID 0.034 vs 0.058).
 
+**Notebook 12 results** (`outputs/12_grader_resolution_check_colab (1).ipynb`). EyePACS separation ("grade went up" on
+progressed minus on stable eyes): **+7 % at 128 px, +17 % at 256 px, +26 % at full resolution**, so 256 px is worth notebook
+09's pretraining. The FGADR grader's separation is -3 % at every size: it grades every Tianjin eye 3 or 4, because it learned
+FGADR's image sources rather than the lesions (`module1/FGADR_GRADER_DIAGNOSIS.md`, `module1/diagnose_fgadr_grader.py`).
+
+# Round 8 -- 256 px, EyePACS grader only (branch `R8-256px-EyePACSGrader`)
+Round 7 found no Generator that shows real progression at 128 px, where the grader barely sees real change (notebook 12).
+Round 8 changes the resolution and drops the FGADR grader. Outputs go to `_r8` folders; rounds 3-7 are never written to.
+
+| Change | Why | Round 7 |
+|---|---|---|
+| `MODULE2_IMAGE_SIZE = 256` in nb 06, 08, 09, 10 | Notebook 12: EyePACS separation +17 % at 256 px vs +7 % at 128 | 128 |
+| nb 09: fresh 256 px pretraining in `nonlong_pretrain..._r8` (`CONTINUE_ROUND3_PRETRAIN = False`, 80 epochs, no grader loss); EyePACS cache copied from round 5's folder | Round 5's pretraining is 128 px and can't continue at 256; round 4's 256 px run had the grader loss that painted coloured marks | round 5's 128 px pretraining |
+| nb 06/08/10 read the pretrained Generator from `PRETRAIN_RUN_TAG` (`_r8`) | Same size as the fine-tuning | `INPUT_RUN_TAG` (`_r5`) |
+| nb 06: SIFT alignment cache rebuilt at 256 px in `registration_prefinals_r8_sift_256/` (first run only; same SIFT settings) | Round 5's cache is 128 px and the loaders refuse warps made at another size | round 5's cache |
+| nb 06: `LAMBDA_GRADER = 0` (round 7's other settings kept: lr 1e-5, `LAMBDA_REC = 5`, control-kid selection, retina mask, colour match) | Round 7's grader loss gamed EyePACS (grade up 45 % vs 18 % for real follow-ups). With FGADR gone nothing independent would catch that; with the grader outside the loss, the EyePACS selection gate and evaluation are an independent check | 0.5 |
+| FGADR grader dropped everywhere (no `--selection-check-classifier-checkpoint`, no `--second-classifier-checkpoint`, nb 09's stage-control check EyePACS only) | It grades every Tianjin eye 3 or 4 -- `module1/FGADR_GRADER_DIAGNOSIS.md` | FGADR as second grader |
+| nb 06 comparison (`<run>/round8_comparison/`): copy, real follow-up (ceiling), round 8 pretrained, round 8 fine-tuned, round 8 direct, all at 256 px, one grader; round 7's 128 px table printed below it for reference only | 128 px Generators can't be scored at 256 px | six rows, two graders, 128 px |
+| nb 08/10: `GENERATOR = 'finetuned'` (or `'pretrained'`); `'round6'` refused at 256 px | Round 6's Generator is 128 px | `'round6'` |
+
+Unchanged: round 5's Module 1 caches, laterality file and Module 3 (`INPUT_ROUND_TAG = '_r5'`; 04_05 and 07 are not re-run).
+
+**Run order (round 8):** free Google Drive space -> **09** (256 px pretraining, ~12-20 h on an L4, resumes after a
+disconnect) -> **06** (builds the 256 px SIFT cache first: read its SIFT failure rate; then trains and runs the round-8
+comparison) -> **08** -> **10**. Open fresh copies of each notebook from this branch in Colab. Watch in nb 06: (1) the
+training log's stage control (graded by the EyePACS grader, which is not in the loss) -- whether any epoch passes the
+gate; (2) the verdict against the real-follow-up ceiling row. If CUDA runs out of memory at 256 px, set
+`MODULE2_BATCH_SIZE = 4`. To try round 7's grader loss at 256 px, set `LAMBDA_GRADER = 0.5`. The verdict then reports the
+EyePACS numbers as unconfirmed, since there is no second grader.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|
