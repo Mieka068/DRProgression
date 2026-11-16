@@ -44,20 +44,44 @@ The Tianjin numbers fit a grader that gives nearly every Tianjin image the same 
 **Verdict: a genuine domain failure, not a code bug.** The FGADR grader is not a usable independent
 grader for Tianjin.
 
-## Still to run on Colab (needs the weights and images)
+## Confirmed on Colab (notebook 12, `outputs/12_grader_resolution_check_colab (1).ipynb`)
 
-The confusion matrix of the FGADR grader on Tianjin is stored in the comparison JSONs on Drive
-(`module1_cache_drgnet_comb_prefinals_r{4,5}/grader_comparison_tianjin.json`,
-`graders.fgadr.eye.both.confusion`). For the full check, run:
+**Part B: the grader on FGADR's test split, by image source.**
+
+| | n | accuracy | qwk | predicted 0/1/2/3/4 |
+|---|---|---|---|---|
+| all | 342 | 0.719 | 0.809 | 32/54/83/115/58 |
+| source `_1` | 185 | 0.589 | **0.508** | 32/54/83/8/8 |
+| sources `_2`/`_3` | 157 | 0.873 | 0.719 | **0/0/0**/107/50 |
+
+- It never predicts below 3 for a `_2`/`_3` image (157/157).
+- Among source-`_1` images it predicts 3 or 4 only 16 times out of 185, and catches only 9 of the 18
+  grade-3/4 `_1` images (50%).
+- Within a single source the grader is much weaker (qwk 0.51 on `_1`). The headline 0.81 relies on
+  telling the sources apart.
+
+The `_1` grade-3/4 group is small (n=18), so the 50% figure is rough. The direction is clear, though.
+
+**Part C: the grader on Tianjin vs. clinical grades (per eye, n=2174).**
 
 ```
-python module1/diagnose_fgadr_grader.py --checkpoint <fgadr final_weights.pt> \
-    --fgadr-root <FGADR Seg-set> --tianjin-dir <Tianjin dir> --out fgadr_grader_diagnosis.json
+              predicted 0    1    2     3     4
+clinical 0 (1682):      0    0    0   581  1101
+clinical 1  (189):      0    0    0    95    94
+clinical 2  (251):      0    0    0    76   175
+clinical 3   (28):      0    0    0     8    20
+clinical 4   (24):      0    0    0     2    22
 ```
 
-Part B shows whether, on FGADR test, grade-3/4 images from `_1` are graded lower than those from
-`_2`/`_3`. That would mean the grader uses the source. Part C prints the Tianjin confusion matrix, the
-predicted-grade histogram and the mean softmax, with and without the retina crop.
+- Accuracy 0.014, qwk 0.002.
+- **Every Tianjin eye is graded 3 or 4**, including all 1682 eyes with no DR. Mean softmax is 0.40 for
+  grade 3 and 0.60 for grade 4, and under 0.01 for grades 0-2.
+- Without the retina crop the result is the same (accuracy 0.015, 857 / 1317 predicted 3 / 4), so the
+  crop is not the cause.
+
+**Conclusion: the grader learned to recognise the image source.** To it, Tianjin photos look like FGADR's
+`_2`/`_3` sources, which in training were always grade 3-4. This is a genuine domain failure caused by
+FGADR's source/grade confound, not a code bug.
 
 ## Consequence for notebook 06
 
