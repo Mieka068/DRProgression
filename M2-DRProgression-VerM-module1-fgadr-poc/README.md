@@ -329,8 +329,8 @@ image-only biomarker regressor. The identity loss only applied to the ~10 % of d
 | `--identity-every-step`: every G step also maps each image to its OWN stage, L1 penalty (lambda_id 5) | `train_module2_nonlong_pretrain.py` | identity only when target == source |
 | `--diffaugment "color,translation,cutout"` on everything the critic sees (both heads, GP endpoints) | same | off |
 | `--lambda-bio 0 --lambda-mono 0`: biomarker losses off (test run B) | same (existing flags) | 1, 1 |
-| No-change test (own stage requested: image change + EyePACS grade-change rate) and redness per requested stage (red added inside the retina) | `tools/stage_control_check.py` | -- |
-| nb 09: `PRETRAIN_MODE = 'tests'` -- test runs A / B / C continue round 8's pretraining 10 epochs each in their own folders (`nonlong_pretrain..._r9test_<run>`), a round-8 baseline check, and a comparison cell that prints the **winner** (redness <= 50 % of round 8's AND no-change grade-change rate not worse; A preferred within 10 %) | notebook 09 | -- |
+| No-change test (own stage requested: image change + EyePACS grade-change rate) and redness per requested stage, split into whole-image red **tint** and local **streaks** (each image's own average colour shift removed) | `tools/stage_control_check.py` | -- |
+| nb 09: `PRETRAIN_MODE = 'tests'` -- test runs A / B / C continue round 8's pretraining 10 epochs each in their own folders (`nonlong_pretrain..._r9test_<run>`), a round-8 baseline check, and a comparison cell that prints the **winner** (streaks <= 50 % of round 8's AND no-change grade-change rate not worse; A preferred within 10 %) | notebook 09 | -- |
 | Training-log message no longer blames the grader loss when it is off | `train_module2_poc.py` | -- |
 
 Test runs: **A** identity every step + DiffAugment; **B** A + biomarker losses off; **C** (optional) control, no changes.

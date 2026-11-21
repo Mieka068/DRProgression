@@ -20,7 +20,10 @@ Round 9 -- two image-level checks (no grader needed), on the same images:
                      and, per grader, how often the grade of that output differs from the grade of the
                      input itself (both should be near 0 -- round 8 read stage-0 requests as grade 4 in 40 %)
     redness[k]       mean red added inside the retina for stage-k requests: relu(dR - dG), d = output - input
-                     on a 0-1 scale (the red streaks); change[k] = mean |G(x) - x| for stage-k requests
+                     on a 0-1 scale (tint + streaks together); change[k] = mean |G(x) - x| for stage-k requests
+    tint[k]          the WHOLE-IMAGE colour shift towards red: relu(mean dR - mean dG) over the retina, per image
+    streak_redness[k]  LOCAL red added once each image's own average shift is removed: relu((dR - mean dR) -
+                     (dG - mean dG)) inside the retina -- red streaks / blotches, not a uniform tint
 Compare these between runs on the same images (same --seed / --split-seed), not as absolute values.
 
 Usage:
@@ -119,6 +122,7 @@ def main():
     conf = {n: np.zeros((args.c_dim, args.c_dim), dtype=int) for n in graders}
     real_hits = {n: 0 for n in graders}
     red_sum, chg_sum, n_k = np.zeros(args.c_dim), np.zeros(args.c_dim), np.zeros(args.c_dim)
+    tint_sum, streak_sum = np.zeros(args.c_dim), np.zeros(args.c_dim)
     own_chg, own_n = 0.0, 0
     own_flip = {n: 0 for n in graders}
     for b in range(0, len(idx), args.batch_size):
@@ -139,6 +143,10 @@ def main():
                 fake = G(torch.cat([x, mask], 1), c)
             d = (fake + 1) / 2 - x01
             red_sum[k] += float(masked_mean(F.relu(d[:, :1] - d[:, 1:2]), m).sum())
+            mean_r = masked_mean(d[:, :1], m).view(-1, 1, 1, 1)  # each image's own average shift
+            mean_g = masked_mean(d[:, 1:2], m).view(-1, 1, 1, 1)
+            tint_sum[k] += float(F.relu(mean_r - mean_g).sum())
+            streak_sum[k] += float(masked_mean(F.relu((d[:, :1] - mean_r) - (d[:, 1:2] - mean_g)), m).sum())
             chg_sum[k] += float(masked_mean(d.abs().mean(1, keepdim=True), m).sum())
             n_k[k] += len(batch)
             own = src == k
@@ -156,10 +164,18 @@ def main():
            "change": {str(k): float(chg_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)},
            "no_change": {"mean_abs_change": own_chg / max(own_n, 1),
                          "grade_changed_rate": {n: own_flip[n] / max(own_n, 1) for n in graders}}}
+    out["tint"] = {str(k): float(tint_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
+    out["streak_redness"] = {str(k): float(streak_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
     out["mean_redness"] = float(np.mean(list(out["redness"].values())))
+    out["mean_tint"] = float(np.mean(list(out["tint"].values())))
+    out["mean_streak_redness"] = float(np.mean(list(out["streak_redness"].values())))
     print("Image checks (inside the retina, 0-1 scale; compare between runs):")
     print("  redness added per requested stage: " + "  ".join(f"{k}: {v:.4f}" for k, v in out["redness"].items())
           + f"  | mean {out['mean_redness']:.4f}")
+    print("  -> local streaks:                  " + "  ".join(f"{k}: {v:.4f}" for k, v in out["streak_redness"].items())
+          + f"  | mean {out['mean_streak_redness']:.4f}")
+    print("  -> whole-image red tint:           " + "  ".join(f"{k}: {v:.4f}" for k, v in out["tint"].items())
+          + f"  | mean {out['mean_tint']:.4f}")
     print("  mean change per requested stage:   " + "  ".join(f"{k}: {v:.4f}" for k, v in out["change"].items()))
     print(f"  no-change test (own stage requested): mean change {out['no_change']['mean_abs_change']:.4f} | grade "
           "changed: " + ", ".join(f"{n} {r:.1%}" for n, r in out["no_change"]["grade_changed_rate"].items()))
