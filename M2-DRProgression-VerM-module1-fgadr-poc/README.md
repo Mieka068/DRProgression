@@ -335,6 +335,18 @@ image-only biomarker regressor. The identity loss only applied to the ~10 % of d
 
 Test runs: **A** identity every step + DiffAugment; **B** A + biomarker losses off; **C** (optional) control, no changes.
 
+**Tests A and B (outputs `09_..._(3)` / `_(4)`): no winner.** Local streaks stayed at 103-105 % of round 8's, and the
+pink tint rose (stage-0 outputs: 0.0013 -> 0.016 / 0.025). Stage-0 requests graded 4 fell from 40 % to 20 % / 16 %. The
+patterns sit in the same places in every image (right-edge bar, crosshatch, wavy bands), and in round 8 the streak number is the
+same for stage-0 requests as for stages 1-4. That points at the Generator's layers, not its losses. Next:
+* **Step 1 (no training):** round 8's Generator rendered with bilinear up-sampling / reflect padding / both
+  (`base_model.apply_render_options`, `--g-upsample` / `--g-padding` in `train_module2_nonlong_pretrain.py` and
+  `tools/stage_control_check.py`; no weights change, so round 8's checkpoint loads). The best variant is chosen if it cuts
+  the streaks to <= 80 % (`round9_pretrain_tests/render_choice.json`), with sample grids (`--grid-out`).
+* **Test D:** A + the chosen variant, 10 epochs from round 8. Skipped, with a message, if step 1 finds nothing.
+The comparison cell covers A-D. If D wins, notebooks 06/08/10 also need the same Generator layers (set with their round-9
+update).
+
 **Run order (round 9, step 1):** notebook 09 from this branch, Run all with `TEST_RUN = 'A'` (~2.5-3 h on an L4), then again
 with `TEST_RUN = 'B'` (optionally `'C'`). Separate sessions or accounts are fine; each run resumes after a disconnect. The last
 round-9 cell prints the verdict. **Step 2:** set `PRETRAIN_MODE = 'full'` and `FULL_RUN = <winner>`, Run all (fresh 80-epoch

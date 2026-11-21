@@ -25,6 +25,8 @@ Round 9 -- two image-level checks (no grader needed), on the same images:
     streak_redness[k]  LOCAL red added once each image's own average shift is removed: relu((dR - mean dR) -
                      (dG - mean dG)) inside the retina -- red streaks / blotches, not a uniform tint
 Compare these between runs on the same images (same --seed / --split-seed), not as absolute values.
+--g-upsample / --g-padding render the Generator differently without retraining (base_model.apply_render_options);
+--grid-out saves a sample grid (rows: one held-out image per grade; columns: input, then stages 0-4).
 
 Usage:
     python tools/stage_control_check.py --generator .../final-G.ckpt --image-size 256 \
@@ -46,7 +48,8 @@ for _p in (ROOT, os.path.join(ROOT, "module1"), os.path.join(ROOT, "DRForestGAN-
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from apply_to_progression_data import CLASSIFIER_NORMS, load_classifier  # noqa: E402
-from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
+from base_model import (Generator, add_arch_arg, add_render_args, apply_render_options, arch_kwargs,  # noqa: E402
+                        check_run_config, load_checkpoint)
 from crosssectional_dataset import CrossSectionalDRDataset  # noqa: E402
 
 
@@ -88,7 +91,9 @@ def main():
     ap.add_argument("--style-dim", type=int, default=None)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--grid-out", default=None, help="Optional .jpg: one held-out image per grade x (input + stages)")
     add_arch_arg(ap)
+    add_render_args(ap)
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -96,6 +101,7 @@ def main():
     G = Generator(conv_dim=args.g_conv_dim, c_dim=args.c_dim, repeat_num=args.g_repeat_num,
                   style_dim=args.style_dim, **arch_kwargs(args.model_arch)[0]).to(dev)
     load_checkpoint(G, args.generator, dev, args.model_arch)
+    apply_render_options(G, args.g_upsample, args.g_padding)
     G.eval()
 
     ds = CrossSectionalDRDataset(args.dataset_dir, preset=args.preset, image_size=args.image_size, augment=False,
@@ -159,7 +165,28 @@ def main():
         for name, (clf, mean, std, _p, _n) in graders.items():
             own_flip[name] += int((grade_batch(clf, own_fake, mean, std) != real_grade[name]).sum())
 
+    if args.grid_out:  # first held-out image of each grade: input, then stages 0..c_dim-1
+        from torchvision.utils import save_image
+        rows = []
+        for g in range(args.c_dim):
+            hit = next((i for i in idx if int(ds.grades[i]) == g), None)
+            if hit is None:
+                continue
+            s = ds[hit]
+            x = s["image"].unsqueeze(0).to(dev)
+            mk = s["mask"].unsqueeze(0).to(dev)
+            row = [x]
+            for k in range(args.c_dim):
+                c = F.one_hot(torch.tensor([k], device=dev), args.c_dim).float()
+                with torch.no_grad():
+                    row.append(G(torch.cat([x, mk], 1), c))
+            rows.append(torch.cat(row))
+        if rows:
+            os.makedirs(os.path.dirname(os.path.abspath(args.grid_out)), exist_ok=True)
+            save_image((torch.cat(rows) + 1) / 2, args.grid_out, nrow=args.c_dim + 1, padding=4)
+            print(f"✓ Sample grid: {args.grid_out}")
     out = {"generator": args.generator, "image_size": args.image_size, "n_real": len(idx), "graders": {},
+           "g_upsample": args.g_upsample, "g_padding": args.g_padding,
            "redness": {str(k): float(red_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)},
            "change": {str(k): float(chg_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)},
            "no_change": {"mean_abs_change": own_chg / max(own_n, 1),

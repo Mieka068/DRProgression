@@ -43,6 +43,36 @@ def add_arch_arg(parser):
                              "before these changes)")
 
 
+def apply_render_options(G, upsample=None, padding=None):
+    """Round 9: change how a built Generator renders WITHOUT changing its weights (neither layer type has
+    parameters, so any checkpoint still loads): upsample 'nearest' / 'bilinear' (the nn.Upsample layers of the
+    up-sampling path; 'deconv' generators have none) and padding 'zeros' / 'reflect' (every Conv2d with
+    padding > 0 -- zero padding makes the image border look different from the inside, a source of edge bars).
+    None = leave as built. Returns G."""
+    if upsample is not None:
+        if upsample not in ("nearest", "bilinear"):
+            raise ValueError(f"upsample must be 'nearest' or 'bilinear', not {upsample!r}")
+        for m in G.modules():
+            if isinstance(m, nn.Upsample):
+                m.mode = upsample
+                m.align_corners = False if upsample == "bilinear" else None
+    if padding is not None:
+        if padding not in ("zeros", "reflect"):
+            raise ValueError(f"padding must be 'zeros' or 'reflect', not {padding!r}")
+        for m in G.modules():
+            if isinstance(m, nn.Conv2d) and any(p > 0 for p in m.padding):
+                m.padding_mode = padding
+    return G
+
+
+def add_render_args(parser):
+    """--g-upsample / --g-padding (apply_render_options); default None = as built (nearest / zeros)."""
+    parser.add_argument("--g-upsample", choices=["nearest", "bilinear"], default=None,
+                        help="Round 9: Generator up-sampling mode (default: the architecture's, nearest)")
+    parser.add_argument("--g-padding", choices=["zeros", "reflect"], default=None,
+                        help="Round 9: Generator conv padding (default: zeros)")
+
+
 RUN_RESULT_FILES = ("poc_results.json", "nonlong_pretrain_results.json")
 
 

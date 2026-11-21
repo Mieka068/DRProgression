@@ -68,6 +68,9 @@ both off by default (= round 8):
   --diffaugment POLICY    DiffAugment (gan_guidance.diff_augment, as in train_module2_poc.py) on everything
                           the critic sees -- real, fake and the GP interpolates' endpoints -- so its
                           real/fake and stage heads must rely on features that survive colour / shift / cutout.
+--g-upsample bilinear / --g-padding reflect change how the Generator renders (no new weights, so round 8's
+checkpoint still loads): its nearest-neighbour up-sampling and zero padding are suspects for the fixed-position
+grid / wavy textures and edge bars that tests A and B left unchanged.
 --lambda-bio 0 switches the biomarker-profile loss off (the image-only BiomarkerRegressor is the other
 easily-fooled judge, and a likely source of the RED in the streaks).
 
@@ -89,7 +92,7 @@ from torchvision.utils import save_image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from base_model import Discriminator, Generator, add_arch_arg, arch_kwargs  # noqa: E402
+from base_model import Discriminator, Generator, add_arch_arg, add_render_args, apply_render_options, arch_kwargs  # noqa: E402
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
 from train_module2_poc import denorm, grad_norm, gradient_penalty, write_batch_log  # noqa: E402
@@ -147,6 +150,8 @@ class Config:
     lambda_grader = 1.0
     identity_every_step = False  # round 9: identity loss on every image every G step (round 8: only target == source)
     diffaugment = ""  # round 9: DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off (round 8)
+    g_upsample = None  # round 9: 'nearest' / 'bilinear' (base_model.apply_render_options); None = as built (nearest)
+    g_padding = None   # round 9: 'zeros' / 'reflect'; None = as built (zeros)
 
     save_dir = "./DRForestGAN-v2/stargan/models_nonlong/"
     sample_dir = "./training_samples_nonlong/"
@@ -362,6 +367,7 @@ def train(config):
     g_kwargs, d_kwargs = arch_kwargs(config.model_arch)
     G = Generator(conv_dim=config.g_conv_dim, c_dim=config.c_dim, repeat_num=config.g_repeat_num,
                   style_dim=config.style_dim, **g_kwargs).to(device)
+    apply_render_options(G, config.g_upsample, config.g_padding)
     D = Discriminator(image_size=config.image_size, conv_dim=config.d_conv_dim, c_dim=config.c_dim,
                       repeat_num=config.d_repeat_num, **d_kwargs).to(device)
     print(f"  Model architecture: {config.model_arch} (G {g_kwargs}, D {d_kwargs})")
@@ -377,7 +383,8 @@ def train(config):
               f"norm {config.grader_loss_norm}, {config.grader_input_size} px, augmented views)")
     print(f"  Identity loss: {'every image, every G step' if config.identity_every_step else 'only when target == source'}"
           f" (lambda_id {config.lambda_id}) | DiffAugment on the critic: {config.diffaugment or 'off'}"
-          f" | biomarker loss: lambda_bio {config.lambda_bio}")
+          f" | biomarker loss: lambda_bio {config.lambda_bio}"
+          f" | G up-sampling {config.g_upsample or 'as built'}, padding {config.g_padding or 'as built'}")
 
     def aug(t):
         return diff_augment(t, config.diffaugment) if config.diffaugment else t
@@ -515,6 +522,7 @@ def train(config):
         "g_lr": config.g_lr, "d_lr": config.d_lr, "n_critic": config.n_critic, "batch_size": config.batch_size,
         "grader_loss_checkpoint": config.grader_loss_path, "grader_loss_norm": config.grader_loss_norm,
         "identity_every_step": config.identity_every_step, "diffaugment": config.diffaugment,
+        "g_upsample": config.g_upsample, "g_padding": config.g_padding,
         "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
@@ -560,6 +568,7 @@ if __name__ == "__main__":
                    help="Round 9: identity loss on every image every G step (default: only when target == source)")
     p.add_argument("--diffaugment", default=Config.diffaugment,
                    help='Round 9: DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off')
+    add_render_args(p)
     p.add_argument("--save-dir", default=Config.save_dir)
     p.add_argument("--seed", type=int, default=Config.seed)
     p.add_argument("--resume-state", default=None,
