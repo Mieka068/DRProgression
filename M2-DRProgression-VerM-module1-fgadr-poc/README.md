@@ -316,6 +316,30 @@ gate; (2) the verdict against the real-follow-up ceiling row. If CUDA runs out o
 `MODULE2_BATCH_SIZE = 4`. To try round 7's grader loss at 256 px, set `LAMBDA_GRADER = 0.5`. The verdict then reports the
 EyePACS numbers as unconfirmed, since there is no second grader.
 
+# Round 9 -- pretraining test runs against the red streaks (branch `R9-Pretrain-Identity-DiffAug`)
+Round 8's results (`outputs/*` on `R8-256px-EyePACSGrader`): sharper 256 px images, and the EyePACS grader reads a higher grade
+67 % of the time without being in the loss, but real follow-ups only go up 27 %. Agreement barely beats copying (16 % vs
+12 %). The added "disease" is vertical red streaks / grid texture, and asking for stage 0 gave outputs graded 4 in 40 % of
+cases. Fine-tuning changed nothing (stage control 0-4 %, best epoch 0 = the pretrained Generator). The pretraining let G
+satisfy two easily fooled judges: the critic's stage head (47.5 % on real images, ~100 % "correct" on fakes) and the
+image-only biomarker regressor. The identity loss only applied to the ~10 % of draws where target == source.
+
+| Change | Where | Default (= round 8) |
+|---|---|---|
+| `--identity-every-step`: every G step also maps each image to its OWN stage, L1 penalty (lambda_id 5) | `train_module2_nonlong_pretrain.py` | identity only when target == source |
+| `--diffaugment "color,translation,cutout"` on everything the critic sees (both heads, GP endpoints) | same | off |
+| `--lambda-bio 0 --lambda-mono 0`: biomarker losses off (test run B) | same (existing flags) | 1, 1 |
+| No-change test (own stage requested: image change + EyePACS grade-change rate) and redness per requested stage (red added inside the retina) | `tools/stage_control_check.py` | -- |
+| nb 09: `PRETRAIN_MODE = 'tests'` -- test runs A / B / C continue round 8's pretraining 10 epochs each in their own folders (`nonlong_pretrain..._r9test_<run>`), a round-8 baseline check, and a comparison cell that prints the **winner** (redness <= 50 % of round 8's AND no-change grade-change rate not worse; A preferred within 10 %) | notebook 09 | -- |
+| Training-log message no longer blames the grader loss when it is off | `train_module2_poc.py` | -- |
+
+Test runs: **A** identity every step + DiffAugment; **B** A + biomarker losses off; **C** (optional) control, no changes.
+
+**Run order (round 9, step 1):** notebook 09 from this branch, Run all with `TEST_RUN = 'A'` (~2.5-3 h on an L4), then again
+with `TEST_RUN = 'B'` (optionally `'C'`). Separate sessions or accounts are fine; each run resumes after a disconnect. The last
+round-9 cell prints the verdict. **Step 2:** set `PRETRAIN_MODE = 'full'` and `FULL_RUN = <winner>`, Run all (fresh 80-epoch
+pretraining, ~19 h). Notebooks 06/08/10 get round-9 settings (and `FOV_ERODE = 2` for the edge bars) after the winner is known.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

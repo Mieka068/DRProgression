@@ -59,6 +59,18 @@ fresh random augmentation in front of it. Round 3's D stage head graded real val
 in-domain here (kappa 0.72 on EyePACS test). The stage-head numbers in nonlong_pretrain_results.json
 stay D's; notebook 09 also scores the outputs with the OTHER grader (FGADR).
 
+Round 9 -- red streaks (round 8 pretraining). Round 8's critic stage head graded real val images at 47.5 %
+(balanced 33 %) yet G's stage loss on fakes fell to 0.078, and asking for stage 0 gave outputs the EyePACS
+grader read as grade 4 in 40 % of cases: G satisfied weak judges with red streaks / texture. Two options,
+both off by default (= round 8):
+  --identity-every-step   every G step also maps each image to its OWN stage and penalises any change
+                          (lambda_id x L1), not only the ~10 % of draws where target == source.
+  --diffaugment POLICY    DiffAugment (gan_guidance.diff_augment, as in train_module2_poc.py) on everything
+                          the critic sees -- real, fake and the GP interpolates' endpoints -- so its
+                          real/fake and stage heads must rely on features that survive colour / shift / cutout.
+--lambda-bio 0 switches the biomarker-profile loss off (the image-only BiomarkerRegressor is the other
+easily-fooled judge, and a likely source of the RED in the streaks).
+
 Dry run (synthetic images + labels, no data needed -- plumbing check only):
     python train_module2_nonlong_pretrain.py --dry-run --save-dir /tmp/nonlong_dry
 """
@@ -81,7 +93,7 @@ from base_model import Discriminator, Generator, add_arch_arg, arch_kwargs  # no
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
 from train_module2_poc import denorm, grad_norm, gradient_penalty, write_batch_log  # noqa: E402
-from gan_guidance import FrozenGrader  # noqa: E402  (after train_module2_poc, which puts module1/ on sys.path)
+from gan_guidance import FrozenGrader, diff_augment  # noqa: E402  (after train_module2_poc, which puts module1/ on sys.path)
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
@@ -133,6 +145,8 @@ class Config:
     grader_loss_norm = "eyepacs"
     grader_input_size = 512
     lambda_grader = 1.0
+    identity_every_step = False  # round 9: identity loss on every image every G step (round 8: only target == source)
+    diffaugment = ""  # round 9: DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off (round 8)
 
     save_dir = "./DRForestGAN-v2/stargan/models_nonlong/"
     sample_dir = "./training_samples_nonlong/"
@@ -361,6 +375,12 @@ def train(config):
                               input_size=config.grader_input_size, device=device)
         print(f"  Frozen-grader loss: {config.lambda_grader} x CE ({config.grader_loss_path}, "
               f"norm {config.grader_loss_norm}, {config.grader_input_size} px, augmented views)")
+    print(f"  Identity loss: {'every image, every G step' if config.identity_every_step else 'only when target == source'}"
+          f" (lambda_id {config.lambda_id}) | DiffAugment on the critic: {config.diffaugment or 'off'}"
+          f" | biomarker loss: lambda_bio {config.lambda_bio}")
+
+    def aug(t):
+        return diff_augment(t, config.diffaugment) if config.diffaugment else t
 
     print(f"\n[3/4] Training for {config.num_epochs} epochs ({len(train_loader)} batches/epoch)...")
     start = time.time()
@@ -374,7 +394,7 @@ def train(config):
     g_steps = history[-1].get("g_steps", 0) if history else 0  # G updates so far (1 per n_critic batches)
     for epoch in range(start_epoch, config.num_epochs):
         bio_on = use_bio and epoch >= config.bio_warmup_epochs
-        sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, bio=0.0, mono=0.0, r=0.0, grd=0.0)
+        sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, id=0.0, bio=0.0, mono=0.0, r=0.0, grd=0.0)
         n_g = 0
         for i, batch in enumerate(train_loader):
             x = batch["image"].to(device)
@@ -393,13 +413,15 @@ def train(config):
                 sums["r"] += r_loss.item()
 
             # --- Discriminator: real/fake + grade real images with their true stage ---
-            out_src, out_cls = D(x)
+            real_d = aug(x)  # round 9: the critic (both heads) only sees augmented images when --diffaugment is set
+            out_src, out_cls = D(real_d)
             d_real = -out_src.mean()
             d_cls = F.cross_entropy(out_cls, src)
             with torch.no_grad():
                 fake = G(x_in, c_trg)
-            out_fake, _ = D(fake)
-            gp, gp_norm = gradient_penalty(D, x, fake, device, return_norm=True)
+            fake_d = aug(fake)
+            out_fake, _ = D(fake_d)
+            gp, gp_norm = gradient_penalty(D, real_d, fake_d, device, return_norm=True)
             d_adv = d_real + out_fake.mean()
             d_loss = d_adv + config.lambda_gp * gp + config.lambda_cls * d_cls
             d_opt.zero_grad(); d_loss.backward()
@@ -412,15 +434,18 @@ def train(config):
             # --- Generator ---
             if i % config.n_critic == 0:
                 fake = G(x_in, c_trg)
-                out_fake, cls_fake = D(fake)
+                out_fake, cls_fake = D(aug(fake))
                 g_adv = -out_fake.mean()
                 g_cls = F.cross_entropy(cls_fake, trg)
                 # Cycle back to the source stage with the same (source) mask -- the synthesized
                 # image has no Module 1 mask of its own during training.
                 rec = G(torch.cat([fake, mask], 1), c_src)
                 g_cyc = F.l1_loss(rec, x)
-                same = trg == src
-                g_id = F.l1_loss(fake[same], x[same]) if same.any() else fake.new_zeros(())
+                if config.identity_every_step:  # round 9: "keep this eye at its own stage" for the whole batch
+                    g_id = F.l1_loss(G(x_in, c_src), x)
+                else:
+                    same = trg == src
+                    g_id = F.l1_loss(fake[same], x[same]) if same.any() else fake.new_zeros(())
                 g_loss = (config.lambda_adv * g_adv + config.lambda_cls * g_cls
                           + config.lambda_cyc * g_cyc + config.lambda_id * g_id)
                 if bio_on:
@@ -441,6 +466,7 @@ def train(config):
                 # by its own real-image loss, so drop those gradients.
                 r_opt.zero_grad()
                 sums["g"] += g_loss.item(); sums["cls"] += g_cls.item(); sums["cyc"] += g_cyc.item()
+                sums["id"] += g_id.item()
                 n_g += 1
                 row[2] = g_steps + n_g
                 row[9:] = [g_loss.item(), g_adv.item(), g_cls.item(), g_cyc.item(),
@@ -451,11 +477,11 @@ def train(config):
         nb = max(len(train_loader), 1)
         g_steps += n_g
         rec_ = {"epoch": epoch + 1, "d_loss": sums["d"] / nb, "r_loss": sums["r"] / nb, "g_steps": g_steps,
-                **{f"g_{k}": sums[k] / max(n_g, 1) for k in ("g", "cls", "cyc", "bio", "mono", "grd")},
+                **{f"g_{k}": sums[k] / max(n_g, 1) for k in ("g", "cls", "cyc", "id", "bio", "mono", "grd")},
                 "biomarker_losses_on": bio_on}
         history.append(rec_)
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] D {rec_['d_loss']:.3f} | G {rec_['g_g']:.3f} "
-              f"(cls {rec_['g_cls']:.3f}, cyc {rec_['g_cyc']:.3f}, bio {rec_['g_bio']:.3f}, "
+              f"(cls {rec_['g_cls']:.3f}, cyc {rec_['g_cyc']:.3f}, id {rec_['g_id']:.3f}, bio {rec_['g_bio']:.3f}, "
               f"mono {rec_['g_mono']:.3f}" + (f", grader {rec_['g_grd']:.3f}" if grader is not None else "")
               + f") | R {rec_['r_loss']:.3f} | G steps {g_steps} | "
               f"{(time.time() - start) / 60:.1f}min")
@@ -488,6 +514,7 @@ def train(config):
         "bio_margin": config.bio_margin, "p_adjacent": config.p_adjacent, "seed": config.seed,
         "g_lr": config.g_lr, "d_lr": config.d_lr, "n_critic": config.n_critic, "batch_size": config.batch_size,
         "grader_loss_checkpoint": config.grader_loss_path, "grader_loss_norm": config.grader_loss_norm,
+        "identity_every_step": config.identity_every_step, "diffaugment": config.diffaugment,
         "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
@@ -529,6 +556,10 @@ if __name__ == "__main__":
     p.add_argument("--grader-loss-norm", choices=["fgadr", "eyepacs"], default=Config.grader_loss_norm)
     p.add_argument("--grader-input-size", type=int, default=Config.grader_input_size)
     p.add_argument("--lambda-grader", type=float, default=Config.lambda_grader)
+    p.add_argument("--identity-every-step", action="store_true",
+                   help="Round 9: identity loss on every image every G step (default: only when target == source)")
+    p.add_argument("--diffaugment", default=Config.diffaugment,
+                   help='Round 9: DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off')
     p.add_argument("--save-dir", default=Config.save_dir)
     p.add_argument("--seed", type=int, default=Config.seed)
     p.add_argument("--resume-state", default=None,

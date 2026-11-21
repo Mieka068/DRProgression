@@ -15,6 +15,14 @@ every --grader (Module 1's ResNet-50 graders, e.g. EyePACS and FGADR). For each 
 Report the grader that was NOT in the Generator's loss (gan_guidance.FrozenGrader) as the main
 number; the loss grader's agreement is optimistic by construction.
 
+Round 9 -- two image-level checks (no grader needed), on the same images:
+    no_change        each image requested at its OWN stage: mean |G(x) - x| inside the retina (0-1 scale)
+                     and, per grader, how often the grade of that output differs from the grade of the
+                     input itself (both should be near 0 -- round 8 read stage-0 requests as grade 4 in 40 %)
+    redness[k]       mean red added inside the retina for stage-k requests: relu(dR - dG), d = output - input
+                     on a 0-1 scale (the red streaks); change[k] = mean |G(x) - x| for stage-k requests
+Compare these between runs on the same images (same --seed / --split-seed), not as absolute values.
+
 Usage:
     python tools/stage_control_check.py --generator .../final-G.ckpt --image-size 256 \
         --dataset-dir /content/data/eyepacs --preset eyepacs_resized \
@@ -47,6 +55,16 @@ def grade_batch(clf, x_pm1, mean, std, size=512):
     m = torch.tensor(mean, device=x.device).view(1, 3, 1, 1)
     s = torch.tensor(std, device=x.device).view(1, 3, 1, 1)
     return clf((x - m) / s).argmax(1)
+
+
+def retina(x_pm1, threshold=0.04):
+    """[B,1,H,W] retina mask of a [-1, 1] batch: brightest channel above threshold on a 0-1 scale."""
+    return (((x_pm1 + 1) / 2).amax(1, keepdim=True) > threshold).float()
+
+
+def masked_mean(v, m):
+    """Per-sample mean of a [B,1,H,W] map v over mask m."""
+    return (v * m).sum((1, 2, 3)) / m.sum((1, 2, 3)).clamp(min=1.0)
 
 
 def main():
@@ -100,22 +118,51 @@ def main():
 
     conf = {n: np.zeros((args.c_dim, args.c_dim), dtype=int) for n in graders}
     real_hits = {n: 0 for n in graders}
+    red_sum, chg_sum, n_k = np.zeros(args.c_dim), np.zeros(args.c_dim), np.zeros(args.c_dim)
+    own_chg, own_n = 0.0, 0
+    own_flip = {n: 0 for n in graders}
     for b in range(0, len(idx), args.batch_size):
         batch = [ds[i] for i in idx[b:b + args.batch_size]]
         x = torch.stack([s["image"] for s in batch]).to(dev)
         mask = torch.stack([s["mask"] for s in batch]).to(dev)
         src = torch.tensor([s["grade"] for s in batch], device=dev)
+        real_grade = {}
         for name, (clf, mean, std, _p, _n) in graders.items():
-            real_hits[name] += int((grade_batch(clf, x, mean, std) == src).sum())
+            real_grade[name] = grade_batch(clf, x, mean, std)
+            real_hits[name] += int((real_grade[name] == src).sum())
+        m = retina(x)
+        x01 = (x + 1) / 2
+        own_fake = torch.zeros_like(x)
         for k in range(args.c_dim):
             c = F.one_hot(torch.full((len(batch),), k, device=dev), args.c_dim).float()
             with torch.no_grad():
                 fake = G(torch.cat([x, mask], 1), c)
+            d = (fake + 1) / 2 - x01
+            red_sum[k] += float(masked_mean(F.relu(d[:, :1] - d[:, 1:2]), m).sum())
+            chg_sum[k] += float(masked_mean(d.abs().mean(1, keepdim=True), m).sum())
+            n_k[k] += len(batch)
+            own = src == k
+            own_fake[own] = fake[own]
             for name, (clf, mean, std, _p, _n) in graders.items():
                 for pg in grade_batch(clf, fake, mean, std).tolist():
                     conf[name][k, pg] += 1
+        own_chg += float(masked_mean(((own_fake + 1) / 2 - x01).abs().mean(1, keepdim=True), m).sum())
+        own_n += len(batch)
+        for name, (clf, mean, std, _p, _n) in graders.items():
+            own_flip[name] += int((grade_batch(clf, own_fake, mean, std) != real_grade[name]).sum())
 
-    out = {"generator": args.generator, "image_size": args.image_size, "n_real": len(idx), "graders": {}}
+    out = {"generator": args.generator, "image_size": args.image_size, "n_real": len(idx), "graders": {},
+           "redness": {str(k): float(red_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)},
+           "change": {str(k): float(chg_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)},
+           "no_change": {"mean_abs_change": own_chg / max(own_n, 1),
+                         "grade_changed_rate": {n: own_flip[n] / max(own_n, 1) for n in graders}}}
+    out["mean_redness"] = float(np.mean(list(out["redness"].values())))
+    print("Image checks (inside the retina, 0-1 scale; compare between runs):")
+    print("  redness added per requested stage: " + "  ".join(f"{k}: {v:.4f}" for k, v in out["redness"].items())
+          + f"  | mean {out['mean_redness']:.4f}")
+    print("  mean change per requested stage:   " + "  ".join(f"{k}: {v:.4f}" for k, v in out["change"].items()))
+    print(f"  no-change test (own stage requested): mean change {out['no_change']['mean_abs_change']:.4f} | grade "
+          "changed: " + ", ".join(f"{n} {r:.1%}" for n, r in out["no_change"]["grade_changed_rate"].items()))
     for name, (_c, _m, _s, path, norm) in graders.items():
         cm = conf[name]
         agree = {str(k): float(cm[k, k] / max(cm[k].sum(), 1)) for k in range(args.c_dim)}

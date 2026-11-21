@@ -865,8 +865,10 @@ def train(config: Config):
               f"{best_g_path}; final-G.ckpt = last epoch ({stopped_at or config.num_epochs})")
         if best["epoch"] == 0 and config.selection_mode == "control-kid" and best["score"] == float("inf"):
             print(f"  ⚠ No epoch reached stage control >= {config.selection_min_control:.0%} within the KID ceiling -- "
-                  "best-G.ckpt is the starting Generator unchanged. The grader loss did not give grade control "
-                  "here; see the per-epoch stage control above.")
+                  "best-G.ckpt is the starting Generator unchanged. "
+                  + ("The grader loss did not give grade control here" if config.lambda_grader > 0 and config.grader_loss_path
+                     else "Fine-tuning (no grader loss) did not give grade control here")
+                  + "; see the per-epoch stage control above.")
         elif best["epoch"] == 0:
             print("  ⚠ No fine-tuning epoch beat the starting Generator -- best-G.ckpt is the pretrained "
                   "Generator unchanged (fine-tuning didn't help on this score)")
