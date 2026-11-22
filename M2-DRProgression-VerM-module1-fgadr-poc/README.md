@@ -354,6 +354,15 @@ place in every image. An untrained check can't judge that layer. **Test D is the
 epochs** (it starts from the broken state), always run. Step 1 stays as a record. A win also requires the no-change image
 change to be <= 2x round 8's (the images recovered).
 
+**Test D (output `09_..._(6)`): no winner.** Streaks were 122 % of round 8's and the tint 0.0185. The no-change image change
+was 0.035 and still falling. The same patterns came back after retraining: each requested stage has its own fixed texture in
+every eye (bars at 1, crosshatch at 3, bands at 4), a learned "stage signature" that round 8's critic rewards. Every test
+continued from round 8, so **test E is a fresh pretraining from scratch with A's settings + reflect padding** (`TEST_RUN =
+'E'`, `E_EPOCHS = 20`, ~6 h). It is compared with round 8's own 20-epoch snapshot (`20-G.ckpt`) in a separate TEST E
+VERDICT. If E works, set `E_EPOCHS = 80` and Run all: the same run continues (~18 h) and becomes round 9's pretrained
+Generator (`nonlong_pretrain..._r9test_E`, `round9_pretrain_tests/round9_pretrained.json`). If not, the next suspect is the
+stage-loss weight.
+
 **Run order (round 9, step 1):** notebook 09 from this branch, Run all with `TEST_RUN = 'A'` (~2.5-3 h on an L4), then again
 with `TEST_RUN = 'B'` (optionally `'C'`). Separate sessions or accounts are fine; each run resumes after a disconnect. The last
 round-9 cell prints the verdict. **Step 2:** set `PRETRAIN_MODE = 'full'` and `FULL_RUN = <winner>`, Run all (fresh 80-epoch
