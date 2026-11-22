@@ -347,6 +347,13 @@ same for stage-0 requests as for stages 1-4. That points at the Generator's laye
 The comparison cell covers A-D. If D wins, notebooks 06/08/10 also need the same Generator layers (set with their round-9
 update).
 
+**Step 1 results (output `09_..._(5)`):** bilinear up-sampling changed nothing (streaks 105 %, images unchanged). Reflect
+padding without retraining broke the images (no-change image change 0.017 -> 0.36, oversaturated colour, red blobs). So the
+Generator *depends on its zero padding*, which networks can use as a position cue -- consistent with patterns in the same
+place in every image. An untrained check can't judge that layer. **Test D is therefore A + reflect padding, retrained 15
+epochs** (it starts from the broken state), always run. Step 1 stays as a record. A win also requires the no-change image
+change to be <= 2x round 8's (the images recovered).
+
 **Run order (round 9, step 1):** notebook 09 from this branch, Run all with `TEST_RUN = 'A'` (~2.5-3 h on an L4), then again
 with `TEST_RUN = 'B'` (optionally `'C'`). Separate sessions or accounts are fine; each run resumes after a disconnect. The last
 round-9 cell prints the verdict. **Step 2:** set `PRETRAIN_MODE = 'full'` and `FULL_RUN = <winner>`, Run all (fresh 80-epoch
