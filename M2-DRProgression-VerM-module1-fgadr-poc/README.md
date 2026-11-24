@@ -363,6 +363,16 @@ VERDICT. If E works, set `E_EPOCHS = 80` and Run all: the same run continues (~1
 Generator (`nonlong_pretrain..._r9test_E`, `round9_pretrain_tests/round9_pretrained.json`). If not, the next suspect is the
 stage-loss weight.
 
+**Test E at 20 and 40 epochs (outputs `09_... (4)` / `_(8)`):** no vivid red/magenta streaks, while round 8 at the same
+epoch counts already had its stage signatures. But the optic disc has a dark blue-black spot in every output (stage 0
+included), the stage-0 outputs have a pink cast, and the no-change image change is 0.036 vs round 8's 0.023. The plain
+streak number (111 %) counts mottling and spots, not the bars. So: **E continues from epoch 40 to 60 with identity weight
+20** (`E_LAMBDA_ID`, was 5; the 40-epoch state is backed up automatically). `tools/stage_control_check.py` adds
+**strong-streak area** (share of the retina with a vivid local red/magenta jump > 0.08) and **disc darkening** (luminance
+drop over the brightest 1 % of the input retina). The TEST E VERDICT now uses those: strong-streak area <= 1/2 of round 8's,
+disc darkening <= 1.5x, no-change image change <= 1.5x, vs round 8's own snapshot at the same epoch count. E at 40 epochs
+(from `40-G.ckpt`) is shown alongside, to see what the stronger identity loss changed.
+
 **Run order (round 9, step 1):** notebook 09 from this branch, Run all with `TEST_RUN = 'A'` (~2.5-3 h on an L4), then again
 with `TEST_RUN = 'B'` (optionally `'C'`). Separate sessions or accounts are fine; each run resumes after a disconnect. The last
 round-9 cell prints the verdict. **Step 2:** set `PRETRAIN_MODE = 'full'` and `FULL_RUN = <winner>`, Run all (fresh 80-epoch

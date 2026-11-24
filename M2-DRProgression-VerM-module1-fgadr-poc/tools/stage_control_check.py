@@ -24,6 +24,10 @@ Round 9 -- two image-level checks (no grader needed), on the same images:
     tint[k]          the WHOLE-IMAGE colour shift towards red: relu(mean dR - mean dG) over the retina, per image
     streak_redness[k]  LOCAL red added once each image's own average shift is removed: relu((dR - mean dR) -
                      (dG - mean dG)) inside the retina -- red streaks / blotches, not a uniform tint
+    strong_streak_area[k]  fraction of the retina where that local red / magenta jump exceeds STRONG_STREAK (0.08 on a
+                     0-1 scale): the vivid bars, not mild mottling (which streak_redness also counts)
+    disc_darkening[k]  how much the BRIGHTEST 1 % of the input retina (the optic disc) gets darker in the output: mean
+                     relu(luminance in - luminance out) over those pixels (the dark disc spot)
 Compare these between runs on the same images (same --seed / --split-seed), not as absolute values.
 --g-upsample / --g-padding render the Generator differently without retraining (base_model.apply_render_options);
 --grid-out saves a sample grid (rows: one held-out image per grade; columns: input, then stages 0-4).
@@ -61,6 +65,22 @@ def grade_batch(clf, x_pm1, mean, std, size=512):
     m = torch.tensor(mean, device=x.device).view(1, 3, 1, 1)
     s = torch.tensor(std, device=x.device).view(1, 3, 1, 1)
     return clf((x - m) / s).argmax(1)
+
+
+STRONG_STREAK = 0.08
+
+
+def brightest_mask(x01, m, frac=0.01):
+    """[B,1,H,W] mask of the brightest `frac` of each image's retina pixels (luminance) -- the optic disc."""
+    lum = (0.299 * x01[:, :1] + 0.587 * x01[:, 1:2] + 0.114 * x01[:, 2:3])
+    out = torch.zeros_like(lum)
+    for i in range(lum.size(0)):
+        inside = torch.nonzero(m[i].flatten() > 0).flatten()
+        if inside.numel():
+            k = max(1, int(round(frac * inside.numel())))
+            top = inside[torch.topk(lum[i].flatten()[inside], k).indices]  # exactly the k brightest retina pixels
+            out[i].view(-1)[top] = 1.0
+    return out, lum
 
 
 def retina(x_pm1, threshold=0.04):
@@ -129,6 +149,7 @@ def main():
     real_hits = {n: 0 for n in graders}
     red_sum, chg_sum, n_k = np.zeros(args.c_dim), np.zeros(args.c_dim), np.zeros(args.c_dim)
     tint_sum, streak_sum = np.zeros(args.c_dim), np.zeros(args.c_dim)
+    strong_sum, dark_sum = np.zeros(args.c_dim), np.zeros(args.c_dim)
     own_chg, own_n = 0.0, 0
     own_flip = {n: 0 for n in graders}
     for b in range(0, len(idx), args.batch_size):
@@ -142,6 +163,7 @@ def main():
             real_hits[name] += int((real_grade[name] == src).sum())
         m = retina(x)
         x01 = (x + 1) / 2
+        disc, lum_in = brightest_mask(x01, m)
         own_fake = torch.zeros_like(x)
         for k in range(args.c_dim):
             c = F.one_hot(torch.full((len(batch),), k, device=dev), args.c_dim).float()
@@ -152,7 +174,12 @@ def main():
             mean_r = masked_mean(d[:, :1], m).view(-1, 1, 1, 1)  # each image's own average shift
             mean_g = masked_mean(d[:, 1:2], m).view(-1, 1, 1, 1)
             tint_sum[k] += float(F.relu(mean_r - mean_g).sum())
-            streak_sum[k] += float(masked_mean(F.relu((d[:, :1] - mean_r) - (d[:, 1:2] - mean_g)), m).sum())
+            local_red = (d[:, :1] - mean_r) - (d[:, 1:2] - mean_g)
+            streak_sum[k] += float(masked_mean(F.relu(local_red), m).sum())
+            strong_sum[k] += float(masked_mean((local_red > STRONG_STREAK).float(), m).sum())
+            f01 = (fake + 1) / 2
+            lum_out = 0.299 * f01[:, :1] + 0.587 * f01[:, 1:2] + 0.114 * f01[:, 2:3]
+            dark_sum[k] += float(masked_mean(F.relu(lum_in - lum_out), disc).sum())
             chg_sum[k] += float(masked_mean(d.abs().mean(1, keepdim=True), m).sum())
             n_k[k] += len(batch)
             own = src == k
@@ -193,6 +220,10 @@ def main():
                          "grade_changed_rate": {n: own_flip[n] / max(own_n, 1) for n in graders}}}
     out["tint"] = {str(k): float(tint_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
     out["streak_redness"] = {str(k): float(streak_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
+    out["strong_streak_area"] = {str(k): float(strong_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
+    out["disc_darkening"] = {str(k): float(dark_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
+    out["mean_strong_streak_area"] = float(np.mean(list(out["strong_streak_area"].values())))
+    out["mean_disc_darkening"] = float(np.mean(list(out["disc_darkening"].values())))
     out["mean_redness"] = float(np.mean(list(out["redness"].values())))
     out["mean_tint"] = float(np.mean(list(out["tint"].values())))
     out["mean_streak_redness"] = float(np.mean(list(out["streak_redness"].values())))
@@ -203,6 +234,10 @@ def main():
           + f"  | mean {out['mean_streak_redness']:.4f}")
     print("  -> whole-image red tint:           " + "  ".join(f"{k}: {v:.4f}" for k, v in out["tint"].items())
           + f"  | mean {out['mean_tint']:.4f}")
+    print("  strong-streak area (share of retina): " + "  ".join(f"{k}: {v:.4f}" for k, v in out["strong_streak_area"].items())
+          + f"  | mean {out['mean_strong_streak_area']:.4f}")
+    print("  disc darkening (brightest 1 %):    " + "  ".join(f"{k}: {v:.4f}" for k, v in out["disc_darkening"].items())
+          + f"  | mean {out['mean_disc_darkening']:.4f}")
     print("  mean change per requested stage:   " + "  ".join(f"{k}: {v:.4f}" for k, v in out["change"].items()))
     print(f"  no-change test (own stage requested): mean change {out['no_change']['mean_abs_change']:.4f} | grade "
           "changed: " + ", ".join(f"{n} {r:.1%}" for n, r in out["no_change"]["grade_changed_rate"].items()))
