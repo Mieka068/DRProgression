@@ -73,7 +73,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "DRForestGAN-v2"))
-from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
+from base_model import (Generator, add_arch_arg, apply_saved_render_options, arch_kwargs,  # noqa: E402
+                        check_run_config, load_checkpoint)
 from trajectory_inference import _module1_predict, _tensor_to_pil, synthesize_trajectory  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "module3"))
@@ -311,6 +312,7 @@ def evaluate(config):
         if not config.dry_run:
             check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
             load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
+            apply_saved_render_options(G, config.generator_checkpoint)  # round 9: e.g. reflect padding
     if G is not None:
         G.eval()
     if config.fov_mask and G is not None:

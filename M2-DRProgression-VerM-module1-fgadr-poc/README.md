@@ -373,6 +373,23 @@ drop over the brightest 1 % of the input retina). The TEST E VERDICT now uses th
 disc darkening <= 1.5x, no-change image change <= 1.5x, vs round 8's own snapshot at the same epoch count. E at 40 epochs
 (from `40-G.ckpt`) is shown alongside, to see what the stronger identity loss changed.
 
+**Test E at 60 / 80 epochs (outputs `09_..._(9)` / `_(9) (1)`): E WORKS -- round 9's pretrained Generator.** With identity
+weight 20 from epoch 41: strong-streak area 0.0056 vs round 8's 0.0118 at 80 epochs, disc darkening 0.022 vs 0.017, no-change
+image change 0.022 vs 0.017. From E at 40 to E at 80, disc darkening fell 0.041 -> 0.022 and the stage-0 tint 0.077 -> 0.025.
+No red/magenta bars in the grids. Left over: a small dot on the optic disc, a faint yellow-green patch at stage 4, a few
+blue specks. Trade-off: stage control 22 % (round 8: 29 %, largely from its streaks), so the Generator barely changes the
+eye between stages before fine-tuning.
+
+**Round 9 notebooks 06 / 08 / 10:** `ROUND_TAG = '_r9'`, `PRETRAIN_RUN_TAG = BASE_RUN_TAG + '_r9test_E'` (test E's folder),
+round 8's 256 px SIFT cache reused, `FOV_ERODE = 2` (edge bars), round 8's fine-tuning settings otherwise.
+`base_model.apply_saved_render_options` gives every loaded Generator the layers its run recorded:
+- `train_module2_poc.py` reads it from the `--init-generator` run and writes `g_upsample` / `g_padding` into `poc_results.json`;
+- `evaluate_trajectory.py`, `visualize_trajectory.py`, `generate_progression.py` and `tools/stage_control_check.py` apply it
+  on load.
+Without this, test E's weights would run with zero padding and break. nb 06's comparison: copy, real follow-up, round 8
+pretrained (reference), round 9 pretrained, round 9 fine-tuned, round 9 direct, plus a round 9 vs round 8 pretrained line.
+**Run order: 06 -> 08 -> 10.**
+
 **Run order (round 9, step 1):** notebook 09 from this branch, Run all with `TEST_RUN = 'A'` (~2.5-3 h on an L4), then again
 with `TEST_RUN = 'B'` (optionally `'C'`). Separate sessions or accounts are fine; each run resumes after a disconnect. The last
 round-9 cell prints the verdict. **Step 2:** set `PRETRAIN_MODE = 'full'` and `FULL_RUN = <winner>`, Run all (fresh 80-epoch

@@ -152,6 +152,7 @@ from base_model import (  # noqa: E402
     Discriminator,
     Generator,
     add_arch_arg,
+    apply_saved_render_options,
     arch_kwargs,
     check_run_config,
     load_checkpoint,
@@ -556,6 +557,9 @@ def train(config: Config):
     if config.init_generator_path:
         load_checkpoint(G, config.init_generator_path, device, config.model_arch)
         print(f"✓ Initialized Generator from {config.init_generator_path}")
+        # Round 9: the pretrained Generator's layers (reflect padding), recorded in poc_results.json below so every later
+        # script that loads this run's best-G / final-G applies them too.
+        config.g_upsample, config.g_padding = apply_saved_render_options(G, config.init_generator_path)
     if config.init_discriminator_path and config.init_discriminator_mode == "fresh":
         print(f"  Discriminator: random init (--init-discriminator-mode fresh) -- "
               f"{config.init_discriminator_path} not loaded")
@@ -948,6 +952,7 @@ def train(config: Config):
         "lambda_grader": config.lambda_grader if config.grader_loss_path else None,
         "diffaugment": config.diffaugment,
         "lambda_drift": config.lambda_drift,
+        "g_upsample": getattr(config, "g_upsample", None), "g_padding": getattr(config, "g_padding", None),
         "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
         "longdr_folder": os.environ.get("DRP_LONGDR_FOLDER", "FundusImagesColor"),
         "selection_alpha": config.selection_alpha if config.selection_classifier_path else None,

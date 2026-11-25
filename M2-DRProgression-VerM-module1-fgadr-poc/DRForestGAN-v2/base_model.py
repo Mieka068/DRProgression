@@ -16,6 +16,8 @@ pointer to --model-arch legacy, which rebuilds the earlier architecture (MODEL_A
 those checkpoints still load for before/after comparisons. Generator and Discriminator kwargs can
 also be set one by one.
 """
+import os
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -63,6 +65,34 @@ def apply_render_options(G, upsample=None, padding=None):
             if isinstance(m, nn.Conv2d) and any(p > 0 for p in m.padding):
                 m.padding_mode = padding
     return G
+
+
+def saved_render_options(ckpt_path):
+    """(upsample, padding) recorded by the run that saved ckpt_path (its poc_results.json / nonlong_pretrain_results.json
+    in the same folder; round 9's g_upsample / g_padding), or (None, None) = as built (nearest / zeros)."""
+    import json
+    import os
+
+    for name in ("poc_results.json", "nonlong_pretrain_results.json"):
+        path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)), name)
+        if os.path.isfile(path):
+            with open(path) as f:
+                r = json.load(f)
+            return r.get("g_upsample"), r.get("g_padding")
+    return None, None
+
+
+def apply_saved_render_options(G, ckpt_path, upsample=None, padding=None):
+    """Round 9: give a loaded Generator the same layers it was trained with (e.g. round 9's reflect padding -- with
+    zero padding its images fall apart). Explicit upsample / padding override what the run recorded. Returns the
+    (upsample, padding) applied, None = as built."""
+    su, sp = saved_render_options(ckpt_path)
+    u, p = upsample or su, padding or sp
+    apply_render_options(G, u, p)
+    if u or p:
+        print(f"  Generator layers: up-sampling {u or 'as built'}, padding {p or 'as built'} "
+              f"({'set explicitly' if (upsample or padding) else 'as recorded by the run that saved ' + os.path.basename(ckpt_path)})")
+    return u, p
 
 
 def add_render_args(parser):

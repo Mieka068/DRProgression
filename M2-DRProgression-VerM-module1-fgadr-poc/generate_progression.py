@@ -51,7 +51,8 @@ from apply_to_progression_data import (  # noqa: E402
     apply_seg_inference_args,
     process_image,
 )
-from base_model import Generator, add_arch_arg, arch_kwargs, check_run_config, load_checkpoint  # noqa: E402
+from base_model import (Generator, add_arch_arg, apply_saved_render_options, arch_kwargs,  # noqa: E402
+                        check_run_config, load_checkpoint)
 from compute_lbs import compute_lbs, estimate_retinal_fov_mask  # noqa: E402
 from trajectory_inference import synthesize_trajectory  # noqa: E402
 from fundus_preprocess import load_module2_mask as _fp_load_module2_mask  # noqa: E402
@@ -173,6 +174,7 @@ def main(config):
     if not config.dry_run:
         check_run_config(config.generator_checkpoint, config.image_size, config.model_arch)
         load_checkpoint(G, config.generator_checkpoint, device, config.model_arch)
+        apply_saved_render_options(G, config.generator_checkpoint)  # round 9: e.g. reflect padding
     G.eval()
     classifier, seg_models = load_module1_models(config, device)
 

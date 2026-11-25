@@ -52,7 +52,7 @@ for _p in (ROOT, os.path.join(ROOT, "module1"), os.path.join(ROOT, "DRForestGAN-
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from apply_to_progression_data import CLASSIFIER_NORMS, load_classifier  # noqa: E402
-from base_model import (Generator, add_arch_arg, add_render_args, apply_render_options, arch_kwargs,  # noqa: E402
+from base_model import (Generator, add_arch_arg, add_render_args, apply_saved_render_options, arch_kwargs,  # noqa: E402
                         check_run_config, load_checkpoint)
 from crosssectional_dataset import CrossSectionalDRDataset  # noqa: E402
 
@@ -121,7 +121,7 @@ def main():
     G = Generator(conv_dim=args.g_conv_dim, c_dim=args.c_dim, repeat_num=args.g_repeat_num,
                   style_dim=args.style_dim, **arch_kwargs(args.model_arch)[0]).to(dev)
     load_checkpoint(G, args.generator, dev, args.model_arch)
-    apply_render_options(G, args.g_upsample, args.g_padding)
+    apply_saved_render_options(G, args.generator, args.g_upsample, args.g_padding)
     G.eval()
 
     ds = CrossSectionalDRDataset(args.dataset_dir, preset=args.preset, image_size=args.image_size, augment=False,
