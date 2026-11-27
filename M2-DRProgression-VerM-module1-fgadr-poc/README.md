@@ -395,6 +395,22 @@ with `TEST_RUN = 'B'` (optionally `'C'`). Separate sessions or accounts are fine
 round-9 cell prints the verdict. **Step 2:** set `PRETRAIN_MODE = 'full'` and `FULL_RUN = <winner>`, Run all (fresh 80-epoch
 pretraining, ~19 h). Notebooks 06/08/10 get round-9 settings (and `FOV_ERODE = 2` for the edge bars) after the winner is known.
 
+# Round 10 -- highlight-weighted identity loss (branch `R10-HighlightIdentity`)
+Round 9 (outputs on `R9-Pretrain-Identity-DiffAug`): no red streaks, and agreement with the follow-up grade beat copying
+(17 % vs 5 %). But fine-tuning again stopped at epoch 0 (stage control 0 %), the figures mostly copy the eye (vessel contrast
+0.91x of the baseline vs 1.20-1.23x in rounds 7/8, where it rose with the texture), step-1 KID was 0.080 vs round 8's 0.054,
+and dark teal spots sat on the optic disc, exudates and glare -- the input's highlights.
+
+| Change | Where | Round 9 |
+|---|---|---|
+| `--highlight-weight W` / `--highlight-frac`: the input's highlights (brightest 3 % of the retina + red >= 0.95) count (1+W)x in the identity and cycle L1 (`highlight_mask`, `weighted_l1`) | `train_module2_nonlong_pretrain.py` | off |
+| highlight darkening (luminance drop over all highlights) and teal shift (red drop relative to green / blue there) | `tools/stage_control_check.py` | disc only |
+| nb 09 run `F` (round 10): starts from test E's `resume_state_ep40.pt` (copied into `nonlong_pretrain..._r10`), identity weight 10 (`F_LAMBDA_ID`), highlight weight 10 (`F_HIGHLIGHT`), reflect padding, DiffAugment; `F_EPOCHS = 60` then 80 | notebook 09 | E: identity 20 from epoch 41 |
+| ROUND 10 VERDICT vs round 9 (E) and round 8 at the same epoch count: strong-streak area <= 1/2 of round 8's, highlight darkening <= 1/2 of round 9's, no-change image change <= 1.5x round 8's; change per requested stage and stage control vs round 9 reported | notebook 09 | -- |
+
+**Run order (round 10):** notebook 09 from this branch, Run all (`TEST_RUN = 'F'`, `F_EPOCHS = 60`, ~6 h) -> read the ROUND 10
+VERDICT -> `F_EPOCHS = 80`, Run all (~6 h) -> verdict -> notebooks 06/08/10 pointed at round 10 (next update).
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

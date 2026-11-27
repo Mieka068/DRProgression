@@ -28,6 +28,9 @@ Round 9 -- two image-level checks (no grader needed), on the same images:
                      0-1 scale): the vivid bars, not mild mottling (which streak_redness also counts)
     disc_darkening[k]  how much the BRIGHTEST 1 % of the input retina (the optic disc) gets darker in the output: mean
                      relu(luminance in - luminance out) over those pixels (the dark disc spot)
+    highlight_darkening[k]  the same over ALL highlights (brightest 3 % + near-saturated red: disc, exudates, glare) --
+                     round 9's dark spots also hit exudates and glare; teal_shift[k] = how much red drops relative to
+                     green / blue there (the spots are teal)
 Compare these between runs on the same images (same --seed / --split-seed), not as absolute values.
 --g-upsample / --g-padding render the Generator differently without retraining (base_model.apply_render_options);
 --grid-out saves a sample grid (rows: one held-out image per grade; columns: input, then stages 0-4).
@@ -81,6 +84,13 @@ def brightest_mask(x01, m, frac=0.01):
             top = inside[torch.topk(lum[i].flatten()[inside], k).indices]  # exactly the k brightest retina pixels
             out[i].view(-1)[top] = 1.0
     return out, lum
+
+
+def highlight_mask(x01, m, frac=0.03, red_sat=0.95):
+    """[B,1,H,W] highlights: exactly the brightest `frac` of each image's retina pixels plus near-saturated red (as in
+    train_module2_nonlong_pretrain.highlight_mask)."""
+    out, _ = brightest_mask(x01, m, frac)
+    return torch.maximum(out, ((x01[:, :1] > red_sat) & (m > 0)).float())
 
 
 def retina(x_pm1, threshold=0.04):
@@ -150,6 +160,7 @@ def main():
     red_sum, chg_sum, n_k = np.zeros(args.c_dim), np.zeros(args.c_dim), np.zeros(args.c_dim)
     tint_sum, streak_sum = np.zeros(args.c_dim), np.zeros(args.c_dim)
     strong_sum, dark_sum = np.zeros(args.c_dim), np.zeros(args.c_dim)
+    hl_sum, teal_sum = np.zeros(args.c_dim), np.zeros(args.c_dim)
     own_chg, own_n = 0.0, 0
     own_flip = {n: 0 for n in graders}
     for b in range(0, len(idx), args.batch_size):
@@ -164,6 +175,7 @@ def main():
         m = retina(x)
         x01 = (x + 1) / 2
         disc, lum_in = brightest_mask(x01, m)
+        hl = highlight_mask(x01, m)
         own_fake = torch.zeros_like(x)
         for k in range(args.c_dim):
             c = F.one_hot(torch.full((len(batch),), k, device=dev), args.c_dim).float()
@@ -180,6 +192,8 @@ def main():
             f01 = (fake + 1) / 2
             lum_out = 0.299 * f01[:, :1] + 0.587 * f01[:, 1:2] + 0.114 * f01[:, 2:3]
             dark_sum[k] += float(masked_mean(F.relu(lum_in - lum_out), disc).sum())
+            hl_sum[k] += float(masked_mean(F.relu(lum_in - lum_out), hl).sum())
+            teal_sum[k] += float(masked_mean(F.relu((d[:, 1:2] + d[:, 2:3]) / 2 - d[:, :1]), hl).sum())
             chg_sum[k] += float(masked_mean(d.abs().mean(1, keepdim=True), m).sum())
             n_k[k] += len(batch)
             own = src == k
@@ -224,6 +238,10 @@ def main():
     out["disc_darkening"] = {str(k): float(dark_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
     out["mean_strong_streak_area"] = float(np.mean(list(out["strong_streak_area"].values())))
     out["mean_disc_darkening"] = float(np.mean(list(out["disc_darkening"].values())))
+    out["highlight_darkening"] = {str(k): float(hl_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
+    out["teal_shift"] = {str(k): float(teal_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
+    out["mean_highlight_darkening"] = float(np.mean(list(out["highlight_darkening"].values())))
+    out["mean_teal_shift"] = float(np.mean(list(out["teal_shift"].values())))
     out["mean_redness"] = float(np.mean(list(out["redness"].values())))
     out["mean_tint"] = float(np.mean(list(out["tint"].values())))
     out["mean_streak_redness"] = float(np.mean(list(out["streak_redness"].values())))
@@ -238,6 +256,8 @@ def main():
           + f"  | mean {out['mean_strong_streak_area']:.4f}")
     print("  disc darkening (brightest 1 %):    " + "  ".join(f"{k}: {v:.4f}" for k, v in out["disc_darkening"].items())
           + f"  | mean {out['mean_disc_darkening']:.4f}")
+    print("  highlight darkening (all bright):  " + "  ".join(f"{k}: {v:.4f}" for k, v in out["highlight_darkening"].items())
+          + f"  | mean {out['mean_highlight_darkening']:.4f}  (teal shift {out['mean_teal_shift']:.4f})")
     print("  mean change per requested stage:   " + "  ".join(f"{k}: {v:.4f}" for k, v in out["change"].items()))
     print(f"  no-change test (own stage requested): mean change {out['no_change']['mean_abs_change']:.4f} | grade "
           "changed: " + ", ".join(f"{n} {r:.1%}" for n, r in out["no_change"]["grade_changed_rate"].items()))

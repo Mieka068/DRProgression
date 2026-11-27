@@ -71,6 +71,9 @@ both off by default (= round 8):
 --g-upsample bilinear / --g-padding reflect change how the Generator renders (no new weights, so round 8's
 checkpoint still loads): its nearest-neighbour up-sampling and zero padding are suspects for the fixed-position
 grid / wavy textures and edge bars that tests A and B left unchanged.
+Round 10 -- --highlight-weight W: in the identity and cycle losses, the input's highlights (its brightest
+--highlight-frac of retina pixels, plus near-saturated red) count (1 + W)x. Round 9 put dark teal spots on the optic
+disc, exudates and glare -- small areas an image-wide L1 barely penalises. 0 = off (rounds 8/9).
 --lambda-bio 0 switches the biomarker-profile loss off (the image-only BiomarkerRegressor is the other
 easily-fooled judge, and a likely source of the RED in the streaks).
 
@@ -150,6 +153,8 @@ class Config:
     lambda_grader = 1.0
     identity_every_step = False  # round 9: identity loss on every image every G step (round 8: only target == source)
     diffaugment = ""  # round 9: DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off (round 8)
+    highlight_weight = 0.0  # round 10: extra weight on the input's highlights in the identity / cycle L1; 0 = off
+    highlight_frac = 0.03   # round 10: brightest share of retina pixels that counts as highlight (+ red >= 0.95)
     g_upsample = None  # round 9: 'nearest' / 'bilinear' (base_model.apply_render_options); None = as built (nearest)
     g_padding = None   # round 9: 'zeros' / 'reflect'; None = as built (zeros)
 
@@ -176,6 +181,29 @@ class BiomarkerRegressor(nn.Module):
 
     def forward(self, x):
         return self.head(self.features(x).mean(dim=(2, 3)))
+
+
+def highlight_mask(x, frac=0.03, red_sat=0.95):
+    """Round 10: [B,1,H,W] {0,1} mask of each image's highlights -- exactly its brightest `frac` of retina pixels
+    (luminance) plus any near-saturated red (the channel that clips first in fundus photos). x in [-1, 1]."""
+    x01 = (x + 1) / 2
+    lum = 0.299 * x01[:, :1] + 0.587 * x01[:, 1:2] + 0.114 * x01[:, 2:3]
+    ret = lum > 0.04
+    out = torch.zeros_like(lum)
+    for i in range(x.size(0)):
+        inside = torch.nonzero(ret[i].flatten()).flatten()
+        if inside.numel():
+            k = max(1, int(round(frac * inside.numel())))
+            out[i].view(-1)[inside[torch.topk(lum[i].flatten()[inside], k).indices]] = 1.0
+    out = torch.maximum(out, ((x01[:, :1] > red_sat) & ret).float())
+    return out
+
+
+def weighted_l1(pred, target, weight=None):
+    """L1 with a per-pixel [B,1,H,W] weight, normalised by the weight sum (== plain L1 when weight is None / all 1)."""
+    if weight is None:
+        return F.l1_loss(pred, target)
+    return ((pred - target).abs() * weight).sum() / (weight.sum() * pred.size(1)).clamp(min=1.0)
 
 
 def sample_targets(src, c_dim, p_adjacent):
@@ -384,7 +412,9 @@ def train(config):
     print(f"  Identity loss: {'every image, every G step' if config.identity_every_step else 'only when target == source'}"
           f" (lambda_id {config.lambda_id}) | DiffAugment on the critic: {config.diffaugment or 'off'}"
           f" | biomarker loss: lambda_bio {config.lambda_bio}"
-          f" | G up-sampling {config.g_upsample or 'as built'}, padding {config.g_padding or 'as built'}")
+          f" | G up-sampling {config.g_upsample or 'as built'}, padding {config.g_padding or 'as built'}"
+          + (f" | highlight weight {config.highlight_weight} (brightest {config.highlight_frac:.0%} + red >= 0.95)"
+             if config.highlight_weight > 0 else ""))
 
     def aug(t):
         return diff_augment(t, config.diffaugment) if config.diffaugment else t
@@ -447,9 +477,11 @@ def train(config):
                 # Cycle back to the source stage with the same (source) mask -- the synthesized
                 # image has no Module 1 mask of its own during training.
                 rec = G(torch.cat([fake, mask], 1), c_src)
-                g_cyc = F.l1_loss(rec, x)
+                hl_w = (1.0 + config.highlight_weight * highlight_mask(x, config.highlight_frac)
+                        if config.highlight_weight > 0 else None)  # round 10
+                g_cyc = weighted_l1(rec, x, hl_w)
                 if config.identity_every_step:  # round 9: "keep this eye at its own stage" for the whole batch
-                    g_id = F.l1_loss(G(x_in, c_src), x)
+                    g_id = weighted_l1(G(x_in, c_src), x, hl_w)
                 else:
                     same = trg == src
                     g_id = F.l1_loss(fake[same], x[same]) if same.any() else fake.new_zeros(())
@@ -523,6 +555,7 @@ def train(config):
         "grader_loss_checkpoint": config.grader_loss_path, "grader_loss_norm": config.grader_loss_norm,
         "identity_every_step": config.identity_every_step, "diffaugment": config.diffaugment,
         "g_upsample": config.g_upsample, "g_padding": config.g_padding,
+        "highlight_weight": config.highlight_weight, "highlight_frac": config.highlight_frac,
         "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
@@ -569,6 +602,9 @@ if __name__ == "__main__":
     p.add_argument("--diffaugment", default=Config.diffaugment,
                    help='Round 9: DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off')
     add_render_args(p)
+    p.add_argument("--highlight-weight", type=float, default=Config.highlight_weight,
+                   help="Round 10: extra weight on the input's highlights in the identity / cycle L1 (0 = off)")
+    p.add_argument("--highlight-frac", type=float, default=Config.highlight_frac)
     p.add_argument("--save-dir", default=Config.save_dir)
     p.add_argument("--seed", type=int, default=Config.seed)
     p.add_argument("--resume-state", default=None,
