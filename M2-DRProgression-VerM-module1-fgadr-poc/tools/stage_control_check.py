@@ -33,6 +33,9 @@ Round 9 -- two image-level checks (no grader needed), on the same images:
                      green / blue there (the spots are teal)
 Compare these between runs on the same images (same --seed / --split-seed), not as absolute values.
 --g-upsample / --g-padding render the Generator differently without retraining (base_model.apply_render_options);
+Round 11 -- --lesion-seg EX=<U-Net> --lesion-seg HE=<U-Net>: lesion_area[k] = mean lesion area Module 1's segmenters find
+in stage-k outputs (gan_guidance.LesionGuide, same measure as the lesion-guided loss) and lesion_area_input on the real
+images; --kid: KID of all outputs vs the real held-out images (lower = more realistic; painted marks raise it).
 --grid-out saves a sample grid (rows: one held-out image per grade; columns: input, then stages 0-4).
 
 Usage:
@@ -121,6 +124,9 @@ def main():
     ap.add_argument("--style-dim", type=int, default=None)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--lesion-seg", action="append", default=[], metavar="NAME=PATH",
+                    help="Round 11: Module 1 lesion U-Nets for lesion area per requested stage (repeat: EX=..., HE=...)")
+    ap.add_argument("--kid", action="store_true", help="Round 11: KID of the outputs vs the real held-out images")
     ap.add_argument("--grid-out", default=None, help="Optional .jpg: one held-out image per grade x (input + stages)")
     add_arch_arg(ap)
     add_render_args(ap)
@@ -155,6 +161,18 @@ def main():
         path, norm = rest.rsplit(":", 1)
         graders[name] = (load_classifier(path, device=dev), *CLASSIFIER_NORMS[norm], path, norm)
 
+    guide = None
+    if args.lesion_seg:
+        from gan_guidance import LesionGuide
+        guide = LesionGuide(dict(kv.split("=", 1) for kv in args.lesion_seg), device=dev)
+    les_sum, les_in = np.zeros(args.c_dim), 0.0
+    kid = None
+    if args.kid:
+        try:
+            from torchmetrics.image.kid import KernelInceptionDistance
+            kid = KernelInceptionDistance(subset_size=min(50, len(idx)), subsets=50, normalize=True).to(dev)
+        except Exception as e:  # torchmetrics / torch-fidelity missing
+            print(f"  (KID skipped: {e})")
     conf = {n: np.zeros((args.c_dim, args.c_dim), dtype=int) for n in graders}
     real_hits = {n: 0 for n in graders}
     red_sum, chg_sum, n_k = np.zeros(args.c_dim), np.zeros(args.c_dim), np.zeros(args.c_dim)
@@ -174,6 +192,11 @@ def main():
             real_hits[name] += int((real_grade[name] == src).sum())
         m = retina(x)
         x01 = (x + 1) / 2
+        if guide is not None:
+            with torch.no_grad():
+                les_in += float(guide.area(x).sum())
+        if kid is not None:
+            kid.update(x01.clamp(0, 1), real=True)
         disc, lum_in = brightest_mask(x01, m)
         hl = highlight_mask(x01, m)
         own_fake = torch.zeros_like(x)
@@ -182,6 +205,11 @@ def main():
             with torch.no_grad():
                 fake = G(torch.cat([x, mask], 1), c)
             d = (fake + 1) / 2 - x01
+            if guide is not None:
+                with torch.no_grad():
+                    les_sum[k] += float(guide.area(fake).sum())
+            if kid is not None:
+                kid.update(((fake + 1) / 2).clamp(0, 1), real=False)
             red_sum[k] += float(masked_mean(F.relu(d[:, :1] - d[:, 1:2]), m).sum())
             mean_r = masked_mean(d[:, :1], m).view(-1, 1, 1, 1)  # each image's own average shift
             mean_g = masked_mean(d[:, 1:2], m).view(-1, 1, 1, 1)
@@ -242,6 +270,16 @@ def main():
     out["teal_shift"] = {str(k): float(teal_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
     out["mean_highlight_darkening"] = float(np.mean(list(out["highlight_darkening"].values())))
     out["mean_teal_shift"] = float(np.mean(list(out["teal_shift"].values())))
+    if guide is not None:
+        out["lesion_area"] = {str(k): float(les_sum[k] / max(n_k[k], 1)) for k in range(args.c_dim)}
+        out["lesion_area_input"] = les_in / max(own_n, 1)
+        out["lesion_segmenters"] = guide.names
+    if kid is not None:
+        try:
+            km, ks = kid.compute()
+            out["kid"], out["kid_std"] = float(km), float(ks)
+        except Exception as e:
+            print(f"  (KID failed: {e})")
     out["mean_redness"] = float(np.mean(list(out["redness"].values())))
     out["mean_tint"] = float(np.mean(list(out["tint"].values())))
     out["mean_streak_redness"] = float(np.mean(list(out["streak_redness"].values())))
@@ -259,6 +297,11 @@ def main():
     print("  highlight darkening (all bright):  " + "  ".join(f"{k}: {v:.4f}" for k, v in out["highlight_darkening"].items())
           + f"  | mean {out['mean_highlight_darkening']:.4f}  (teal shift {out['mean_teal_shift']:.4f})")
     print("  mean change per requested stage:   " + "  ".join(f"{k}: {v:.4f}" for k, v in out["change"].items()))
+    if "lesion_area" in out:
+        print(f"  lesion area ({'+'.join(out['lesion_segmenters'])}) per requested stage: "
+              + "  ".join(f"{k}: {v:.5f}" for k, v in out["lesion_area"].items()) + f"  | real input {out['lesion_area_input']:.5f}")
+    if "kid" in out:
+        print(f"  KID of the outputs vs the real images: {out['kid']:.4f} +/- {out['kid_std']:.4f} (lower = more realistic)")
     print(f"  no-change test (own stage requested): mean change {out['no_change']['mean_abs_change']:.4f} | grade "
           "changed: " + ", ".join(f"{n} {r:.1%}" for n, r in out["no_change"]["grade_changed_rate"].items()))
     for name, (_c, _m, _s, path, norm) in graders.items():

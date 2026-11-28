@@ -428,6 +428,7 @@ def evaluate(config):
                              "copy-the-baseline control" if config.copy_baseline else config.generator_checkpoint),
                "fov_mask": bool(config.fov_mask), "fov_erode": config.fov_erode, "fov_feather": config.fov_feather,
                "color_match": bool(config.color_match), "cascade_mode": config.cascade_mode,
+               "highlight_guard": bool(getattr(config, "highlight_guard", False)),
                "image_size": config.image_size, "include_stable": bool(config.include_stable),
                "real_followup_native": bool(config.real_followup_native),
                "graders": {"primary": config.classifier_checkpoint, "second": config.second_classifier_checkpoint,

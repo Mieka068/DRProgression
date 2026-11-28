@@ -74,6 +74,10 @@ grid / wavy textures and edge bars that tests A and B left unchanged.
 Round 10 -- --highlight-weight W: in the identity and cycle losses, the input's highlights (its brightest
 --highlight-frac of retina pixels, plus near-saturated red) count (1 + W)x. Round 9 put dark teal spots on the optic
 disc, exudates and glare -- small areas an image-wide L1 barely penalises. 0 = off (rounds 8/9).
+Round 11 -- lesion-guided loss: --lesion-seg EX=<U-Net> --lesion-seg HE=<U-Net> --lambda-lesion L. Module 1's frozen
+lesion segmenters measure lesion area (gan_guidance.LesionGuide); a request above the input's stage must show at least the
+input's area plus how much more real EyePACS eyes of the requested stage have (stage biomarker profiles, --profiles). Fresh
+random views in front of the segmenters; ramped in over --lesion-warmup-epochs from epoch --lesion-ramp-from. 0 = off.
 --lambda-bio 0 switches the biomarker-profile loss off (the image-only BiomarkerRegressor is the other
 easily-fooled judge, and a likely source of the RED in the streaks).
 
@@ -99,7 +103,7 @@ from base_model import Discriminator, Generator, add_arch_arg, add_render_args, 
 from crosssectional_dataset import NUM_STAGES, get_crosssectional_loaders  # noqa: E402
 from stage_biomarker_profiles import BIOMARKER_NAMES, N_BIOMARKERS, profile_tensors  # noqa: E402
 from train_module2_poc import denorm, grad_norm, gradient_penalty, write_batch_log  # noqa: E402
-from gan_guidance import FrozenGrader, diff_augment  # noqa: E402  (after train_module2_poc, which puts module1/ on sys.path)
+from gan_guidance import FrozenGrader, LesionGuide, diff_augment, lesion_loss, lesion_stage_targets  # noqa: E402  (after train_module2_poc, which puts module1/ on sys.path)
 from resume_utils import load_resume_state, save_resume_state, seed_everything  # noqa: E402
 
 
@@ -153,6 +157,11 @@ class Config:
     lambda_grader = 1.0
     identity_every_step = False  # round 9: identity loss on every image every G step (round 8: only target == source)
     diffaugment = ""  # round 9: DiffAugment policy for the critic, e.g. "color,translation,cutout"; "" = off (round 8)
+    lesion_seg_paths = {}  # round 11: {"EX": path, "HE": path} -- Module 1 U-Nets for the lesion-guided loss
+    lambda_lesion = 0.0     # round 11: lesion-guided loss weight; 0 = off
+    lesion_warmup_epochs = 2
+    lesion_ramp_from = 0    # 0-based epoch at which the ramp starts (round 11 continues test E from epoch 60)
+    lesion_input_size = 512
     highlight_weight = 0.0  # round 10: extra weight on the input's highlights in the identity / cycle L1; 0 = off
     highlight_frac = 0.03   # round 10: brightest share of retina pixels that counts as highlight (+ red >= 0.95)
     g_upsample = None  # round 9: 'nearest' / 'bilinear' (base_model.apply_render_options); None = as built (nearest)
@@ -419,6 +428,18 @@ def train(config):
     def aug(t):
         return diff_augment(t, config.diffaugment) if config.diffaugment else t
 
+    guide = stage_area = None
+    if config.lambda_lesion > 0:
+        if not config.lesion_seg_paths or not config.profiles_path:
+            raise SystemExit("--lambda-lesion needs --lesion-seg NAME=PATH (e.g. EX and HE) and --profiles")
+        with open(config.profiles_path) as f:
+            stage_area = lesion_stage_targets(json.load(f), lesions=tuple(sorted(config.lesion_seg_paths)),
+                                              num_stages=config.c_dim)
+        guide = LesionGuide(config.lesion_seg_paths, device=device, input_size=config.lesion_input_size)
+        print(f"  Lesion-guided loss: lambda {config.lambda_lesion} ({', '.join(guide.names)} segmenters at "
+              f"{config.lesion_input_size} px, augmented views), ramped over {config.lesion_warmup_epochs} epochs from "
+              f"epoch {config.lesion_ramp_from + 1}; stage lesion-area targets {[round(float(v), 5) for v in stage_area]}")
+
     print(f"\n[3/4] Training for {config.num_epochs} epochs ({len(train_loader)} batches/epoch)...")
     start = time.time()
     models, opts = {"G": G, "D": D, "R": R}, {"g_opt": g_opt, "d_opt": d_opt, "r_opt": r_opt}
@@ -431,7 +452,9 @@ def train(config):
     g_steps = history[-1].get("g_steps", 0) if history else 0  # G updates so far (1 per n_critic batches)
     for epoch in range(start_epoch, config.num_epochs):
         bio_on = use_bio and epoch >= config.bio_warmup_epochs
-        sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, id=0.0, bio=0.0, mono=0.0, r=0.0, grd=0.0)
+        sums = dict(d=0.0, g=0.0, cls=0.0, cyc=0.0, id=0.0, bio=0.0, mono=0.0, r=0.0, grd=0.0, les=0.0)
+        les_ramp = (min(1.0, max(0.0, (epoch - config.lesion_ramp_from + 1) / max(config.lesion_warmup_epochs, 1)))
+                    if guide is not None else 0.0)
         n_g = 0
         for i, batch in enumerate(train_loader):
             x = batch["image"].to(device)
@@ -495,6 +518,10 @@ def train(config):
                     g_mono = monotonic_loss(pred_fake, pred_real, src, trg)
                     g_loss = g_loss + config.lambda_bio * g_bio + config.lambda_mono * g_mono
                     sums["bio"] += g_bio.item(); sums["mono"] += g_mono.item()
+                if guide is not None and les_ramp > 0:  # round 11
+                    g_les, _short, _n_les = lesion_loss(guide, fake, x, src, trg, stage_area)
+                    g_loss = g_loss + config.lambda_lesion * les_ramp * g_les
+                    sums["les"] += float(g_les.detach())
                 g_grd = None
                 if grader is not None:
                     g_grd = F.cross_entropy(grader(fake), trg)
@@ -516,12 +543,13 @@ def train(config):
         nb = max(len(train_loader), 1)
         g_steps += n_g
         rec_ = {"epoch": epoch + 1, "d_loss": sums["d"] / nb, "r_loss": sums["r"] / nb, "g_steps": g_steps,
-                **{f"g_{k}": sums[k] / max(n_g, 1) for k in ("g", "cls", "cyc", "id", "bio", "mono", "grd")},
+                **{f"g_{k}": sums[k] / max(n_g, 1) for k in ("g", "cls", "cyc", "id", "bio", "mono", "grd", "les")},
                 "biomarker_losses_on": bio_on}
         history.append(rec_)
         print(f"Epoch [{epoch + 1}/{config.num_epochs}] D {rec_['d_loss']:.3f} | G {rec_['g_g']:.3f} "
               f"(cls {rec_['g_cls']:.3f}, cyc {rec_['g_cyc']:.3f}, id {rec_['g_id']:.3f}, bio {rec_['g_bio']:.3f}, "
               f"mono {rec_['g_mono']:.3f}" + (f", grader {rec_['g_grd']:.3f}" if grader is not None else "")
+              + (f", lesion {rec_['g_les']:.3f} x{les_ramp:.2f}" if guide is not None else "")
               + f") | R {rec_['r_loss']:.3f} | G steps {g_steps} | "
               f"{(time.time() - start) / 60:.1f}min")
 
@@ -556,6 +584,9 @@ def train(config):
         "identity_every_step": config.identity_every_step, "diffaugment": config.diffaugment,
         "g_upsample": config.g_upsample, "g_padding": config.g_padding,
         "highlight_weight": config.highlight_weight, "highlight_frac": config.highlight_frac,
+        "lambda_lesion": config.lambda_lesion, "lesion_seg_paths": config.lesion_seg_paths,
+        "lesion_ramp_from": config.lesion_ramp_from, "lesion_warmup_epochs": config.lesion_warmup_epochs,
+        "lesion_input_size": config.lesion_input_size,
         "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
@@ -605,6 +636,13 @@ if __name__ == "__main__":
     p.add_argument("--highlight-weight", type=float, default=Config.highlight_weight,
                    help="Round 10: extra weight on the input's highlights in the identity / cycle L1 (0 = off)")
     p.add_argument("--highlight-frac", type=float, default=Config.highlight_frac)
+    p.add_argument("--lesion-seg", action="append", default=[], metavar="NAME=PATH",
+                   help="Round 11: a Module 1 lesion U-Net for the lesion-guided loss (repeat: EX=..., HE=...)")
+    p.add_argument("--lambda-lesion", type=float, default=Config.lambda_lesion)
+    p.add_argument("--lesion-warmup-epochs", type=int, default=Config.lesion_warmup_epochs)
+    p.add_argument("--lesion-ramp-from", type=int, default=Config.lesion_ramp_from,
+                   help="0-based epoch the lesion-loss ramp starts at (e.g. 60 when continuing from 60 epochs)")
+    p.add_argument("--lesion-input-size", type=int, default=Config.lesion_input_size)
     p.add_argument("--save-dir", default=Config.save_dir)
     p.add_argument("--seed", type=int, default=Config.seed)
     p.add_argument("--resume-state", default=None,
@@ -623,6 +661,7 @@ if __name__ == "__main__":
     cfg.profiles_path = args.profiles
     cfg.resume_state_path = args.resume_state
     cfg.grader_loss_path = args.grader_loss_checkpoint
+    cfg.lesion_seg_paths = dict(kv.split("=", 1) for kv in args.lesion_seg)
     cfg.dataset_kwargs = {k: v for k, v in {"labels_csv": args.labels_csv, "images_dir": args.images_subdir,
                                             "image_col": args.image_col, "label_col": args.label_col,
                                             "ext": args.ext}.items() if v is not None}

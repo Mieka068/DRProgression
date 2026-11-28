@@ -411,6 +411,24 @@ and dark teal spots sat on the optic disc, exudates and glare -- the input's hig
 **Run order (round 10):** notebook 09 from this branch, Run all (`TEST_RUN = 'F'`, `F_EPOCHS = 60`, ~6 h) -> read the ROUND 10
 VERDICT -> `F_EPOCHS = 80`, Run all (~6 h) -> verdict -> notebooks 06/08/10 pointed at round 10 (next update).
 
+# Round 11 -- lesion-guided loss + highlight guard (branch `R11-LesionGuided`)
+Round 10 at 60 epochs (output `09_..._(11)` on `R10-HighlightIdentity`): identity weight 10 brought back rim redness /
+streaks (strong-streak area 0.0131 vs round 9's 0.0064, round 8's 0.0141). The highlight spots fell only 22 %, and copying
+did not drop (change per requested stage 0.025 vs 0.024). Stopped at 60; round 9 (test E) stays the base. Lowering the
+identity weight does not create progression: nothing honest pushes the Generator to draw lesions.
+
+| Change | Where | Round 9 |
+|---|---|---|
+| Lesion-guided loss: Module 1's frozen EX + HE U-Nets (`gan_guidance.LesionGuide`, whole retina at 512 px, fresh random views) measure lesion area; a request above the input's stage must reach the input's area + (stage-k minus input-stage median EX+HE area from the stage biomarker profiles, `lesion_stage_targets`); hinge shortfall / full stage range (`lesion_loss`); `--lesion-seg`, `--lambda-lesion`, ramp over `--lesion-warmup-epochs` from `--lesion-ramp-from` | `train_module2_nonlong_pretrain.py`, `gan_guidance.py` | -- |
+| Lesion area per requested stage (+ on the real inputs) and KID of all outputs vs the real held-out images (`--lesion-seg`, `--kid`) | `tools/stage_control_check.py` | -- |
+| nb 09 run `G` (round 11): starts from test E's `resume_state_ep60.pt` (copied into `nonlong_pretrain..._r11`), test E's settings + lesion loss (`G_LAMBDA_LESION = 1.0`); `G_EPOCHS = 70` then 80; ROUND 11 VERDICT vs round 9 (E) and round 8 at the same epoch count -- lesion rise (stages 3-4 minus 0-1) >= 1.5x round 9's, EyePACS stage control (not in the loss) >= round 9's + 5 points, strong-streak area <= 1/2 round 8's, KID <= 1.5x round 9's + 0.005, no-change change <= 1.5x round 8's | notebook 09 | -- |
+| Highlight guard (`--highlight-guard`, `fov_mask.highlight_guard`): where the real baseline's highlights (brightest 3 % + red >= 0.95, grown 2 px) got > 0.06 darker or lost > 0.06 red vs green/blue in a synthesized step, the baseline pixel is kept -- inference-only, removes round 9's teal spots, blocks real darkening there (report it) | evaluate / visualize / generate (cascade) | off |
+| nb 06/08/10 on this branch: round 9's Generator with `HIGHLIGHT_GUARD = True`, results in `..._guard` files / folders (nb 06 resumes round 9's early-stopped run straight to evaluation) | notebooks 06/08/10 | no guard |
+
+**Run order:** notebook 09, Run all (`TEST_RUN = 'G'`, `G_EPOCHS = 70`, ~4-5 h; state copied to Drive every 5 epochs) ->
+ROUND 11 VERDICT -> `G_EPOCHS = 80`, Run all -> verdict. Independently, at any time: notebooks 06 -> 08 -> 10 from this
+branch for round 9 + highlight guard.
+
 # Notebooks -- what each runs, in order (Colab, `notebooks/`)
 | # | Notebook | Runs | Needs |
 |---|---|---|---|

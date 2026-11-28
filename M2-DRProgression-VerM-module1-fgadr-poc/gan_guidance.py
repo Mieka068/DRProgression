@@ -152,3 +152,80 @@ class FrozenGrader(nn.Module):
         if x.shape[-1] != self.input_size:
             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
         return self.net((x - self.mean) / self.std)
+
+
+# ----------------------------------------------------------------------------- lesion guidance (round 11)
+
+class LesionGuide(nn.Module):
+    """Round 11: Module 1's frozen lesion segmenters (e.g. EX + HE U-Nets) measure the lesion area of a [-1, 1] batch:
+    area(x) = per image, sum over lesions of the mean lesion probability inside the retina (a retina fraction).
+    Used (a) in the pretraining loss -- a stage-k request must show at least the input's lesion area plus how much more
+    real EyePACS eyes have at stage k than at the input's stage (stage biomarker profiles) -- and (b) in
+    tools/stage_control_check.py to report lesion area per requested stage. augment=True gives each call a fresh random
+    view (grader_augment) so a fixed painted pattern can't reliably fool the segmenters.
+    The U-Nets were trained on ~1280 px retinas tiled at 512 px; here the whole retina is resized to input_size (512) in
+    one pass, so small lesions are under-detected -- input and output are measured the same way, which is what counts."""
+
+    def __init__(self, seg_paths, device="cpu", input_size=512):
+        super().__init__()
+        from apply_to_progression_data import load_segmentation_model
+        self.names = sorted(seg_paths)
+        self.nets = nn.ModuleList([load_segmentation_model(seg_paths[n], device=device) for n in self.names])
+        for net in self.nets:
+            net.eval()
+            for p in net.parameters():
+                p.requires_grad_(False)
+        self.input_size = input_size
+
+    def train(self, mode=True):  # frozen BatchNorm statistics
+        super().train(mode)
+        for net in self.nets:
+            net.eval()
+        return self
+
+    def area(self, x_pm1, augment=False):
+        x = ((x_pm1 + 1) / 2).clamp(0, 1)
+        if augment:
+            x = grader_augment(x)
+        if x.shape[-1] != self.input_size:
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
+        ret = ((0.299 * x[:, :1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]) > 0.04).float()
+        n = ret.sum(dim=(1, 2, 3)).clamp(min=1.0)
+        total = x.new_zeros(x.size(0))
+        for net in self.nets:
+            prob = torch.softmax(net(x), dim=1)[:, 1:2]
+            total = total + (prob * ret).sum(dim=(1, 2, 3)) / n
+        return total
+
+
+def lesion_stage_targets(profiles, lesions=("EX", "HE"), num_stages=5):
+    """[num_stages] tensor: per stage, the sum over `lesions` of the median lesion area fraction Module 1 found on real
+    EyePACS images of that stage (stage_biomarker_profiles.py JSON, stages.<g>.raw.lesions.<l>.area_frac_median), made
+    non-decreasing (a higher stage never asks for less)."""
+    vals = []
+    for g in range(num_stages):
+        les = profiles.get("stages", {}).get(str(g), {}).get("raw", {}).get("lesions", {})
+        vals.append(sum(float(les.get(l, {}).get("area_frac_median", 0.0) or 0.0) for l in lesions))
+    out, run = [], 0.0
+    for v in vals:
+        run = max(run, v)
+        out.append(run)
+    return torch.tensor(out, dtype=torch.float32)
+
+
+def lesion_loss(guide, fake, x, src, trg, stage_area):
+    """Round 11 hinge: for requests above the input's stage, the output's lesion area (augmented view) must reach the
+    input's (augmented view, no gradient) plus stage_area[trg] - stage_area[src]; the shortfall is divided by the full
+    stage-0 -> stage-4 range so the loss is ~[0, 1]. Requests at / below the input's stage add nothing (the identity
+    loss keeps those). Returns (loss, mean shortfall, n requests) -- loss is 0 when no request is above its input."""
+    worse = trg > src
+    if not bool(worse.any()):
+        return fake.new_zeros(()), 0.0, 0
+    stage_area = stage_area.to(fake.device)
+    gain = (stage_area[trg[worse]] - stage_area[src[worse]]).clamp(min=0)
+    with torch.no_grad():
+        a_in = guide.area(x[worse], augment=True)
+    a_fk = guide.area(fake[worse], augment=True)
+    short = F.relu(a_in + gain - a_fk)
+    scale = (stage_area[-1] - stage_area[0]).clamp(min=1e-3)
+    return short.mean() / scale, float(short.mean().detach()), int(worse.sum())

@@ -116,12 +116,39 @@ def match_color(img, ref, region, eps=1e-4):
     return torch.where(r.bool().expand_as(img), out, img).clamp(-1.0, 1.0)
 
 
-def finish_step(img, ref, fov=None, color_match=False):
+def highlight_guard(img, ref, frac=0.03, red_sat=0.95, dark_tol=0.06, teal_tol=0.06, grow_px=2):
+    """Round 11 (inference only): where the REAL baseline (ref) is a highlight -- its brightest `frac` of retina pixels plus
+    near-saturated red, grown by grow_px (optic disc, exudates, glare) -- and the synthesized step (img) got more than
+    dark_tol darker or lost more than teal_tol red relative to green/blue, keep the baseline pixel. Removes round 9's dark
+    teal spots on highlights; it also blocks any real darkening there, so it must be reported. [-1, 1] NCHW."""
+    r01, i01 = (ref + 1) / 2, (img + 1) / 2
+    lum = lambda t: 0.299 * t[:, :1] + 0.587 * t[:, 1:2] + 0.114 * t[:, 2:3]  # noqa: E731
+    lum_r = lum(r01)
+    ret = lum_r > 0.04
+    hl = torch.zeros_like(lum_r)
+    for b in range(ref.size(0)):
+        inside = torch.nonzero(ret[b].flatten()).flatten()
+        if inside.numel():
+            k = max(1, int(round(frac * inside.numel())))
+            hl[b].view(-1)[inside[torch.topk(lum_r[b].flatten()[inside], k).indices]] = 1.0
+    hl = torch.maximum(hl, ((r01[:, :1] > red_sat) & ret).float())
+    if grow_px > 0:
+        hl = F.max_pool2d(hl, 2 * grow_px + 1, stride=1, padding=grow_px)
+    d = i01 - r01
+    bad = ((lum_r - lum(i01)) > dark_tol) | ((((d[:, 1:2] + d[:, 2:3]) / 2) - d[:, :1]) > teal_tol)
+    bad = F.max_pool2d((bad.float() * hl), 3, stride=1, padding=1) * hl  # cover each spot's rim, stay inside highlights
+    return torch.where(bad.bool().expand_as(img), ref, img)
+
+
+def finish_step(img, ref, fov=None, color_match=False, guard=False):
     """Round 7: one synthesized cascade step -> colour-matched to the REAL baseline (ref; always the
     baseline, never the previous step, so the error can't build up) and blacked out outside fov
-    (the baseline's possibly shrunk/softened retina mask). fov None and color_match False = raw G."""
+    (the baseline's possibly shrunk/softened retina mask). fov None and color_match False = raw G.
+    Round 11: guard=True also applies highlight_guard (after the colour match)."""
     if color_match:
         img = match_color(img, ref, fov if fov is not None else fov_mask(ref))
+    if guard:
+        img = highlight_guard(img, ref)
     if fov is not None:
         img = apply_fov(img, fov)
     return img
@@ -162,6 +189,9 @@ def add_cascade_args(parser):
                         help="Round 7: match every synthesized step's colours to the real baseline's")
     parser.add_argument("--cascade-mode", choices=["cascade", "direct"], default="cascade",
                         help="Round 7: 'direct' generates every stage from the real baseline (evaluation control)")
+    parser.add_argument("--highlight-guard", action="store_true",
+                        help="Round 11: keep the baseline pixel where its highlights (disc, exudates, glare) got darker / "
+                             "teal in a synthesized step (inference-only fix for round 9's spots -- report it)")
 
 
 def check_cascade_args(parser, args):
@@ -181,4 +211,5 @@ def cascade_kwargs(baseline, config):
     """fov_mask / color_match / mode keyword arguments for synthesize_trajectory."""
     return {"fov_mask": cascade_fov(baseline, config),
             "color_match": bool(getattr(config, "color_match", False)),
-            "mode": getattr(config, "cascade_mode", "cascade")}
+            "mode": getattr(config, "cascade_mode", "cascade"),
+            "highlight_guard": bool(getattr(config, "highlight_guard", False))}

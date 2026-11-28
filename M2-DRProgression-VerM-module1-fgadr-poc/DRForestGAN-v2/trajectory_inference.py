@@ -77,7 +77,7 @@ def _module1_predict(image_tensor, classifier, seg_models, device, mask_size):
 
 def synthesize_trajectory(generator, classifier, seg_models, baseline_image, baseline_mask,
                            start_stage, end_stage, c_dim, device, fov_mask=None,
-                           color_match=False, mode="cascade"):
+                           color_match=False, mode="cascade", highlight_guard=False):
     """
     Generates a full stage-by-stage trajectory from start_stage to end_stage (see module
     docstring for the per-step loop).
@@ -152,7 +152,7 @@ def synthesize_trajectory(generator, classifier, seg_models, baseline_image, bas
             x = torch.cat([current_image, current_mask], dim=1)
             synthesized = generator(x, c_target)
             # colour-matched to the real baseline (round 7, optional), black outside its retina (round 6)
-            synthesized = finish_step(synthesized, baseline_image, fov_mask, color_match)
+            synthesized = finish_step(synthesized, baseline_image, fov_mask, color_match, highlight_guard)
 
             predicted_grade, grade_probs, new_mask = _module1_predict(
                 synthesized, classifier, seg_models, device, mask_size
