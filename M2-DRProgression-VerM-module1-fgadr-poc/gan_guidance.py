@@ -25,6 +25,7 @@ progressing pairs. Re-implemented here (policy names as in the paper's code).
 import math
 
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -184,6 +185,9 @@ class LesionGuide(nn.Module):
         return self
 
     def area(self, x_pm1, augment=False):
+        """Memory: with gradients on, each U-Net is gradient-checkpointed (its activations are recomputed in the backward
+        pass instead of stored) and, on CUDA, run in bfloat16 (float16 where bfloat16 is unsupported) -- two ResNet-50
+        U-Nets at 512 px on a batch of 8 ran out of a 24 GB GPU in fp32."""
         x = ((x_pm1 + 1) / 2).clamp(0, 1)
         if augment:
             x = grader_augment(x)
@@ -192,8 +196,13 @@ class LesionGuide(nn.Module):
         ret = ((0.299 * x[:, :1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]) > 0.04).float()
         n = ret.sum(dim=(1, 2, 3)).clamp(min=1.0)
         total = x.new_zeros(x.size(0))
+        on_cuda = x.is_cuda
+        amp_dtype = (torch.bfloat16 if on_cuda and torch.cuda.is_bf16_supported() else torch.float16)
+        ckpt = torch.is_grad_enabled() and x.requires_grad
         for net in self.nets:
-            prob = torch.softmax(net(x), dim=1)[:, 1:2]
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=on_cuda):
+                logits = (torch.utils.checkpoint.checkpoint(net, x, use_reentrant=False) if ckpt else net(x))
+            prob = torch.softmax(logits.float(), dim=1)[:, 1:2]
             total = total + (prob * ret).sum(dim=(1, 2, 3)) / n
         return total
 
@@ -213,7 +222,7 @@ def lesion_stage_targets(profiles, lesions=("EX", "HE"), num_stages=5):
     return torch.tensor(out, dtype=torch.float32)
 
 
-def lesion_loss(guide, fake, x, src, trg, stage_area):
+def lesion_loss(guide, fake, x, src, trg, stage_area, max_batch=4):
     """Round 11 hinge: for requests above the input's stage, the output's lesion area (augmented view) must reach the
     input's (augmented view, no gradient) plus stage_area[trg] - stage_area[src]; the shortfall is divided by the full
     stage-0 -> stage-4 range so the loss is ~[0, 1]. Requests at / below the input's stage add nothing (the identity
@@ -221,6 +230,11 @@ def lesion_loss(guide, fake, x, src, trg, stage_area):
     worse = trg > src
     if not bool(worse.any()):
         return fake.new_zeros(()), 0.0, 0
+    if max_batch and int(worse.sum()) > max_batch:  # memory: at most max_batch requests per step, picked at random
+        idx = torch.nonzero(worse).flatten()
+        keep = idx[torch.randperm(idx.numel(), device=idx.device)[:max_batch]]
+        worse = torch.zeros_like(worse)
+        worse[keep] = True
     stage_area = stage_area.to(fake.device)
     gain = (stage_area[trg[worse]] - stage_area[src[worse]]).clamp(min=0)
     with torch.no_grad():

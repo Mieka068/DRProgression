@@ -162,6 +162,7 @@ class Config:
     lesion_warmup_epochs = 2
     lesion_ramp_from = 0    # 0-based epoch at which the ramp starts (round 11 continues test E from epoch 60)
     lesion_input_size = 512
+    lesion_max_batch = 4    # round 11: at most this many above-stage requests per G step go through the segmenters (memory)
     highlight_weight = 0.0  # round 10: extra weight on the input's highlights in the identity / cycle L1; 0 = off
     highlight_frac = 0.03   # round 10: brightest share of retina pixels that counts as highlight (+ red >= 0.95)
     g_upsample = None  # round 9: 'nearest' / 'bilinear' (base_model.apply_render_options); None = as built (nearest)
@@ -519,7 +520,7 @@ def train(config):
                     g_loss = g_loss + config.lambda_bio * g_bio + config.lambda_mono * g_mono
                     sums["bio"] += g_bio.item(); sums["mono"] += g_mono.item()
                 if guide is not None and les_ramp > 0:  # round 11
-                    g_les, _short, _n_les = lesion_loss(guide, fake, x, src, trg, stage_area)
+                    g_les, _short, _n_les = lesion_loss(guide, fake, x, src, trg, stage_area, config.lesion_max_batch)
                     g_loss = g_loss + config.lambda_lesion * les_ramp * g_les
                     sums["les"] += float(g_les.detach())
                 g_grd = None
@@ -586,7 +587,7 @@ def train(config):
         "highlight_weight": config.highlight_weight, "highlight_frac": config.highlight_frac,
         "lambda_lesion": config.lambda_lesion, "lesion_seg_paths": config.lesion_seg_paths,
         "lesion_ramp_from": config.lesion_ramp_from, "lesion_warmup_epochs": config.lesion_warmup_epochs,
-        "lesion_input_size": config.lesion_input_size,
+        "lesion_input_size": config.lesion_input_size, "lesion_max_batch": config.lesion_max_batch,
         "retina_crop": os.environ.get("DRP_RETINA_CROP", "1"),
         "metrics": metrics, "loss_history": history,
         "total_time_min": (time.time() - start) / 60,
@@ -643,6 +644,8 @@ if __name__ == "__main__":
     p.add_argument("--lesion-ramp-from", type=int, default=Config.lesion_ramp_from,
                    help="0-based epoch the lesion-loss ramp starts at (e.g. 60 when continuing from 60 epochs)")
     p.add_argument("--lesion-input-size", type=int, default=Config.lesion_input_size)
+    p.add_argument("--lesion-max-batch", type=int, default=Config.lesion_max_batch,
+                   help="Round 11: at most this many above-stage requests per G step in the lesion loss (memory)")
     p.add_argument("--save-dir", default=Config.save_dir)
     p.add_argument("--seed", type=int, default=Config.seed)
     p.add_argument("--resume-state", default=None,
